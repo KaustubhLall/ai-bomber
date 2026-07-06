@@ -1,7 +1,9 @@
 # Build artifacts
 build/
 build_viz/
+build_ninja/
 build_viz.bat
+build_test.bat
 *.exe
 *.lib
 *.pdb
