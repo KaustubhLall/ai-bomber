@@ -38,46 +38,71 @@ typedef struct {
 } StepResult;
 ```
 
-## API functions
+## Main API functions
 
 ### `env_init`
+
 ```c
 void env_init(BomberEnv* env, const BomberConfig* config);
 ```
-Initializes the environment with the given configuration. Calls `env_reset` internally.
+
+Initializes the environment with the supplied configuration and calls `env_reset` internally using `config->seed`.
 
 ### `env_reset`
+
 ```c
 void env_reset(BomberEnv* env, uint64_t seed);
 ```
-Resets the environment with a deterministic seed. Regenerates the map, resets agents, clears bombs.
+
+Resets the environment with a deterministic seed. This regenerates the map, respawns agents, clears bombs, resets action history, and recomputes danger state.
 
 ### `env_step`
+
 ```c
 StepResult env_step(BomberEnv* env, Action action);
 ```
-Executes one step for agent 0 with the given action. Internally:
-1. Executes the agent's action (move, bomb, wait).
-2. Runs enemy AI for other agents.
-3. Picks up powerups.
-4. Ticks all bombs (decrement timers, explode at zero).
-5. Recomputes danger map.
-6. Computes reward.
-7. Checks terminal conditions.
+
+Executes one step for controlled agent `0`.
+
+Order of operations:
+
+1. Record the controlled agent action.
+2. Execute movement, bomb placement, or wait.
+3. Pick up any powerup on the controlled agent's tile and preserve that pickup for reward/metrics accounting before clearing the tile.
+4. Run deterministic seeded baseline behavior for other agents.
+5. Tick bombs, including explosions and chain reactions.
+6. Recompute danger and escape maps.
+7. Advance the step counter.
+8. Compute reward components and total reward.
+9. Check terminal conditions.
 
 Returns the step reward, done flag, and terminal reason.
 
 ### `env_observe`
+
 ```c
 void env_observe(const BomberEnv* env, int agent_id, Observation* obs);
 ```
-Computes the observation for the given agent. See [OBSERVATION.md](OBSERVATION.md).
+
+Computes the observation for the requested agent. See [OBSERVATION.md](OBSERVATION.md).
 
 ### `env_get_debug_snapshot`
+
 ```c
 void env_get_debug_snapshot(const BomberEnv* env, DebugSnapshot* out);
 ```
-Returns a full snapshot of the environment state for visualization and debugging.
+
+Copies the full environment state, danger map, latest reward breakdown, latest action, cumulative reward, and a short decision string for the visualizer/debug UI.
+
+## Rules helpers
+
+### `rules_pickup_powerup`
+
+```c
+int rules_pickup_powerup(BomberState* state, int agent_id);
+```
+
+Applies the powerup at the agent's current tile and clears that tile to floor. Returns `1` when a powerup was collected and `0` otherwise. `env_step` uses this return value for powerup reward and metrics accounting.
 
 ## Usage example
 
