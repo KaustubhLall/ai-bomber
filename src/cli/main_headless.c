@@ -16,7 +16,7 @@ static void usage(const char* prog) {
     printf("  --episodes <n>       Number of episodes (default 100)\n");
     printf("  --seed <n>           Random seed (default 1337)\n");
     printf("  --mode <mode>        Game mode: survival, battle (default survival)\n");
-    printf("  --enemy <type>       Enemy agent type (for battle mode)\n");
+    printf("  --enemy <type>       Reserved for explicit opponent policy wiring\n");
     printf("  --export <file>      Export metrics to file\n");
     printf("  --replay <file>      Save replay to file\n");
     printf("  --compare            Compare all agents\n");
@@ -25,7 +25,7 @@ static void usage(const char* prog) {
 
 int main(int argc, char** argv) {
     const char* agent_name = "random";
-    const char* enemy_name = "scripted";
+    const char* enemy_name = NULL;
     const char* export_file = NULL;
     const char* replay_file = NULL;
     int episodes = 100;
@@ -58,6 +58,11 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (enemy_name) {
+        fprintf(stderr, "Warning: --enemy=%s is parsed but not yet wired into the runner; using the environment opponent behavior.\n",
+                enemy_name);
+    }
+
     BomberConfig cfg;
     if (mode == MODE_BATTLE) config_battle(&cfg);
     else config_survival(&cfg);
@@ -79,6 +84,10 @@ int main(int argc, char** argv) {
 
     if (rc.record_replay) {
         rc.replay = (Replay*)calloc(1, sizeof(Replay));
+        if (!rc.replay) {
+            fprintf(stderr, "Failed to allocate replay buffer.\n");
+            return 1;
+        }
     }
 
     Metrics metrics;
@@ -109,6 +118,8 @@ int main(int argc, char** argv) {
             fprintf(f, "}\n");
             fclose(f);
             printf("Metrics exported to %s\n", export_file);
+        } else {
+            fprintf(stderr, "Failed to open metrics export file: %s\n", export_file);
         }
     }
 
