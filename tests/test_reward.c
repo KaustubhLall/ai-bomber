@@ -13,7 +13,6 @@ int main(void) {
     BomberEnv env;
     env_init(&env, &cfg);
 
-    /* Survival reward on wait */
     int prev_crates = map_count_crates(&env.state);
     int prev_enemies = 0;
     for (int a = 1; a < env.state.agent_count; a++) {
@@ -22,10 +21,9 @@ int main(void) {
 
     float reward = reward_compute(&env.last_reward, &env, ACTION_WAIT, 0,
                                   prev_crates, 0, prev_enemies, 0);
+    (void)reward;
 
-    /* Should get survival reward */
     assert(env.last_reward.survival > 0.0f);
-    /* Total should equal sum of components */
     float sum = env.last_reward.survival + env.last_reward.crate_destroyed +
                 env.last_reward.powerup + env.last_reward.enemy_damage +
                 env.last_reward.enemy_elimination + env.last_reward.win +
@@ -36,13 +34,15 @@ int main(void) {
 
     assert(fabsf(sum - env.last_reward.total) < 0.001f);
 
-    /* Invalid action penalty */
+    float powerup_reward = reward_compute(&env.last_reward, &env, ACTION_WAIT, 0,
+                                          prev_crates, 1, prev_enemies, 0);
+    (void)powerup_reward;
+    assert(fabsf(env.last_reward.powerup - cfg.powerup_reward) < 0.001f);
+
     env.state.agents[0].x = 1;
     env.state.agents[0].y = 1;
     float r2 = reward_compute(&env.last_reward, &env, ACTION_UP, 0,
                               prev_crates, 0, prev_enemies, 0);
-    /* Moving up from (1,1) hits wall -> invalid, but reward_compute doesn't check
-       validity directly. The env_step does. Here we just verify components sum. */
     (void)r2;
     float sum2 = env.last_reward.survival + env.last_reward.crate_destroyed +
                  env.last_reward.powerup + env.last_reward.enemy_damage +
