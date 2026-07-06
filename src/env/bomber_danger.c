@@ -42,8 +42,12 @@ static void bfs_reachable(const BomberState* state, int sx, int sy, int max_dist
 
 void danger_compute(DangerMap* dm, const BomberState* state) {
     memset(dm->current_blast, 0, sizeof(int) * MAX_HEIGHT * MAX_WIDTH);
-    memset(dm->time_to_blast, -1, sizeof(int) * MAX_HEIGHT * MAX_WIDTH);
-    memset(dm->safe_now, 1, sizeof(int) * MAX_HEIGHT * MAX_WIDTH);
+    for (int y = 0; y < MAX_HEIGHT; y++) {
+        for (int x = 0; x < MAX_WIDTH; x++) {
+            dm->time_to_blast[y][x] = -1;
+            dm->safe_now[y][x] = 1;
+        }
+    }
     memset(dm->reachable_safe, 0, sizeof(int) * MAX_HEIGHT * MAX_WIDTH);
 
     /* For each active bomb, compute predicted blast tiles and time-to-blast */

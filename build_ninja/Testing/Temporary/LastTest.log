@@ -1,0 +1,179 @@
+Start testing: Jul 06 14:06 Pacific Daylight Time
+----------------------------------------------------------
+1/11 Testing: test_rng
+1/11 Test: test_rng
+Command: "C:/Users/kaust/IdeaProjects/ai-bomber/build_ninja/tests/test_rng.exe"
+Directory: C:/Users/kaust/IdeaProjects/ai-bomber/build_ninja/tests
+"test_rng" start time: Jul 06 14:06 Pacific Daylight Time
+Output:
+----------------------------------------------------------
+test_rng: ALL PASSED
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"test_rng" end time: Jul 06 14:06 Pacific Daylight Time
+"test_rng" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/11 Testing: test_bomber_env
+2/11 Test: test_bomber_env
+Command: "C:/Users/kaust/IdeaProjects/ai-bomber/build_ninja/tests/test_bomber_env.exe"
+Directory: C:/Users/kaust/IdeaProjects/ai-bomber/build_ninja/tests
+"test_bomber_env" start time: Jul 06 14:06 Pacific Daylight Time
+Output:
+----------------------------------------------------------
+test_bomber_env: ALL PASSED
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"test_bomber_env" end time: Jul 06 14:06 Pacific Daylight Time
+"test_bomber_env" time elapsed: 00:00:00
+----------------------------------------------------------
+
+3/11 Testing: test_map
+3/11 Test: test_map
+Command: "C:/Users/kaust/IdeaProjects/ai-bomber/build_ninja/tests/test_map.exe"
+Directory: C:/Users/kaust/IdeaProjects/ai-bomber/build_ninja/tests
+"test_map" start time: Jul 06 14:06 Pacific Daylight Time
+Output:
+----------------------------------------------------------
+test_map: ALL PASSED
+<end of output>
+Test time =   0.04 sec
+----------------------------------------------------------
+Test Passed.
+"test_map" end time: Jul 06 14:06 Pacific Daylight Time
+"test_map" time elapsed: 00:00:00
+----------------------------------------------------------
+
+4/11 Testing: test_bombs
+4/11 Test: test_bombs
+Command: "C:/Users/kaust/IdeaProjects/ai-bomber/build_ninja/tests/test_bombs.exe"
+Directory: C:/Users/kaust/IdeaProjects/ai-bomber/build_ninja/tests
+"test_bombs" start time: Jul 06 14:06 Pacific Daylight Time
+Output:
+----------------------------------------------------------
+test_bombs: ALL PASSED
+<end of output>
+Test time =   0.03 sec
+----------------------------------------------------------
+Test Passed.
+"test_bombs" end time: Jul 06 14:06 Pacific Daylight Time
+"test_bombs" time elapsed: 00:00:00
+----------------------------------------------------------
+
+5/11 Testing: test_blast
+5/11 Test: test_blast
+Command: "C:/Users/kaust/IdeaProjects/ai-bomber/build_ninja/tests/test_blast.exe"
+Directory: C:/Users/kaust/IdeaProjects/ai-bomber/build_ninja/tests
+"test_blast" start time: Jul 06 14:06 Pacific Daylight Time
+Output:
+----------------------------------------------------------
+test_blast: ALL PASSED
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"test_blast" end time: Jul 06 14:06 Pacific Daylight Time
+"test_blast" time elapsed: 00:00:00
+----------------------------------------------------------
+
+6/11 Testing: test_danger
+6/11 Test: test_danger
+Command: "C:/Users/kaust/IdeaProjects/ai-bomber/build_ninja/tests/test_danger.exe"
+Directory: C:/Users/kaust/IdeaProjects/ai-bomber/build_ninja/tests
+"test_danger" start time: Jul 06 14:06 Pacific Daylight Time
+Output:
+----------------------------------------------------------
+test_danger: ALL PASSED
+<end of output>
+Test time =   0.04 sec
+----------------------------------------------------------
+Test Passed.
+"test_danger" end time: Jul 06 14:06 Pacific Daylight Time
+"test_danger" time elapsed: 00:00:00
+----------------------------------------------------------
+
+7/11 Testing: test_observation
+7/11 Test: test_observation
+Command: "C:/Users/kaust/IdeaProjects/ai-bomber/build_ninja/tests/test_observation.exe"
+Directory: C:/Users/kaust/IdeaProjects/ai-bomber/build_ninja/tests
+"test_observation" start time: Jul 06 14:06 Pacific Daylight Time
+Output:
+----------------------------------------------------------
+test_observation: ALL PASSED (flat_size=506)
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"test_observation" end time: Jul 06 14:06 Pacific Daylight Time
+"test_observation" time elapsed: 00:00:00
+----------------------------------------------------------
+
+8/11 Testing: test_reward
+8/11 Test: test_reward
+Command: "C:/Users/kaust/IdeaProjects/ai-bomber/build_ninja/tests/test_reward.exe"
+Directory: C:/Users/kaust/IdeaProjects/ai-bomber/build_ninja/tests
+"test_reward" start time: Jul 06 14:06 Pacific Daylight Time
+Output:
+----------------------------------------------------------
+test_reward: ALL PASSED
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"test_reward" end time: Jul 06 14:06 Pacific Daylight Time
+"test_reward" time elapsed: 00:00:00
+----------------------------------------------------------
+
+9/11 Testing: test_replay
+9/11 Test: test_replay
+Command: "C:/Users/kaust/IdeaProjects/ai-bomber/build_ninja/tests/test_replay.exe"
+Directory: C:/Users/kaust/IdeaProjects/ai-bomber/build_ninja/tests
+"test_replay" start time: Jul 06 14:06 Pacific Daylight Time
+Output:
+----------------------------------------------------------
+test_replay: ALL PASSED
+<end of output>
+Test time =   0.16 sec
+----------------------------------------------------------
+Test Passed.
+"test_replay" end time: Jul 06 14:06 Pacific Daylight Time
+"test_replay" time elapsed: 00:00:00
+----------------------------------------------------------
+
+10/11 Testing: test_agents
+10/11 Test: test_agents
+Command: "C:/Users/kaust/IdeaProjects/ai-bomber/build_ninja/tests/test_agents.exe"
+Directory: C:/Users/kaust/IdeaProjects/ai-bomber/build_ninja/tests
+"test_agents" start time: Jul 06 14:06 Pacific Daylight Time
+Output:
+----------------------------------------------------------
+test_agents: ALL PASSED
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"test_agents" end time: Jul 06 14:06 Pacific Daylight Time
+"test_agents" time elapsed: 00:00:00
+----------------------------------------------------------
+
+11/11 Testing: test_determinism
+11/11 Test: test_determinism
+Command: "C:/Users/kaust/IdeaProjects/ai-bomber/build_ninja/tests/test_determinism.exe"
+Directory: C:/Users/kaust/IdeaProjects/ai-bomber/build_ninja/tests
+"test_determinism" start time: Jul 06 14:06 Pacific Daylight Time
+Output:
+----------------------------------------------------------
+test_determinism: ALL PASSED
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"test_determinism" end time: Jul 06 14:06 Pacific Daylight Time
+"test_determinism" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Jul 06 14:06 Pacific Daylight Time

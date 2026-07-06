@@ -30,6 +30,8 @@ int main(void) {
     env.state.agents[0].bomb_ammo = 1;
     result = place_bomb(&env.state, 0);
     assert(result == 0);
+    /* Reset ammo to 0 since we have 1 active bomb */
+    env.state.agents[0].bomb_ammo = 0;
 
     /* Bomb exists at agent position */
     assert(map_has_bomb(&env.state, env.state.agents[0].x, env.state.agents[0].y) == 1);

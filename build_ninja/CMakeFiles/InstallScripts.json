@@ -1,0 +1,9 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/Users/kaust/IdeaProjects/ai-bomber/build_ninja/cmake_install.cmake",
+		"C:/Users/kaust/IdeaProjects/ai-bomber/build_ninja/src/cmake_install.cmake",
+		"C:/Users/kaust/IdeaProjects/ai-bomber/build_ninja/tests/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
