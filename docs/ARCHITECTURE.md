@@ -3,92 +3,100 @@
 ## Design principles
 
 1. **Simulator first**: The core simulation is independent of rendering, ML, or any external framework.
-2. **Deterministic**: Same seed + same actions = same result, every time, on every platform.
-3. **No heap allocation in inner loop**: All state uses fixed-size arrays.
-4. **Clean C ABI**: Designed for future Python/ctypes/cffi integration.
-5. **Pluggable agents**: Agents implement a simple function pointer interface.
+2. **Deterministic**: Same seed and same action sequence produce the same result.
+3. **Fixed-size state**: The environment uses bounded arrays for maps, agents, bombs, replay data, and observations.
+4. **Clean C surface area**: The environment API is intentionally small so future Python, C++, or model-runtime bindings are straightforward.
+5. **Pluggable agents**: Agents implement a function-pointer interface and own per-instance state.
 
 ## Module overview
 
 ### Core (`src/core/`)
-- `rng`: SplitMix64-based deterministic PRNG. No global state.
-- `config`: Default and custom game configurations.
-- `math_util`: Inline math helpers (clamp, abs, min, max, manhattan distance).
+
+- `rng`: SplitMix64-based deterministic PRNG with no global state.
+- `config`: Default configurations and bounds normalization.
+- `math_util`: Inline math helpers.
 - `ring_buffer`: Fixed-size circular buffer for action history.
-- `replay`: Binary replay save/load and deterministic playback.
+- `replay`: Binary replay save/load helpers.
 - `metrics`: Episode-level statistics tracking and reporting.
 
 ### Environment (`src/env/`)
-- `env`: Main environment API (init, reset, step, observe, debug snapshot).
-- `bomber_state`: Fixed-size state struct (tiles, agents, bombs).
-- `bomber_map`: Map generation, bounds checking, walkability, bomb collision.
+
+- `env`: Main environment API: init, reset, step, observe, debug snapshot.
+- `bomber_state`: Fixed-size state struct for tiles, agents, and bombs.
+- `bomber_map`: Map generation, bounds checking, walkability, and bomb collision.
 - `bomber_bombs`: Bomb placement and ticking.
-- `bomber_blast`: Blast computation, crate destruction, chain reactions, damage.
-- `bomber_danger`: Danger map with time-to-blast, safe tiles, escape routes, trap detection.
-- `bomber_observation`: Compact local observation for ML + debug observation for viz.
-- `bomber_reward`: Configurable reward components with breakdown tracking.
-- `bomber_rules`: Movement, bomb placement, powerup pickup, terminal condition checks.
+- `bomber_blast`: Blast computation, crate destruction, chain reactions, and damage.
+- `bomber_danger`: Time-to-blast map, safe tiles, escape routes, and trap detection.
+- `bomber_observation`: Local observation tensor and compact debug observation.
+- `bomber_reward`: Configurable reward components with a per-step breakdown.
+- `bomber_rules`: Movement, placement, pickup, and terminal condition rules.
 
 ### Agents (`src/agents/`)
-- `agent`: Generic agent interface with function pointers.
-- `random_agent`: Uniform random action selection.
-- `scripted_agent`: Rule-based baseline (danger avoidance, crate bombing, powerup seeking).
-- `heuristic_bomber_agent`: Danger-map-aware agent with escape route verification.
-- `greedy_crate_agent`: Crate-focused agent that avoids suicide.
 
-### Sim (`src/sim/`)
-- `runner`: Episode runner with metrics and replay recording.
-- `benchmark`: Performance benchmarking.
-- `evaluator`: Agent comparison and evaluation.
+- `agent`: Generic agent factory and dispatch interface.
+- `random_agent`: Uniform random baseline.
+- `scripted_agent`: Rule-based baseline with danger avoidance and target seeking.
+- `heuristic_bomber_agent`: Danger-map-aware baseline with escape route checks.
+- `greedy_crate_agent`: Crate-focused baseline that avoids known danger.
+
+### Simulation (`src/sim/`)
+
+- `runner`: Episode runner with metrics and optional replay recording.
+- `benchmark`: Performance benchmark entry point.
+- `evaluator`: Agent comparison and aggregate evaluation.
 
 ### Visualizer (`src/viz/`)
+
 - `main_viz`: raylib entry point with live and replay modes.
-- `renderer`: All drawing functions for arena, panels, overlays.
-- `dashboard`: Layout manager and event detection.
+- `renderer`: Arena, overlays, panels, and status rendering.
+- `dashboard`: Layout and event tracking.
 - `charts`: Line and bar chart primitives.
 - `ui_controls`: Button and slider widgets.
+- `viz_session`: Multi-agent visualizer session state.
 
 ## Data flow
 
-```
-Config + Seed
+```text
+Config + seed
     |
     v
 env_init() -> env_reset()
     |
     v
-+---<--- loop ---<---+
-|                   |
-|  env_observe()    |
-|       |           |
-|       v           |
-|  agent_act()      |
-|       |           |
-|       v           |
-|  env_step()       |
-|       |           |
-|       v           |
-|  metrics_update() |
-|       |           |
-|  replay_record()  |
-|       |           |
-+-------<-----------+
++---<--- episode loop ---<---+
+|                            |
+|  env_observe()             |
+|       |                    |
+|       v                    |
+|  agent_act()               |
+|       |                    |
+|       v                    |
+|  env_step()                |
+|       |                    |
+|       v                    |
+|  metrics_update()          |
+|       |                    |
+|  replay_record() optional  |
+|       |                    |
++------------<---------------+
     |
     v
-  done? -> metrics_print() / replay_save()
+metrics_print() / replay_save()
 ```
 
 ## State representation
 
-All game state is in `BomberState`:
-- Fixed `MAX_HEIGHT x MAX_WIDTH` tile grid (31x31 max)
-- Up to `MAX_AGENTS` (8) agents
-- Up to `MAX_BOMBS` (64) bombs
-- No pointers, no heap allocation
+All game state is stored in `BomberState`:
 
-## Determinism
+- Fixed `MAX_HEIGHT x MAX_WIDTH` tile grid, currently capped at 31x31.
+- Up to `MAX_AGENTS` agents.
+- Up to `MAX_BOMBS` active or inactive bomb slots.
+- No heap pointers inside the environment state.
 
-- PRNG: SplitMix64 with explicit seed, no global state.
-- Map generation: deterministic from seed.
-- Enemy AI: uses the same RNG stream (sequential, not parallel).
-- Replay: seed + action list is sufficient for exact reproduction.
+## Determinism notes
+
+- PRNG state is explicit and local to the environment or the agent instance.
+- Map generation is seeded and deterministic.
+- Built-in agent RNG state must be per instance; file-static agent state would make side-by-side sessions interfere with each other.
+- The simple one-agent stepping API still owns the current environment opponent behavior. Explicit opponent policy wiring is tracked as a future runner improvement.
+- Replays currently record the controlled agent action stream; full multi-policy replay should also store opponent policy metadata and seed schedule.
