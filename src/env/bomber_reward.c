@@ -5,7 +5,7 @@
 #include "core/config.h"
 
 float reward_compute(RewardBreakdown* rb, BomberEnv* env, Action action,
-                     int agent_id, int prev_crates, int prev_powerups,
+                     int agent_id, int prev_crates, int powerups_collected,
                      int prev_enemies_alive, int was_in_danger) {
     memset(rb, 0, sizeof(RewardBreakdown));
     const BomberConfig* cfg = &env->config;
@@ -24,10 +24,9 @@ float reward_compute(RewardBreakdown* rb, BomberEnv* env, Action action,
         rb->crate_destroyed = cfg->crate_destroy_reward * (float)crates_destroyed;
     }
 
-    /* Powerup pickup: check if agent moved onto a powerup tile */
-    TileType tile = state->tiles[agent->y][agent->x];
-    if (tile == TILE_POWERUP_BOMB || tile == TILE_POWERUP_RANGE || tile == TILE_POWERUP_SPEED) {
-        rb->powerup = cfg->powerup_reward;
+    /* Powerup pickup is detected during env_step before the tile is cleared. */
+    if (powerups_collected > 0) {
+        rb->powerup = cfg->powerup_reward * (float)powerups_collected;
     }
 
     /* Enemy damage/elimination */
