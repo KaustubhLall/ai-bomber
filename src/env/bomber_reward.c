@@ -3,6 +3,7 @@
 #include "env/bomber_map.h"
 #include "env/bomber_blast.h"
 #include "core/config.h"
+#include <string.h>
 
 float reward_compute(RewardBreakdown* rb, BomberEnv* env, Action action,
                      int agent_id, int prev_crates, int powerups_collected,
