@@ -1,65 +1,68 @@
 # AI Bomber
 
-A high-performance Bomberman-style AI simulation environment and visualizer built in C17 with raylib.
+A deterministic Bomberman-style AI simulation environment, headless benchmark harness, and raylib visualizer written in C17.
 
-## Overview
+The project is built around a small fixed-size simulator that can run without a renderer or ML framework. Agents interact with the same observation and action interface whether they are rule-based baselines today or external model policies later.
 
-AI Bomber is a portfolio-quality local AI training sandbox where different agents learn to survive, place bombs, destroy crates, avoid blast zones, collect powerups, and eliminate opponents. The core is a clean, fast, deterministic simulator with a polished visualizer.
+## What this demonstrates
 
-**Key principles:**
-- Simulator first, models second
-- Deterministic seeded simulation
-- No heap allocation in the inner loop
-- Clean C ABI for future Python/ML integration
-- No dependency on PyTorch, TensorFlow, or any ML framework
+- A simulator-first architecture with deterministic seeds and replayable episodes
+- Fixed-size C data structures for predictable performance and simple debugging
+- Pluggable agents for random, scripted, heuristic, and crate-focused baselines
+- A local observation format designed to be exported to Python, C++, or another training loop
+- A raylib visualizer for inspecting reward, danger, bombs, local observations, and agent behavior
+- CTest coverage for core environment rules, determinism, replay, rewards, agents, and metrics
+
+## Current status
+
+The current implementation is a local research sandbox, not a trained neural agent. It includes rule-based baselines and a stable C interface so model training can be added without rewriting the simulator. The most useful next step is to connect the observation/action API to a training process and compare learned policies against the included baselines.
 
 ## Build
 
 ### Prerequisites
 
-- C17 compiler (GCC, Clang, or MSVC)
+- C17 compiler: GCC, Clang, or MSVC
 - CMake 3.16+
-- Ninja (recommended)
+- Ninja, recommended for fast local builds
 
 ### Build instructions
 
 ```bash
-# Configure
+# Configure a release build.
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
-# Build everything (including visualizer with raylib)
+# Build everything, including the raylib visualizer.
 cmake --build build
 
-# Build without visualizer (headless only)
+# Build the simulator, CLIs, and tests without the visualizer.
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DAI_BOMBER_BUILD_VIZ=OFF
 cmake --build build
 ```
 
-raylib is fetched automatically via CMake FetchContent when not found on the system.
+raylib is fetched automatically through CMake FetchContent when it is not already available on the system.
 
-## Run tests
+## Test
 
 ```bash
-cd build
-ctest --output-on-failure
+ctest --test-dir build --output-on-failure
 ```
 
-## Run headless simulation
+## Run headless simulations
 
 ```bash
-# Random agent, 1000 episodes
+# Random agent, 1000 episodes.
 ./build/bomber_headless --agent random --episodes 1000 --seed 1337
 
-# Heuristic agent with metrics export
+# Heuristic agent with metrics export.
 ./build/bomber_headless --agent heuristic --episodes 1000 --seed 1337 --export metrics.json
 
-# Battle mode
+# Battle mode with an explicit opponent policy.
 ./build/bomber_headless --mode battle --agent heuristic --enemy scripted --episodes 100
 
-# Compare all agents
+# Compare the built-in agents.
 ./build/bomber_headless --compare --episodes 500
 
-# Save replay
+# Save a replay of the first episode.
 ./build/bomber_headless --agent heuristic --episodes 1 --seed 42 --replay replay.bin
 ```
 
@@ -72,59 +75,59 @@ ctest --output-on-failure
 ## Run visualizer
 
 ```bash
-# Default: compare random, heuristic, and greedy agents across epochs
+# Default: compare random, heuristic, and greedy agents across epochs.
 ./build/bomber_viz --seed 1337 --epochs 500
 
-# Specific agents (repeat --agent for multiple)
+# Specific agents, repeating --agent for each policy.
 ./build/bomber_viz --agent random --agent scripted --agent heuristic --agent greedy
 
-# Single agent
+# Single agent.
 ./build/bomber_viz --agent heuristic --seed 1337
 
-# Replay mode
+# Replay mode.
 ./build/bomber_viz --replay replay.bin
 ```
 
 ### Visualizer views
 
-- **Arena View (1)**: Full board with danger overlay, local observation, status panel, reward graph, action distribution, bomb timeline, decision trace, event log, and controls
-- **Graphs View (2)**: Per-epoch reward, running average reward, action distribution, and training overview table for all agents
-- **Comparison View (3)**: Side-by-side mini arenas for all agents with training overview panel
+- **Arena View (1)**: board view with danger overlay, local observation, status panel, reward graph, action distribution, bomb timeline, decision trace, event log, and controls
+- **Graphs View (2)**: per-epoch reward, running average reward, action distribution, and training overview table for all agents
+- **Comparison View (3)**: side-by-side mini arenas for all configured agents with a shared training overview panel
 
 ### Visualizer controls
 
-- **SPACE**: Pause/Resume
-- **R**: Reset all sessions
-- **+/-**: Speed multiplier
-- **S**: Step (when paused)
-- **TAB**: Switch active agent
-- **1/2/3**: Switch view (Arena / Graphs / Comparison)
-- **N**: New epoch for active agent
-- **ESC**: Quit
+- **SPACE**: pause or resume
+- **R**: reset all sessions
+- **+/-**: adjust speed multiplier
+- **S**: step once while paused
+- **TAB**: switch active agent
+- **1/2/3**: switch view
+- **N**: start a new epoch for the active agent
+- **ESC**: quit
 
 ## Project structure
 
-```
-/src
-  /core       - RNG, config, math utils, ring buffer, replay, metrics
-  /env        - Bomberman environment, state, map, bombs, blast, danger, observation, reward
-  /agents     - Agent interface and implementations (random, scripted, heuristic, greedy)
-  /sim        - Runner, benchmark, evaluator
-  /viz        - Raylib visualizer (renderer, dashboard, charts, UI controls, session manager)
-  /cli        - Headless and benchmark CLI tools
-/tests        - CTest test suite
-/docs         - Documentation
-/assets       - Config files, sprites, fonts
+```text
+src/
+  core/       RNG, config, math utilities, ring buffer, replay, metrics
+  env/        environment state, rules, maps, bombs, blasts, danger, observation, reward
+  agents/     agent interface and built-in policies
+  sim/        runner, benchmark, evaluator
+  viz/        raylib visualizer and session manager
+  cli/        headless and benchmark entry points
+tests/        CTest suite
+docs/         design notes and API documentation
+assets/       optional configs, sprites, and fonts
 ```
 
-## Agents
+## Built-in agents
 
 | Agent | Description |
-|-------|-------------|
-| `random` | Uniform random actions |
-| `scripted` | Avoids blast danger, bombs near crates, seeks powerups |
-| `heuristic` | Uses danger map, only bombs with escape route, prioritizes survival |
-| `greedy` | Focuses on crate destruction while avoiding death |
+| --- | --- |
+| `random` | Uniform random action selection. Useful as a sanity-check baseline. |
+| `scripted` | Avoids immediate danger, bombs adjacent crates, and seeks visible powerups. |
+| `heuristic` | Uses danger information and escape checks before bombing. |
+| `greedy` / `greedy_crate` | Prioritizes crate destruction while still avoiding known danger. |
 
 ## Documentation
 
@@ -136,3 +139,10 @@ ctest --output-on-failure
 - [Visualizer](docs/VISUALIZER.md)
 - [Adding Agents](docs/ADDING_AGENTS.md)
 - [Future Model Integration](docs/FUTURE_MODELS.md)
+
+## Roadmap
+
+- External policy bridge for Python or another model runtime
+- More rigorous opponent policies and multi-agent evaluation
+- Better replay metadata for full multi-policy reproduction
+- Stable benchmark fixtures for comparing simulator changes over time
