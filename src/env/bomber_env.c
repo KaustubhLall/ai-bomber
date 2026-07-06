@@ -10,14 +10,20 @@
 #include <string.h>
 #include <stdio.h>
 
+static int is_powerup_tile(TileType tile) {
+    return tile == TILE_POWERUP_BOMB || tile == TILE_POWERUP_RANGE || tile == TILE_POWERUP_SPEED;
+}
+
 void env_init(BomberEnv* env, const BomberConfig* config) {
     memset(env, 0, sizeof(BomberEnv));
     env->config = *config;
-    rng_init(&env->rng, (uint64_t)config->seed);
-    env_reset(env, (uint64_t)config->seed);
+    config_normalize(&env->config);
+    rng_init(&env->rng, (uint64_t)env->config.seed);
+    env_reset(env, (uint64_t)env->config.seed);
 }
 
 void env_reset(BomberEnv* env, uint64_t seed) {
+    config_normalize(&env->config);
     rng_init(&env->rng, seed);
     map_generate(&env->state, &env->config, &env->rng);
     rb_init(&env->action_history);
@@ -35,7 +41,6 @@ StepResult env_step(BomberEnv* env, Action action) {
     BomberAgentState* agent = &state->agents[0];
     const BomberConfig* cfg = &env->config;
 
-    /* Track pre-step state for reward computation */
     int prev_crates = map_count_crates(state);
     int prev_enemies_alive = 0;
     for (int a = 1; a < state->agent_count; a++) {
@@ -43,10 +48,8 @@ StepResult env_step(BomberEnv* env, Action action) {
     }
     int was_in_danger = (env->danger.time_to_blast[agent->y][agent->x] >= 0) ? 1 : 0;
 
-    /* Record action */
     rb_push(&env->action_history, (int)action);
 
-    /* Execute action for agent 0 */
     int action_valid = 1;
     env->prev_agent_x = agent->x;
     env->prev_agent_y = agent->y;
@@ -72,24 +75,20 @@ StepResult env_step(BomberEnv* env, Action action) {
             break;
     }
 
-    /* Track progress for stall detection */
     if (agent->x != env->prev_agent_x || agent->y != env->prev_agent_y) {
         env->steps_since_progress = 0;
     } else {
         env->steps_since_progress++;
     }
 
-    /* Pick up powerups */
+    int powerups_collected = is_powerup_tile(state->tiles[agent->y][agent->x]) ? 1 : 0;
     rules_pickup_powerup(state, 0);
 
-    /* Simple enemy AI: move randomly (placeholder for scripted enemy bot) */
     for (int a = 1; a < state->agent_count; a++) {
         if (!state->agents[a].alive) continue;
-        /* Random walk: try a random direction */
         int dirs[4] = {ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT};
         int shuffled[4];
         for (int i = 0; i < 4; i++) shuffled[i] = dirs[i];
-        /* Fisher-Yates with rng */
         for (int i = 3; i > 0; i--) {
             int j = rng_range(&env->rng, 0, i + 1);
             int tmp = shuffled[i]; shuffled[i] = shuffled[j]; shuffled[j] = tmp;
@@ -102,27 +101,21 @@ StepResult env_step(BomberEnv* env, Action action) {
             }
         }
         rules_pickup_powerup(state, a);
-        /* Occasionally place bombs */
         if (moved && state->agents[a].bomb_ammo > 0 && rng_bool(&env->rng)) {
             rules_try_place_bomb(state, a, cfg->bomb_timer);
         }
     }
 
-    /* Tick bombs (decrement timers, explode at zero) */
     tick_bombs(state);
 
-    /* Recompute danger map */
     danger_compute(&env->danger, state);
     danger_compute_escape(&env->danger, state, 0);
 
-    /* Advance step counter */
     state->step++;
 
-    /* Compute reward */
     float reward = reward_compute(&env->last_reward, env, action, 0,
-                                   prev_crates, 0, prev_enemies_alive, was_in_danger);
+                                   prev_crates, powerups_collected, prev_enemies_alive, was_in_danger);
 
-    /* Apply invalid action penalty */
     if (!action_valid) {
         env->last_reward.invalid_action_penalty = cfg->invalid_action_penalty;
         reward += cfg->invalid_action_penalty;
@@ -131,7 +124,6 @@ StepResult env_step(BomberEnv* env, Action action) {
 
     state->total_reward += reward;
 
-    /* Check terminal */
     TerminalReason terminal = rules_check_terminal(state, 0, cfg->max_steps);
     result.reward = reward;
     result.terminal_reason = terminal;
@@ -154,7 +146,6 @@ void env_get_debug_snapshot(const BomberEnv* env, DebugSnapshot* out) {
     out->cumulative_reward = env->state.total_reward;
     out->determinism_ok = 1;
 
-    /* Generate decision text */
     const char* action_names[] = {"UP", "DOWN", "LEFT", "RIGHT", "BOMB", "WAIT"};
     if (out->last_action >= 0 && out->last_action < ACTION_COUNT) {
         snprintf(out->decision_text, sizeof(out->decision_text),
