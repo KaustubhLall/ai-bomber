@@ -37,25 +37,26 @@ int rules_try_place_bomb(BomberState* state, int agent_id, int bomb_timer) {
     return 1;
 }
 
-void rules_pickup_powerup(BomberState* state, int agent_id) {
+int rules_pickup_powerup(BomberState* state, int agent_id) {
     BomberAgentState* agent = &state->agents[agent_id];
-    if (!agent->alive) return;
+    if (!agent->alive) return 0;
+
     TileType tile = state->tiles[agent->y][agent->x];
     switch (tile) {
         case TILE_POWERUP_BOMB:
             agent->bomb_ammo++;
             state->tiles[agent->y][agent->x] = TILE_FLOOR;
-            break;
+            return 1;
         case TILE_POWERUP_RANGE:
             agent->blast_range++;
             state->tiles[agent->y][agent->x] = TILE_FLOOR;
-            break;
+            return 1;
         case TILE_POWERUP_SPEED:
             agent->speed++;
             state->tiles[agent->y][agent->x] = TILE_FLOOR;
-            break;
+            return 1;
         default:
-            break;
+            return 0;
     }
 }
 
