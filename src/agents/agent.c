@@ -5,6 +5,13 @@
 #include "agents/greedy_crate_agent.h"
 #include <string.h>
 
+void* agent_impl_storage(Agent* agent, size_t required_size) {
+    if (!agent || required_size > sizeof(agent->storage.bytes)) {
+        return NULL;
+    }
+    return (void*)agent->storage.bytes;
+}
+
 void agent_init(Agent* agent, AgentType type) {
     memset(agent, 0, sizeof(Agent));
     agent->type = type;
@@ -13,17 +20,18 @@ void agent_init(Agent* agent, AgentType type) {
         case AGENT_SCRIPTED:     scripted_agent_init(agent); break;
         case AGENT_HEURISTIC:    heuristic_agent_init(agent); break;
         case AGENT_GREEDY_CRATE: greedy_crate_agent_init(agent); break;
-        case AGENT_ENEMY_BOT:    scripted_agent_init(agent); break; /* reuse scripted */
+        case AGENT_ENEMY_BOT:    scripted_agent_init(agent); break; /* reuse scripted baseline */
         case AGENT_EXTERNAL:     random_agent_init(agent); break;  /* placeholder */
     }
 }
 
 Action agent_act(Agent* agent, const Observation* obs, const DebugSnapshot* debug) {
+    if (!agent || !agent->act) return ACTION_WAIT;
     return agent->act(agent, obs, debug);
 }
 
 void agent_reset(Agent* agent, uint64_t seed) {
-    if (agent->reset) agent->reset(agent, seed);
+    if (agent && agent->reset) agent->reset(agent, seed);
 }
 
 AgentType agent_parse_type(const char* name) {

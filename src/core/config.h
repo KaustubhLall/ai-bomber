@@ -47,5 +47,6 @@ typedef struct {
 void config_defaults(BomberConfig* cfg);
 void config_survival(BomberConfig* cfg);
 void config_battle(BomberConfig* cfg);
+void config_normalize(BomberConfig* cfg);
 
 #endif /* BOMBER_CONFIG_H */

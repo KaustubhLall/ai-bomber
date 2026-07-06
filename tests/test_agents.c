@@ -4,18 +4,12 @@
 #include <assert.h>
 #include <stdio.h>
 
-int main(void) {
-    BomberConfig cfg;
-    config_survival(&cfg);
-    cfg.seed = 1;
-    cfg.max_steps = 50;
-
-    /* Test random agent */
+static void run_agent_smoke(BomberConfig* cfg, AgentType type) {
     BomberEnv env;
-    env_init(&env, &cfg);
+    env_init(&env, cfg);
 
     Agent agent;
-    agent_init(&agent, AGENT_RANDOM);
+    agent_init(&agent, type);
     agent_reset(&agent, 1);
 
     Observation obs;
@@ -30,57 +24,34 @@ int main(void) {
         if (env.state.agents[0].alive) steps_survived++;
         if (r.done) break;
     }
-    assert(steps_survived >= 0); /* smoke test: ran without crash */
-
-    /* Test scripted agent */
-    env_init(&env, &cfg);
-    agent_init(&agent, AGENT_SCRIPTED);
-    agent_reset(&agent, 1);
-
-    steps_survived = 0;
-    for (int i = 0; i < 50; i++) {
-        env_observe(&env, 0, &obs);
-        env_get_debug_snapshot(&env, &snap);
-        Action a = agent_act(&agent, &obs, &snap);
-        StepResult r = env_step(&env, a);
-        if (env.state.agents[0].alive) steps_survived++;
-        if (r.done) break;
-    }
     assert(steps_survived >= 0);
+}
 
-    /* Test heuristic agent */
-    env_init(&env, &cfg);
-    agent_init(&agent, AGENT_HEURISTIC);
-    agent_reset(&agent, 1);
+int main(void) {
+    BomberConfig cfg;
+    config_survival(&cfg);
+    cfg.seed = 1;
+    cfg.max_steps = 50;
 
-    steps_survived = 0;
-    for (int i = 0; i < 50; i++) {
-        env_observe(&env, 0, &obs);
-        env_get_debug_snapshot(&env, &snap);
-        Action a = agent_act(&agent, &obs, &snap);
-        StepResult r = env_step(&env, a);
-        if (env.state.agents[0].alive) steps_survived++;
-        if (r.done) break;
-    }
-    assert(steps_survived >= 0);
+    run_agent_smoke(&cfg, AGENT_RANDOM);
+    run_agent_smoke(&cfg, AGENT_SCRIPTED);
+    run_agent_smoke(&cfg, AGENT_HEURISTIC);
+    run_agent_smoke(&cfg, AGENT_GREEDY_CRATE);
 
-    /* Test greedy crate agent */
-    env_init(&env, &cfg);
-    agent_init(&agent, AGENT_GREEDY_CRATE);
-    agent_reset(&agent, 1);
+    Agent a;
+    Agent b;
+    agent_init(&a, AGENT_RANDOM);
+    agent_init(&b, AGENT_RANDOM);
+    assert(a.impl != NULL);
+    assert(b.impl != NULL);
+    assert(a.impl != b.impl);
 
-    steps_survived = 0;
-    for (int i = 0; i < 50; i++) {
-        env_observe(&env, 0, &obs);
-        env_get_debug_snapshot(&env, &snap);
-        Action a = agent_act(&agent, &obs, &snap);
-        StepResult r = env_step(&env, a);
-        if (env.state.agents[0].alive) steps_survived++;
-        if (r.done) break;
-    }
-    assert(steps_survived >= 0);
+    agent_init(&a, AGENT_SCRIPTED);
+    agent_init(&b, AGENT_SCRIPTED);
+    assert(a.impl != NULL);
+    assert(b.impl != NULL);
+    assert(a.impl != b.impl);
 
-    /* Test agent_parse_type */
     assert(agent_parse_type("random") == AGENT_RANDOM);
     assert(agent_parse_type("scripted") == AGENT_SCRIPTED);
     assert(agent_parse_type("heuristic") == AGENT_HEURISTIC);
