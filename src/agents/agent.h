@@ -3,6 +3,9 @@
 
 #include "env/env.h"
 #include "env/bomber_observation.h"
+#include <stddef.h>
+
+#define AGENT_IMPL_CAPACITY 512
 
 typedef struct Agent Agent;
 
@@ -18,11 +21,19 @@ typedef enum {
     AGENT_EXTERNAL
 } AgentType;
 
+typedef union {
+    unsigned char bytes[AGENT_IMPL_CAPACITY];
+    uint64_t align_u64;
+    double align_double;
+    void* align_ptr;
+} AgentImplStorage;
+
 struct Agent {
     AgentType type;
     AgentActFn act;
     AgentResetFn reset;
-    void* impl; /* Pointer to specific agent state */
+    void* impl; /* Pointer into storage or an external policy implementation. */
+    AgentImplStorage storage;
     char name[32];
 };
 
@@ -30,5 +41,6 @@ void agent_init(Agent* agent, AgentType type);
 Action agent_act(Agent* agent, const Observation* obs, const DebugSnapshot* debug);
 void agent_reset(Agent* agent, uint64_t seed);
 AgentType agent_parse_type(const char* name);
+void* agent_impl_storage(Agent* agent, size_t required_size);
 
 #endif /* BOMBER_AGENT_H */
