@@ -56,8 +56,8 @@ ctest --test-dir build --output-on-failure
 # Heuristic agent with metrics export.
 ./build/bomber_headless --agent heuristic --episodes 1000 --seed 1337 --export metrics.json
 
-# Battle mode with an explicit opponent policy.
-./build/bomber_headless --mode battle --agent heuristic --enemy scripted --episodes 100
+# Battle mode with the current deterministic environment opponent behavior.
+./build/bomber_headless --mode battle --agent heuristic --episodes 100
 
 # Compare the built-in agents.
 ./build/bomber_headless --compare --episodes 500
@@ -143,6 +143,6 @@ assets/       optional configs, sprites, and fonts
 ## Roadmap
 
 - External policy bridge for Python or another model runtime
-- More rigorous opponent policies and multi-agent evaluation
+- Explicit opponent policy wiring in the headless runner
 - Better replay metadata for full multi-policy reproduction
 - Stable benchmark fixtures for comparing simulator changes over time
