@@ -79,8 +79,8 @@ StepResult env_step(BomberEnv* env, Action action) {
         env->steps_since_progress++;
     }
 
-    /* Pick up powerups */
-    rules_pickup_powerup(state, 0);
+    /* Pick up powerups. Capture the result before the tile is cleared for rewards/metrics. */
+    int powerups_collected = rules_pickup_powerup(state, 0);
 
     /* Simple enemy AI: move randomly (placeholder for scripted enemy bot) */
     for (int a = 1; a < state->agent_count; a++) {
@@ -101,7 +101,7 @@ StepResult env_step(BomberEnv* env, Action action) {
                 break;
             }
         }
-        rules_pickup_powerup(state, a);
+        (void)rules_pickup_powerup(state, a);
         /* Occasionally place bombs */
         if (moved && state->agents[a].bomb_ammo > 0 && rng_bool(&env->rng)) {
             rules_try_place_bomb(state, a, cfg->bomb_timer);
@@ -120,7 +120,8 @@ StepResult env_step(BomberEnv* env, Action action) {
 
     /* Compute reward */
     float reward = reward_compute(&env->last_reward, env, action, 0,
-                                   prev_crates, 0, prev_enemies_alive, was_in_danger);
+                                   prev_crates, powerups_collected,
+                                   prev_enemies_alive, was_in_danger);
 
     /* Apply invalid action penalty */
     if (!action_valid) {
