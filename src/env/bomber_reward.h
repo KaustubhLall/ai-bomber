@@ -26,7 +26,7 @@ typedef struct {
 } RewardBreakdown;
 
 float reward_compute(RewardBreakdown* rb, BomberEnv* env, Action action,
-                     int agent_id, int prev_crates, int prev_powerups,
+                     int agent_id, int prev_crates, int powerups_collected,
                      int prev_enemies_alive, int was_in_danger);
 
 #endif /* BOMBER_REWARD_H */
