@@ -57,6 +57,7 @@ if(AI_BOMBER_BUILD_VIZ)
         viz/dashboard.c
         viz/charts.c
         viz/ui_controls.c
+        viz/viz_session.c
     )
     target_link_libraries(bomber_viz PRIVATE bomber_core raylib)
 endif()

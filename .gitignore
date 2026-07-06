@@ -1,5 +1,7 @@
 # Build artifacts
 build/
+build_viz/
+build_viz.bat
 *.exe
 *.lib
 *.pdb

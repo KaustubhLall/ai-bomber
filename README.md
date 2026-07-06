@@ -72,19 +72,34 @@ ctest --output-on-failure
 ## Run visualizer
 
 ```bash
-# Live mode with heuristic agent
-./build/bomber_viz --live --agent heuristic --seed 1337
+# Default: compare random, heuristic, and greedy agents across epochs
+./build/bomber_viz --seed 1337 --epochs 500
+
+# Specific agents (repeat --agent for multiple)
+./build/bomber_viz --agent random --agent scripted --agent heuristic --agent greedy
+
+# Single agent
+./build/bomber_viz --agent heuristic --seed 1337
 
 # Replay mode
 ./build/bomber_viz --replay replay.bin
 ```
 
+### Visualizer views
+
+- **Arena View (1)**: Full board with danger overlay, local observation, status panel, reward graph, action distribution, bomb timeline, decision trace, event log, and controls
+- **Graphs View (2)**: Per-epoch reward, running average reward, action distribution, and training overview table for all agents
+- **Comparison View (3)**: Side-by-side mini arenas for all agents with training overview panel
+
 ### Visualizer controls
 
 - **SPACE**: Pause/Resume
-- **R**: Reset episode
+- **R**: Reset all sessions
 - **+/-**: Speed multiplier
 - **S**: Step (when paused)
+- **TAB**: Switch active agent
+- **1/2/3**: Switch view (Arena / Graphs / Comparison)
+- **N**: New epoch for active agent
 - **ESC**: Quit
 
 ## Project structure
@@ -95,7 +110,7 @@ ctest --output-on-failure
   /env        - Bomberman environment, state, map, bombs, blast, danger, observation, reward
   /agents     - Agent interface and implementations (random, scripted, heuristic, greedy)
   /sim        - Runner, benchmark, evaluator
-  /viz        - Raylib visualizer (renderer, dashboard, charts, UI controls)
+  /viz        - Raylib visualizer (renderer, dashboard, charts, UI controls, session manager)
   /cli        - Headless and benchmark CLI tools
 /tests        - CTest test suite
 /docs         - Documentation

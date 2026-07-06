@@ -127,7 +127,7 @@ void dashboard_draw(DashboardState* ds, const DebugSnapshot* snap, const Observa
     int left_ox = 8;
 
     renderer_draw_status_panel(snap, left_ox, 20, left_w, 140);
-    renderer_draw_local_obs(obs, left_ox, 170, left_w, 16);
+    renderer_draw_local_obs(obs, left_ox, 170, 16);
     renderer_draw_danger_map(snap, left_ox, 400, left_w, 200);
 
     /* Right panel: reward graph + action dist + bomb timeline + decision trace + event log + controls */
