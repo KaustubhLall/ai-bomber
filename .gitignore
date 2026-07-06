@@ -1,0 +1,22 @@
+# Build artifacts
+build/
+*.exe
+*.lib
+*.pdb
+*.obj
+
+# IDE files
+.vs/
+.vscode/
+*.user
+
+# Raylib build cache
+src/lib/
+
+# Test artifacts
+*.bin
+test_replay.bin
+
+# OS files
+Thumbs.db
+.DS_Store
