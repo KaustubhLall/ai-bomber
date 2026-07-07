@@ -7,7 +7,7 @@ $shell = New-Object -ComObject WScript.Shell
 $items = @(
     @{ Name='AI Bomber - MCTS'; Args='--agent mcts --enemy heuristic --agents 2 --fps 60 --start-paused' },
     @{ Name='AI Bomber - Alpha Beta'; Args='--agent alpha-beta --enemy heuristic --agents 2 --fps 60 --start-paused' },
-    @{ Name='AI Bomber - Policy Comparison'; Args='--fps 60' }
+    @{ Name='AI Bomber - Policy Comparison'; Args='--agent mcts --agent heuristic --agent greedy --agent alpha-beta --agent random --enemy heuristic --fps 60' }
 )
 foreach ($item in $items) {
     $shortcut = $shell.CreateShortcut((Join-Path $desktop ($item.Name + '.lnk')))

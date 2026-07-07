@@ -22,7 +22,9 @@ The visualizer is built with raylib and provides a portfolio-quality dashboard f
 | R | Reset episode |
 | + / = | Increase speed |
 | - | Decrease speed |
-| [ / ] | Decrease/increase render FPS (15, 30, 60, 120, 240) |
+| F2 / F3 or Sim buttons | Decrease/increase simulation steps per frame |
+| F5 / F6 or FPS buttons | Decrease/increase render FPS preset |
+| F7 or Set FPS | Enter an exact FPS from 5 to 1000 |
 | H | Toggle help and powerup guide |
 | S | Single step (when paused) |
 | ESC | Quit |

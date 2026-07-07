@@ -132,8 +132,9 @@ shown explicitly as `Opponent Policy: built-in-random`.
 
 - **SPACE**: pause or resume
 - **R**: reset all sessions
-- **+/-**: adjust speed multiplier
-- **[ / ]**: lower or raise render FPS through 15/30/60/120/240 (independent of simulation speed)
+- **F2/F3** or the visible **Sim - / Sim +** buttons: adjust simulation steps per rendered frame
+- **F5/F6** or the visible **FPS - / FPS +** buttons: change render FPS presets
+- **F7** or **Set FPS**: type an exact render FPS from 5 to 1000
 - **H**: open the in-app controls and powerup guide
 - **S**: step once while paused
 - **TAB**: switch active agent
@@ -153,6 +154,8 @@ shown explicitly as `Opponent Policy: built-in-random`.
 - **Speed level (blue)** is recorded in state and observations, but does not currently alter grid movement speed.
 
 With the default configuration, a destroyed crate has a 30% chance to reveal one of the three powerups.
+
+The default visualizer now runs only MCTS against the heuristic opponent for one match and then pauses. Use the Policy Comparison shortcut for five simultaneous policy sessions, `--epochs N` for repeated matches, or `--enemy builtin-random` for the old non-adversarial fallback.
 
 ### Screenshots
 

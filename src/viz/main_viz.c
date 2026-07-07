@@ -38,6 +38,36 @@ static int next_fps(int current, int direction) {
     return choices[idx];
 }
 
+static void apply_fps(VizSession* vs, int fps) {
+    if (fps < 5) fps = 5;
+    if (fps > 1000) fps = 1000;
+    vs->target_fps = fps;
+    SetTargetFPS(fps);
+}
+
+static void draw_runtime_controls(const VizSession* vs, int editing, const char* entry) {
+    const ThemeColors* tc = theme_colors();
+    const char* labels[] = {"Sim -", "Sim +", "FPS -", "FPS +", "Set FPS"};
+    DrawRectangle(570, 58, 465, 28, (Color){18, 24, 34, 245});
+    for (int i = 0; i < 5; i++) {
+        int x = 575 + i * 90;
+        DrawRectangle(x, 61, 82, 22, tc->button);
+        DrawRectangleLines(x, 61, 82, 22, tc->panel_border);
+        DrawText(labels[i], x + 9, 66, 12, tc->text_primary);
+    }
+    char status[96];
+    snprintf(status, sizeof(status), "Sim %dx | FPS %d", vs->speed_mult, vs->target_fps);
+    DrawText(status, 1044, 66, 12, tc->text_secondary);
+    if (editing) {
+        DrawRectangle(520, 360, 360, 120, (Color){15, 21, 31, 250});
+        DrawRectangleLines(520, 360, 360, 120, tc->agent);
+        DrawText("Set render FPS (5-1000)", 548, 382, 20, tc->text_primary);
+        DrawRectangle(548, 418, 300, 34, (Color){8, 12, 18, 255});
+        DrawText(entry[0] ? entry : "type a number", 560, 427, 18, entry[0] ? tc->positive : tc->text_dim);
+        DrawText("ENTER apply | ESC cancel", 585, 458, 12, tc->text_secondary);
+    }
+}
+
 static void draw_help_overlay(int screen_w, int screen_h) {
     const ThemeColors* tc = theme_colors();
     int w = 760, h = 520, x = (screen_w - w) / 2, y = (screen_h - h) / 2;
@@ -61,7 +91,9 @@ static void draw_help_overlay(int screen_w, int screen_h) {
     DrawText("Speed level", x + 58, y + 376, 16, tc->text_primary);
     DrawText("Currently tracked in state/observations, but does not yet change grid movement.", x + 58, y + 398, 14, tc->warning);
     DrawText("Powerups have a 30% default chance to replace a destroyed crate.", x + 24, y + 452, 14, tc->text_secondary);
-    DrawText("Press H to return", x + w - 150, y + h - 34, 14, tc->text_dim);
+    DrawRectangle(x + w - 150, y + h - 44, 126, 28, tc->button);
+    DrawRectangleLines(x + w - 150, y + h - 44, 126, 28, tc->panel_border);
+    DrawText("Close help (H)", x + w - 139, y + h - 37, 14, tc->text_primary);
 }
 
 static void ensure_screenshot_dir(void) {
@@ -475,11 +507,11 @@ int main(int argc, char** argv) {
     const char* agent_names[8];
     int agent_count = 0;
     uint64_t seed = 1337;
-    int max_epochs = 500;
+    int max_epochs = 1;
     int target_fps = 60;
     int start_paused = 0;
     const char* replay_file = NULL;
-    const char* enemy_name = NULL;
+    const char* enemy_name = "heuristic";
     int arena_agent_count = 2;
 
     for (int i = 1; i < argc; i++) {
@@ -487,6 +519,7 @@ int main(int argc, char** argv) {
             if (agent_count < 8) agent_names[agent_count++] = argv[++i];
         } else if (strcmp(argv[i], "--enemy") == 0 && i + 1 < argc) {
             enemy_name = argv[++i];
+            if (strcmp(enemy_name, "builtin-random") == 0) enemy_name = NULL;
         } else if (strcmp(argv[i], "--agents") == 0 && i + 1 < argc) {
             arena_agent_count = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
@@ -495,7 +528,8 @@ int main(int argc, char** argv) {
             max_epochs = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--fps") == 0 && i + 1 < argc) {
             target_fps = atoi(argv[++i]);
-            if (target_fps != 15 && target_fps != 30 && target_fps != 60 && target_fps != 120 && target_fps != 240) target_fps = 60;
+            if (target_fps < 5) target_fps = 5;
+            if (target_fps > 1000) target_fps = 1000;
         } else if (strcmp(argv[i], "--start-paused") == 0) {
             start_paused = 1;
         } else if (strcmp(argv[i], "--replay") == 0 && i + 1 < argc) {
@@ -504,11 +538,11 @@ int main(int argc, char** argv) {
             printf("Usage: bomber_viz [options]\n");
             printf("Options:\n");
             printf("  --agent <type>   Agent type: random, scripted, heuristic, greedy, alpha-beta, mcts\n");
-            printf("  --enemy <type>   Shared opponent policy; omit for built-in-random\n");
+            printf("  --enemy <type>   Opponent policy (default heuristic; use builtin-random explicitly)\n");
             printf("  --agents <n>     Arena agent count, 1-%d (default 2)\n", MAX_AGENTS);
             printf("  --seed <n>       Random seed (default 1337)\n");
-            printf("  --epochs <n>     Max epochs to run (default 500)\n");
-            printf("  --fps <n>        Render FPS: 15, 30, 60, 120, or 240\n");
+            printf("  --epochs <n>     Match count (default 1, then pauses)\n");
+            printf("  --fps <n>        Exact render FPS from 5 to 1000\n");
             printf("  --start-paused   Open paused for inspection\n");
             printf("  --replay <file>  Load replay file instead of live mode\n");
             printf("  --help           Show this help\n");
@@ -518,6 +552,9 @@ int main(int argc, char** argv) {
             printf("  [S]       Step once (when paused)\n");
             printf("  [+/-]     Speed up/down\n");
             printf("  [[/]]     Render FPS down/up\n");
+            printf("  [F2/F3]   Simulation speed down/up\n");
+            printf("  [F5/F6]   Render FPS down/up\n");
+            printf("  [F7]      Type an exact render FPS\n");
             printf("  [H]       Help and powerup guide\n");
             printf("  [TAB]     Switch active agent\n");
             printf("  [1/2/3/4] Switch view: Arena / Compare / Graphs / Debug\n");
@@ -531,10 +568,6 @@ int main(int argc, char** argv) {
 
     if (agent_count == 0) {
         agent_names[agent_count++] = "mcts";
-        agent_names[agent_count++] = "heuristic";
-        agent_names[agent_count++] = "greedy";
-        agent_names[agent_count++] = "alpha-beta";
-        agent_names[agent_count++] = "random";
     }
 
     InitWindow(SCREEN_W, SCREEN_H, "AI Bomber - Visualizer");
@@ -580,8 +613,19 @@ int main(int argc, char** argv) {
     }
 
     int should_exit = 0;
+    int fps_editing = 0;
+    char fps_entry[8] = {0};
+    int fps_entry_len = 0;
     while (!should_exit && !WindowShouldClose()) {
-        if (IsKeyPressed(KEY_ESCAPE)) should_exit = 1;
+        if (fps_editing) {
+            int ch;
+            while ((ch = GetCharPressed()) > 0) if (ch >= '0' && ch <= '9' && fps_entry_len < 7) {
+                fps_entry[fps_entry_len++] = (char)ch; fps_entry[fps_entry_len] = '\0';
+            }
+            if (IsKeyPressed(KEY_BACKSPACE) && fps_entry_len > 0) fps_entry[--fps_entry_len] = '\0';
+            if (IsKeyPressed(KEY_ENTER) && fps_entry_len > 0) { apply_fps(&vs, atoi(fps_entry)); fps_editing = 0; }
+            if (IsKeyPressed(KEY_ESCAPE)) fps_editing = 0;
+        } else if (IsKeyPressed(KEY_ESCAPE)) should_exit = 1;
         if (IsKeyPressed(KEY_SPACE)) vs.paused = !vs.paused;
         if (IsKeyPressed(KEY_R)) viz_session_reset_all(&vs);
         if (IsKeyPressed(KEY_S) && vs.paused) vs.step_once = 1;
@@ -589,8 +633,20 @@ int main(int argc, char** argv) {
             vs.speed_mult = (vs.speed_mult * 2 > 16) ? 16 : vs.speed_mult * 2;
         if (IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT))
             vs.speed_mult = (vs.speed_mult / 2 < 1) ? 1 : vs.speed_mult / 2;
-        if (IsKeyPressed(KEY_LEFT_BRACKET)) { vs.target_fps = next_fps(vs.target_fps, -1); SetTargetFPS(vs.target_fps); }
-        if (IsKeyPressed(KEY_RIGHT_BRACKET)) { vs.target_fps = next_fps(vs.target_fps, 1); SetTargetFPS(vs.target_fps); }
+        if (IsKeyPressed(KEY_F2)) vs.speed_mult = (vs.speed_mult / 2 < 1) ? 1 : vs.speed_mult / 2;
+        if (IsKeyPressed(KEY_F3)) vs.speed_mult = (vs.speed_mult * 2 > 16) ? 16 : vs.speed_mult * 2;
+        if (IsKeyPressed(KEY_LEFT_BRACKET) || IsKeyPressed(KEY_F5)) apply_fps(&vs, next_fps(vs.target_fps, -1));
+        if (IsKeyPressed(KEY_RIGHT_BRACKET) || IsKeyPressed(KEY_F6)) apply_fps(&vs, next_fps(vs.target_fps, 1));
+        if (IsKeyPressed(KEY_F7)) { fps_editing = 1; fps_entry_len = 0; fps_entry[0] = '\0'; }
+        if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+            Vector2 mouse = GetMousePosition();
+            if (CheckCollisionPointRec(mouse, (Rectangle){575,61,82,22})) vs.speed_mult = (vs.speed_mult / 2 < 1) ? 1 : vs.speed_mult / 2;
+            else if (CheckCollisionPointRec(mouse, (Rectangle){665,61,82,22})) vs.speed_mult = (vs.speed_mult * 2 > 16) ? 16 : vs.speed_mult * 2;
+            else if (CheckCollisionPointRec(mouse, (Rectangle){755,61,82,22})) apply_fps(&vs, next_fps(vs.target_fps, -1));
+            else if (CheckCollisionPointRec(mouse, (Rectangle){845,61,82,22})) apply_fps(&vs, next_fps(vs.target_fps, 1));
+            else if (CheckCollisionPointRec(mouse, (Rectangle){935,61,82,22})) { fps_editing = 1; fps_entry_len = 0; fps_entry[0] = '\0'; }
+            else if (vs.show_help && CheckCollisionPointRec(mouse, (Rectangle){910,646,126,28})) vs.show_help = 0;
+        }
         if (IsKeyPressed(KEY_H)) vs.show_help = !vs.show_help;
         if (IsKeyPressed(KEY_TAB)) {
             vs.active_session = (vs.active_session + 1) % vs.session_count;
@@ -636,6 +692,7 @@ int main(int argc, char** argv) {
             case VIEW_DEBUG:       draw_graphs_view(&vs, SCREEN_W, SCREEN_H); break;
         }
         if (vs.show_help) draw_help_overlay(SCREEN_W, SCREEN_H);
+        draw_runtime_controls(&vs, fps_editing, fps_entry);
 
         if (screenshot_toast_frames > 0) {
             DrawRectangle(SCREEN_W - 180, SCREEN_H - 48, 160, 30, (Color){18, 28, 38, 235});

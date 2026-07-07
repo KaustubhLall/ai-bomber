@@ -181,7 +181,10 @@ uint64_t env_state_hash(const BomberEnv* env) {
 }
 
 void env_observe(const BomberEnv* env, int agent_id, Observation* obs) {
-    obs_compute(&env->state, &env->danger, agent_id,
+    DangerMap perspective_danger;
+    danger_compute(&perspective_danger, &env->state);
+    danger_compute_escape(&perspective_danger, &env->state, agent_id);
+    obs_compute(&env->state, &perspective_danger, agent_id,
                 rb_get(&env->action_history, rb_size(&env->action_history) - 1), obs);
 }
 

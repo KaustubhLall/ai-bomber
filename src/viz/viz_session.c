@@ -132,7 +132,7 @@ void viz_session_step(VizSession* vs) {
         if (s->episode_done) {
             if (vs->auto_advance_epoch && s->epoch_count < vs->max_epochs) {
                 record_epoch(vs, i);
-                viz_session_reset_epoch(vs, i);
+                if (s->epoch_count < vs->max_epochs) viz_session_reset_epoch(vs, i);
             }
             continue;
         }
@@ -211,4 +211,8 @@ void viz_session_step(VizSession* vs) {
             }
         }
     }
+    int all_complete = vs->session_count > 0;
+    for (int i = 0; i < vs->session_count; i++)
+        if (!vs->sessions[i].episode_done || vs->sessions[i].epoch_count < vs->max_epochs) all_complete = 0;
+    if (all_complete) vs->paused = 1;
 }
