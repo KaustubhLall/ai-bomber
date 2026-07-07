@@ -1,48 +1,62 @@
 # Adversarial evaluation audit
 
-## What counts as evidence
+## Evidence standard
 
-A headline win rate is not enough. Every benchmark row now separates owned
-eliminations, self-eliminations, opponent self-eliminations, and eliminations
-caused by the opponent. Matrix summaries combine both spawn/role orientations.
-This prevents a passive policy from receiving combat credit when its opponent
-simply blows itself up.
+A win counts as combat evidence only when the opponent's `death_owner` is the
+evaluated policy. Reports separately retain owned eliminations, self-kills,
+opponent self-kills, and opponent kills. Every promotion run uses both spawn
+orientations. Battle mode has no survival reward, penalizes timeouts, and ends
+after 200 steps.
 
-Battle reward also no longer pays a per-step survival bonus. Timeouts carry a
--1 penalty, prolonged waiting carries a larger penalty, elimination reward is
-only granted to the bomb owner, and a battle ends after 200 steps.
+Heuristic and greedy now use the same adversarial bomb-survival proof as MCTS.
+They may place a bomb only when they can survive every legal immediate opponent
+reply, and they follow a robust escape action while their bomb is active. In a
+40-game development check (`seed 28001`) they recorded zero self-kills;
+heuristic earned 18 real eliminations against greedy. They are therefore useful
+opponents rather than sources of donated wins. The bomb-free evasive and
+alpha-beta policies remain draw/safety stress tests.
 
-## July 7, 2026 audit run
+## Candidate policy
 
-Command:
+MCTS is an open-loop UCT search with 96 simulations and rollout depth 12. It
+uses adversarial opponent replies, causal progress features, upgrade-aware
+tactical rollouts, repetition avoidance, and a separate robust execution-time
+bomb/escape proof. Exact simultaneous player swaps are resolved atomically, so
+head-on movement cannot create a permanent engine body-lock.
+
+## Untouched holdout: seeds 40001-40010
+
+Commands used each policy pair in both role orientations:
 
 ```powershell
-build-codex-vs/src/Release/bomber_benchmark.exe --matrix --episodes 20 --seed 9001 --suite post-audit --output results/post-audit-20.json
-python tools/summarize_matrix.py results/post-audit-20.json
+build-codex-vs/src/Release/bomber_headless.exe --mode battle --agent mcts --enemy greedy --episodes 10 --seed 40001
+build-codex-vs/src/Release/bomber_headless.exe --mode battle --agent greedy --enemy mcts --episodes 10 --seed 40001
 ```
 
-This is a 20-episode-per-orientation diagnostic run, not a final statistical
-claim. In the role-balanced results MCTS went 30-8-2 against heuristic and
-39-1-0 against greedy. However, MCTS produced only 2 owned eliminations in the
-40 heuristic games and 3 in the 40 greedy games. MCTS-vs-MCTS and
-MCTS-vs-alpha-beta timed out in all 40 role-balanced games. Alpha-beta also
-produced no owned eliminations in the inspected matrix.
+Equivalent paired commands were run for `alpha-beta` and `heuristic`. Results:
 
-The meaningful conclusion is negative: current MCTS is a safer root-UCB rollout
-planner, but it is not yet a strong offensive Bomberman policy. Its high win
-rate against the older baselines is still dominated by opponent self-destruction.
-No “trained”, “strong”, or superhuman claim is justified.
+| Opponent | MCTS owned eliminations | Opponent eliminations | Timeouts | MCTS self-kills | Opponent self-kills |
+|---|---:|---:|---:|---:|---:|
+| safe greedy | 11/20 (55%) | 0/20 | 9/20 | 0 | 0 |
+| bomb-free alpha-beta | 1/20 (5%) | 0/20 | 19/20 | 0 | 0 |
+| safe heuristic | 0/20 | 0/20 | 20/20 | 0 | 0 |
 
-## Best next experiment
+MCTS is now a competent, active combat policy against safe greedy: its 55%
+holdout elimination rate contains no self-kills or donated wins. It is not a
+dominant policy. Alpha-beta usually forces a draw, and safe heuristic remains
+the top curriculum rung: MCTS did not beat it on this holdout. Across the
+controlled MCTS orientation it waited only 0.2-0.4% of actions, so the draw
+result is not an idle-policy artifact.
 
-Do not train longer in the compact NumPy reference arena and assume transfer.
-The next useful model work is a full-C-environment policy/value adapter trained
-against a sampled opponent pool (heuristic, greedy, MCTS, frozen checkpoints,
-then self-play). Promotion should require all of the following on untouched
-role-balanced seeds:
+Seed 40004 is the deterministic visual proof: MCTS beats safe greedy in 41
+steps with one owned elimination, zero waits, zero self-kills, and zero opponent
+self-kills. The replay, CSV trace, JSON metrics, and one-click launcher are
+`results/mcts-safe-greedy-win.*` and `shortcuts/Watch MCTS Causal Win.cmd`.
 
-1. higher owned-elimination rate, not just win rate;
-2. lower self-elimination and timeout rates;
-3. improvement against at least heuristic and greedy without regression against
-   frozen prior checkpoints;
-4. deterministic replay validation for sampled evaluation games.
+## Next promotion target
+
+Do not claim mastery or train longer against random. The next policy must keep
+zero self-kills and at least the safe-greedy result while earning causal wins
+against safe heuristic on a validation seed set, then repeat on a new untouched
+holdout. A sampled curriculum should use safe greedy, safe heuristic, defensive
+alpha-beta, frozen MCTS checkpoints, and only then self-play.

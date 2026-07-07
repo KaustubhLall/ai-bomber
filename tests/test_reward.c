@@ -13,7 +13,7 @@ int main(void) {
     BomberEnv env;
     env_init(&env, &cfg);
 
-    int prev_crates = map_count_crates(&env.state);
+    int prev_crates = env.state.agents[0].crates_destroyed;
     int prev_enemies = 0;
     for (int a = 1; a < env.state.agent_count; a++) {
         if (env.state.agents[a].alive) prev_enemies++;

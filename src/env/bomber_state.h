@@ -22,6 +22,9 @@ typedef struct {
     int blast_range;
     int speed;
     int score;
+    int crates_destroyed;
+    int eliminations;
+    int powerups_collected;
 } BomberAgentState;
 
 typedef struct {

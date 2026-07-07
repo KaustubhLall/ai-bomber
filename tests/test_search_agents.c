@@ -23,6 +23,21 @@ int main(void) {
     assert(evaluator_score_state(&env, 0) < 0.0f);
     env_reset(&env, 77);
 
+    /* The offensive evaluator distinguishes a forced blast from an escapable one. */
+    for (int y = 0; y < env.state.height; y++) for (int x = 0; x < env.state.width; x++)
+        env.state.tiles[y][x] = TILE_SOLID_WALL;
+    env.state.agents[0].x = 3; env.state.agents[0].y = 2;
+    env.state.agents[1].x = 3; env.state.agents[1].y = 3;
+    env.state.tiles[2][3] = env.state.tiles[3][3] = TILE_FLOOR;
+    env.state.bombs[0] = (BombState){3, 2, 0, 1, 2, 1};
+    env.state.agents[0].bombs_active = 1;
+    danger_compute(&env.danger, &env.state);
+    assert(evaluator_opponent_escape_options(&env, 0) == 0);
+    env.state.tiles[3][4] = TILE_FLOOR;
+    danger_compute(&env.danger, &env.state);
+    assert(evaluator_opponent_escape_options(&env, 0) > 0);
+    env_reset(&env, 77);
+
     DebugSnapshot debug;
     Observation observation;
     Agent agent;
@@ -34,7 +49,8 @@ int main(void) {
 
     agent_init(&agent, AGENT_MCTS);
     action = agent_act(&agent, &observation, &debug);
-    assert(action >= 0 && action < ACTION_COUNT && agent.diagnostics.simulations == 32);
+    assert(action >= 0 && action < ACTION_COUNT && agent.diagnostics.simulations == 96);
+    assert(agent.diagnostics.depth == 12 && agent.diagnostics.nodes > 1);
 
     /* Search agents acting as enemy 1 must choose from enemy 1's legal actions. */
     env_observe(&env, 1, &observation);

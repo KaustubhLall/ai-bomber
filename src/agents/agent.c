@@ -4,6 +4,7 @@
 #include "agents/heuristic_bomber_agent.h"
 #include "agents/greedy_crate_agent.h"
 #include "agents/search_agent.h"
+#include "agents/evasive_agent.h"
 #include <string.h>
 
 void* agent_impl_storage(Agent* agent, size_t required_size) {
@@ -25,6 +26,7 @@ void agent_init(Agent* agent, AgentType type) {
         case AGENT_EXTERNAL:     random_agent_init(agent); break;  /* placeholder */
         case AGENT_ALPHABETA:    alphabeta_agent_init(agent); break;
         case AGENT_MCTS:         mcts_agent_init(agent); break;
+        case AGENT_EVASIVE:      evasive_agent_init(agent); break;
     }
 }
 
@@ -47,6 +49,7 @@ AgentType agent_parse_type(const char* name) {
     if (strcmp(name, "external") == 0) return AGENT_EXTERNAL;
     if (strcmp(name, "alphabeta") == 0 || strcmp(name, "alpha-beta") == 0) return AGENT_ALPHABETA;
     if (strcmp(name, "mcts") == 0) return AGENT_MCTS;
+    if (strcmp(name, "evasive") == 0 || strcmp(name, "survivor") == 0) return AGENT_EVASIVE;
     return AGENT_RANDOM;
 }
 
@@ -60,6 +63,7 @@ const char* agent_type_name(AgentType type) {
         case AGENT_EXTERNAL: return "external";
         case AGENT_ALPHABETA: return "alpha-beta";
         case AGENT_MCTS: return "mcts";
+        case AGENT_EVASIVE: return "evasive";
         default: return "unknown";
     }
 }

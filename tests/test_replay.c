@@ -1,6 +1,7 @@
 #include "env/env.h"
 #include "core/replay.h"
 #include "env/bomber_map.h"
+#include "sim/runner.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -57,8 +58,33 @@ int main(void) {
     assert(replay_validate(loaded, &final_hash));
     assert(final_hash == loaded->frames[loaded->frame_count - 1].state_hash);
 
+    Replay* battle = (Replay*)calloc(1, sizeof(Replay));
+    RunConfig run = {0};
+    config_battle(&run.config);
+    run.agent_type = AGENT_MCTS; run.enemy_type = AGENT_GREEDY_CRATE;
+    run.seed = 40004; run.episodes = 1; run.record_replay = 1; run.replay = battle;
+    Metrics metrics; runner_run(&run, &metrics);
+    assert(battle->frame_count > 0);
+    assert(strcmp(battle->agent_name, "mcts") == 0 && strcmp(battle->opponent_name, "greedy") == 0);
+    ReplayFrame* terminal = &battle->frames[battle->frame_count - 1];
+    assert(terminal->state.width == run.config.width && terminal->state.height == run.config.height);
+    assert(terminal->state.agents[0].alive && !terminal->state.agents[1].alive);
+    assert(terminal->state.death_owner[1] == 0);
+    assert(replay_validate(battle, &final_hash));
+    assert(replay_save(battle, "test_battle_replay.bin"));
+    memset(loaded, 0, sizeof(*loaded));
+    assert(replay_load(loaded, "test_battle_replay.bin"));
+    terminal = &loaded->frames[loaded->frame_count - 1];
+    assert(terminal->state.width == run.config.width && terminal->state.height == run.config.height);
+    assert(terminal->state.agents[0].alive && !terminal->state.agents[1].alive);
+    assert(terminal->state.death_owner[1] == 0);
+    assert(replay_validate(loaded, &final_hash));
+    remove("test_replay.bin");
+    remove("test_battle_replay.bin");
+
     free(replay);
     free(loaded);
+    free(battle);
     printf("test_replay: ALL PASSED\n");
     return 0;
 }

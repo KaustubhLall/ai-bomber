@@ -66,6 +66,8 @@ void runner_run(const RunConfig* rc, Metrics* metrics) {
 
         if (replay_ptr && ep == 0) {
             replay_init(replay_ptr, &rc->config, ep_seed);
+            replay_set_policies(replay_ptr, agent_type_name(rc->agent_type),
+                                (int)rc->enemy_type >= 0 ? agent_type_name(rc->enemy_type) : "built-in-random");
         }
 
         env_set_opponent(&env, enemy_ptr);

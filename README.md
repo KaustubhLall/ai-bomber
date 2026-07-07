@@ -113,7 +113,8 @@ These framework-free reference pipelines provide reproducible policy/value, repl
 
 Windows users can run the preset launchers in `shortcuts/`, or execute
 `shortcuts/install-desktop-shortcuts.ps1` once to create MCTS, alpha-beta,
-policy-comparison, live-policy-arena, and match-history shortcuts on the Desktop.
+policy-comparison, live-policy-arena, match-history, and causal-win replay
+shortcuts on the Desktop.
 
 Visualizer matchup configuration mirrors the headless runner: `--agent` selects
 agent 0, `--enemy` selects the opponent policy, `--agents` sets the total arena

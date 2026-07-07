@@ -37,6 +37,7 @@ int main(void) {
     run_agent_smoke(&cfg, AGENT_SCRIPTED);
     run_agent_smoke(&cfg, AGENT_HEURISTIC);
     run_agent_smoke(&cfg, AGENT_GREEDY_CRATE);
+    run_agent_smoke(&cfg, AGENT_EVASIVE);
 
     Agent a;
     Agent b;
@@ -69,6 +70,7 @@ int main(void) {
     assert(agent_parse_type("heuristic") == AGENT_HEURISTIC);
     assert(agent_parse_type("greedy") == AGENT_GREEDY_CRATE);
     assert(agent_parse_type("greedy_crate") == AGENT_GREEDY_CRATE);
+    assert(agent_parse_type("evasive") == AGENT_EVASIVE);
 
     printf("test_agents: ALL PASSED\n");
     return 0;

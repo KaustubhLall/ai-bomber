@@ -10,6 +10,7 @@ $items = @(
     @{ Name='AI Bomber - Policy Comparison'; Args='--agent mcts --agent heuristic --agent greedy --agent alpha-beta --agent random --enemy heuristic --fps 1 --render-fps 60' },
     @{ Name='AI Bomber - Live Policy Arena'; Args='--matchup --fps 1 --render-fps 60 --start-paused' },
     @{ Name='AI Bomber - Match History'; Args='--history --fps 1 --render-fps 60 --start-paused' }
+    @{ Name='AI Bomber - MCTS Causal Win'; Args='--replay "results\mcts-safe-greedy-win.bin" --fps 3 --render-fps 60' }
 )
 foreach ($item in $items) {
     $shortcut = $shell.CreateShortcut((Join-Path $desktop ($item.Name + '.lnk')))

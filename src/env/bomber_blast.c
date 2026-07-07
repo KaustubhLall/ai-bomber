@@ -46,6 +46,11 @@ int explode_bomb(BomberState* state, int bomb_index, RNG* rng, float powerup_rat
 
     bomb->active = 0;
 
+    if (owner >= 0 && owner < state->agent_count) {
+        for (int i = 0; i < blast.count; i++)
+            if (state->tiles[blast.tiles[i].y][blast.tiles[i].x] == TILE_CRATE)
+                state->agents[owner].crates_destroyed++;
+    }
     destroy_crates(state, &blast, rng, powerup_rate);
 
     apply_blast_damage(state, &blast, owner);
@@ -63,6 +68,8 @@ void apply_blast_damage(BomberState* state, const BlastResult* blast, int owner_
             if (state->agents[a].alive && state->agents[a].x == bx && state->agents[a].y == by) {
                 state->agents[a].alive = 0;
                 state->death_owner[a] = owner_id;
+                if (owner_id >= 0 && owner_id < state->agent_count && owner_id != a)
+                    state->agents[owner_id].eliminations++;
             }
         }
     }

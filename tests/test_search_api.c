@@ -38,10 +38,24 @@ int main(void) {
     env_step_joint(&clone, collide, 2);
     assert(clone.state.agents[0].x == 3 && clone.state.agents[1].x == 5);
 
+    /* Exact simultaneous swaps are legal; neither side gets update-order priority. */
+    clone.state.agents[0].x = 3; clone.state.agents[0].y = 3;
+    clone.state.agents[1].x = 4; clone.state.agents[1].y = 3;
+    clone.state.tiles[3][3] = clone.state.tiles[3][4] = TILE_FLOOR;
+    Action swap[2] = {ACTION_RIGHT, ACTION_LEFT};
+    env_step_joint(&clone, swap, 2);
+    assert(clone.state.agents[0].x == 4 && clone.state.agents[1].x == 3);
+
     /* Simultaneous mutual elimination is a draw, not a one-sided loss. */
     clone.state.agents[0].alive = 0;
     clone.state.agents[1].alive = 0;
     assert(rules_check_terminal(&clone.state, 0, clone.config.max_steps) == TERMINAL_DRAW);
+
+    /* A final-turn death is a death, not a timeout. */
+    clone.state.agents[0].alive = 0;
+    clone.state.agents[1].alive = 1;
+    clone.state.step = clone.config.max_steps;
+    assert(rules_check_terminal(&clone.state, 0, clone.config.max_steps) == TERMINAL_AGENT_DEAD);
     puts("search API tests passed");
     return 0;
 }

@@ -20,5 +20,6 @@ EvalResult evaluator_run(AgentType agent_type, const BomberConfig* cfg,
 void evaluator_compare(AgentType* types, int num_types, const BomberConfig* cfg,
                        int episodes, uint64_t seed);
 float evaluator_score_state(const BomberEnv* env, int agent_id);
+int evaluator_opponent_escape_options(const BomberEnv* env, int agent_id);
 
 #endif /* BOMBER_EVALUATOR_H */

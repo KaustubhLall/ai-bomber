@@ -3,4 +3,6 @@
 #include "agents/agent.h"
 void alphabeta_agent_init(Agent* agent);
 void mcts_agent_init(Agent* agent);
+int search_bomb_is_robustly_safe(const DebugSnapshot* debug, int actor);
+Action search_robust_escape_action(const DebugSnapshot* debug, int actor, int* found);
 #endif

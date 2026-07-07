@@ -9,16 +9,40 @@
 #include <string.h>
 #include <stdlib.h>
 
+static int export_replay_trace(const Replay* replay, const char* path) {
+    FILE* file = fopen(path, "w");
+    if (!file) return 0;
+    fprintf(file, "frame,step,blue_x,blue_y,red_x,red_y,blue_action,red_action,blue_alive,red_alive,blue_death_owner,red_death_owner,bombs\n");
+    for (int i = 0; i < replay->frame_count; i++) {
+        const ReplayFrame* frame = &replay->frames[i]; const BomberState* state = &frame->state;
+        Action red = frame->joint_action_count > 1 ? frame->joint_actions[1] : ACTION_WAIT;
+        fprintf(file, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,\"", i, frame->step,
+                state->agents[0].x, state->agents[0].y, state->agents[1].x, state->agents[1].y,
+                (int)frame->action, (int)red, state->agents[0].alive, state->agents[1].alive,
+                state->death_owner[0], state->death_owner[1]);
+        int first = 1;
+        for (int b = 0; b < MAX_BOMBS; b++) if (state->bombs[b].active) {
+            fprintf(file, "%s%d:%d:%d:%d", first ? "" : "|", state->bombs[b].owner_id,
+                    state->bombs[b].x, state->bombs[b].y, state->bombs[b].timer);
+            first = 0;
+        }
+        fprintf(file, "\"\n");
+    }
+    fclose(file);
+    return 1;
+}
+
 static void usage(const char* prog) {
     printf("Usage: %s [options]\n", prog);
     printf("Options:\n");
-    printf("  --agent <type>       Agent type: random, scripted, heuristic, greedy\n");
+    printf("  --agent <type>       Agent: random, scripted, heuristic, greedy, evasive, alpha-beta, mcts\n");
     printf("  --episodes <n>       Number of episodes (default 100)\n");
     printf("  --seed <n>           Random seed (default 1337)\n");
     printf("  --mode <mode>        Game mode: survival, battle (default survival)\n");
-    printf("  --enemy <type>       Opponent agent type: random, scripted, heuristic, greedy\n");
+    printf("  --enemy <type>       Opponent policy (same choices as --agent)\n");
     printf("  --export <file>      Export metrics to file\n");
     printf("  --replay <file>      Save replay to file\n");
+    printf("  --trace <csv>        Export first episode frame/action trace\n");
     printf("  --compare            Compare all agents\n");
     printf("  --help               Show this help\n");
 }
@@ -28,6 +52,7 @@ int main(int argc, char** argv) {
     const char* enemy_name = NULL;
     const char* export_file = NULL;
     const char* replay_file = NULL;
+    const char* trace_file = NULL;
     int episodes = 100;
     uint64_t seed = 1337;
     int do_compare = 0;
@@ -50,6 +75,8 @@ int main(int argc, char** argv) {
             export_file = argv[++i];
         } else if (strcmp(argv[i], "--replay") == 0 && i + 1 < argc) {
             replay_file = argv[++i];
+        } else if (strcmp(argv[i], "--trace") == 0 && i + 1 < argc) {
+            trace_file = argv[++i];
         } else if (strcmp(argv[i], "--compare") == 0) {
             do_compare = 1;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -76,7 +103,7 @@ int main(int argc, char** argv) {
     rc.enemy_type = enemy_name ? agent_parse_type(enemy_name) : (AgentType)-1;
     rc.seed = seed;
     rc.episodes = episodes;
-    rc.record_replay = (replay_file != NULL) ? 1 : 0;
+    rc.record_replay = (replay_file != NULL || trace_file != NULL) ? 1 : 0;
     rc.replay = NULL;
 
     if (rc.record_replay) {
@@ -133,8 +160,12 @@ int main(int argc, char** argv) {
         } else {
             fprintf(stderr, "Failed to save replay to %s\n", replay_file);
         }
-        free(rc.replay);
     }
+    if (trace_file && rc.replay) {
+        if (export_replay_trace(rc.replay, trace_file)) printf("Replay trace saved to %s\n", trace_file);
+        else fprintf(stderr, "Failed to save replay trace to %s\n", trace_file);
+    }
+    free(rc.replay);
 
     return 0;
 }

@@ -65,6 +65,9 @@ void map_generate(BomberState* state, const BomberConfig* cfg, RNG* rng) {
         state->agents[i].blast_range = cfg->blast_range;
         state->agents[i].speed = 1;
         state->agents[i].score = 0;
+        state->agents[i].crates_destroyed = 0;
+        state->agents[i].eliminations = 0;
+        state->agents[i].powerups_collected = 0;
         state->death_owner[i] = -1;
     }
 

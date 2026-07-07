@@ -20,7 +20,8 @@ typedef enum {
     AGENT_ENEMY_BOT,
     AGENT_EXTERNAL,
     AGENT_ALPHABETA,
-    AGENT_MCTS
+    AGENT_MCTS,
+    AGENT_EVASIVE
 } AgentType;
 
 typedef struct {

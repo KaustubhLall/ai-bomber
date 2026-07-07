@@ -1,4 +1,5 @@
 #include "agents/heuristic_bomber_agent.h"
+#include "agents/search_agent.h"
 #include "env/bomber_map.h"
 #include "env/bomber_danger.h"
 #include "core/math_util.h"
@@ -103,6 +104,12 @@ static Action move_toward(int dx, int dy, const Observation* obs, HeuristicBombe
 Action heuristic_agent_act(Agent* agent, const Observation* obs, const DebugSnapshot* debug) {
     HeuristicBomberAgent* ha = (HeuristicBomberAgent*)agent->impl;
 
+    if (debug->state.agents[obs->agent_id].bombs_active > 0) {
+        int found = 0;
+        Action escape = search_robust_escape_action(debug, obs->agent_id, &found);
+        if (found) return escape;
+    }
+
     /* Priority 1: Start following an escape route as soon as a blast is scheduled. */
     if (obs->in_danger || obs->danger_timer >= 0) {
         Action escape = best_escape(obs, debug);
@@ -121,7 +128,8 @@ Action heuristic_agent_act(Agent* agent, const Observation* obs, const DebugSnap
     /* Priority 2: Bomb crates or an enemy in range only when an escape exists. */
     if ((has_adjacent_tile_type(obs, TILE_CRATE) || enemy_in_blast_range(obs)) &&
         obs->valid_actions[ACTION_PLACE_BOMB] &&
-        obs->safe_actions[ACTION_PLACE_BOMB]) {
+        obs->safe_actions[ACTION_PLACE_BOMB] &&
+        search_bomb_is_robustly_safe(debug, obs->agent_id)) {
         snprintf(ha->decision_text, sizeof(ha->decision_text),
                  "Place bomb: useful target, escape path available");
         return ACTION_PLACE_BOMB;

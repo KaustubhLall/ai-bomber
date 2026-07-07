@@ -110,7 +110,7 @@ StepResult env_step_joint(BomberEnv* env, const Action* actions, int action_coun
     for (int a = 0; a < state->agent_count; a++)
         env->last_joint_actions[a] = actions && a < action_count ? actions[a] : ACTION_WAIT;
 
-    int prev_crates = map_count_crates(state);
+    int prev_owned_crates = agent->crates_destroyed;
     int prev_enemies_alive = 0;
     for (int a = 1; a < state->agent_count; a++) {
         if (state->agents[a].alive) prev_enemies_alive++;
@@ -141,16 +141,27 @@ StepResult env_step_joint(BomberEnv* env, const Action* actions, int action_coun
             valid[a] = 0;
         }
     }
-    /* Agents are solid: reject contested destinations and moves into occupied tiles. */
+    /* Resolve moves atomically. Contested destinations are rejected, while a
+       destination vacated in the same tick (including a two-agent swap) is legal. */
     for (int a = 0; a < state->agent_count; a++) if (moving[a] && valid[a]) {
         for (int b = 0; b < state->agent_count; b++) if (a != b && state->agents[b].alive) {
-            if ((desired_x[a] == state->agents[b].x && desired_y[a] == state->agents[b].y) ||
-                (moving[b] && desired_x[a] == desired_x[b] && desired_y[a] == desired_y[b])) {
+            if (moving[b] && valid[b] && desired_x[a] == desired_x[b] && desired_y[a] == desired_y[b]) {
                 valid[a] = 0;
-                if (moving[b] && desired_x[a] == desired_x[b] && desired_y[a] == desired_y[b]) valid[b] = 0;
+                valid[b] = 0;
             }
         }
     }
+    int changed;
+    do {
+        changed = 0;
+        for (int a = 0; a < state->agent_count; a++) if (moving[a] && valid[a]) {
+            for (int b = 0; b < state->agent_count; b++) if (a != b && state->agents[b].alive &&
+                desired_x[a] == state->agents[b].x && desired_y[a] == state->agents[b].y &&
+                (!moving[b] || !valid[b])) {
+                valid[a] = 0; changed = 1; break;
+            }
+        }
+    } while (changed);
     for (int a = 0; a < state->agent_count; a++) if (moving[a] && valid[a]) {
         state->agents[a].x = desired_x[a];
         state->agents[a].y = desired_y[a];
@@ -180,7 +191,7 @@ StepResult env_step_joint(BomberEnv* env, const Action* actions, int action_coun
     state->step++;
 
     float reward = reward_compute(&env->last_reward, env, action, 0,
-                                   prev_crates, powerups_collected, prev_enemies_alive, was_in_danger);
+                                   prev_owned_crates, powerups_collected, prev_enemies_alive, was_in_danger);
 
     if (!action_valid) {
         env->last_reward.invalid_action_penalty = cfg->invalid_action_penalty;

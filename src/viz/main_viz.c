@@ -31,7 +31,7 @@ static const char* action_name(Action action) {
 
 static const AgentType selectable_policies[] = {
     AGENT_RANDOM, AGENT_SCRIPTED, AGENT_GREEDY_CRATE,
-    AGENT_HEURISTIC, AGENT_ALPHABETA, AGENT_MCTS
+    AGENT_HEURISTIC, AGENT_EVASIVE, AGENT_ALPHABETA, AGENT_MCTS
 };
 
 static AgentType cycle_policy(AgentType current, int direction) {
@@ -130,11 +130,24 @@ static void draw_history_view(VizSession* vs, int screen_w, int screen_h) {
              outcome_name(entry ? entry->outcome : frame->terminal),
              (unsigned long long)frame->state_hash);
     DrawText(info, 390, 720, 15, tc->text_secondary);
+    int owned = 0, self_kills = 0, opponent_self = 0, opponent_kills = 0;
     if (entry) {
-        snprintf(info, sizeof(info), "Owned kills %d | self %d | opponent self %d | opponent kills %d",
-                 entry->owned_eliminations, entry->self_kills, entry->opponent_self_kills, entry->opponent_kills);
-        DrawText(info, 390, 748, 15, tc->text_secondary);
+        owned = entry->owned_eliminations; self_kills = entry->self_kills;
+        opponent_self = entry->opponent_self_kills; opponent_kills = entry->opponent_kills;
+    } else {
+        const BomberState* state = &frame->state;
+        if (!state->agents[0].alive) {
+            if (state->death_owner[0] == 0) self_kills++;
+            else if (state->death_owner[0] > 0) opponent_kills++;
+        }
+        for (int a = 1; a < state->agent_count; a++) if (!state->agents[a].alive) {
+            if (state->death_owner[a] == 0) owned++;
+            else if (state->death_owner[a] == a) opponent_self++;
+        }
     }
+    snprintf(info, sizeof(info), "Owned kills %d | self %d | opponent self %d | opponent kills %d",
+             owned, self_kills, opponent_self, opponent_kills);
+    DrawText(info, 390, 748, 15, tc->text_secondary);
     DrawText("PageUp/PageDown match | Left/Right frame | Home restart | Space play/pause | M new match",
              390, 790, 13, tc->text_dim);
     (void)screen_w; (void)screen_h;
@@ -689,7 +702,7 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: bomber_viz [options]\n");
             printf("Options:\n");
-            printf("  --agent <type>   Agent type: random, scripted, heuristic, greedy, alpha-beta, mcts\n");
+            printf("  --agent <type>   Agent: random, scripted, heuristic, greedy, evasive, alpha-beta, mcts\n");
             printf("  --enemy <type>   Opponent policy (default heuristic; use builtin-random explicitly)\n");
             printf("  --agents <n>     Arena agent count, 1-%d (default 2)\n", MAX_AGENTS);
             printf("  --seed <n>       Random seed (default 1337)\n");
@@ -751,6 +764,8 @@ int main(int argc, char** argv) {
     if (replay_file) {
         Replay* replay = (Replay*)calloc(1, sizeof(Replay));
         if (replay && replay_load(replay, replay_file)) {
+            vs.history.count = 0;
+            vs.history.selected = -1;
             vs.history_replay = replay;
             vs.history_frame = 0;
             vs.history_playing = 0;
@@ -772,7 +787,13 @@ int main(int argc, char** argv) {
 
     if (smoke_screenshot) {
         vs.show_help = 0;
-        if (strcmp(smoke_view, "history") == 0) {
+        if (replay_file && vs.history_replay && vs.history_replay->frame_count > 0) {
+            vs.show_matchup = 0;
+            vs.view_mode = VIEW_HISTORY;
+            vs.history_frame = vs.history_replay->frame_count - 1;
+            vs.history_playing = 0;
+            vs.paused = 1;
+        } else if (strcmp(smoke_view, "history") == 0) {
             (void)viz_session_start_match(&vs, agent_parse_type(smoke_blue), agent_parse_type(smoke_red), seed);
             apply_simulation_hz(&vs, &(PlaybackClock){0}, 60);
         } else {

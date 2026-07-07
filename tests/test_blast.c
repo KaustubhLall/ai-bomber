@@ -71,6 +71,16 @@ int main(void) {
     TileType t = env.state.tiles[5][6];
     assert(t == TILE_FLOOR || t == TILE_POWERUP_BOMB ||
            t == TILE_POWERUP_RANGE || t == TILE_POWERUP_SPEED);
+    assert(env.state.agents[0].crates_destroyed == 1);
+
+    /* Elimination credit belongs to the bomb owner, not merely the survivor. */
+    env_reset(&env, 2);
+    env.state.agents[1].x = 5; env.state.agents[1].y = 6;
+    env.state.bombs[0].x = 5; env.state.bombs[0].y = 5;
+    env.state.bombs[0].owner_id = 0; env.state.bombs[0].timer = 1;
+    env.state.bombs[0].range = 2; env.state.bombs[0].active = 1;
+    explode_bomb(&env.state, 0, &env.rng, 0.0f);
+    assert(env.state.agents[0].eliminations == 1);
 
     /* Agent dies in blast */
     env_reset(&env, 1);
