@@ -16,6 +16,9 @@ typedef struct {
     int crates_destroyed;
     int powerups_collected;
     int invalid_actions;
+    int enemies_killed;
+    int self_kills;
+    int bombs_placed;
 
     /* Action distribution */
     int action_counts[6]; /* ACTION_COUNT = 6 */

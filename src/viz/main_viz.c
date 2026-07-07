@@ -275,6 +275,22 @@ static void draw_arena_view(VizSession* vs, int screen_w, int screen_h) {
     DrawText(valid, rx, ry, tf->small, tc->text_secondary); ry += tf->small + ts->gap_y;
     DrawText(safe, rx, ry, tf->small, tc->positive); ry += tf->small + ts->gap_y;
 
+    if (s->type == AGENT_ALPHABETA) {
+        const SearchDiagnostics* sd = &s->agent.diagnostics;
+        snprintf(decision_buf, sizeof(decision_buf), "Alpha-beta  depth %d  nodes %d  prunes %d", sd->depth, sd->nodes, sd->prunes);
+        DrawText(decision_buf, rx, ry, tf->small, tc->agent); ry += tf->small + ts->gap_y;
+        snprintf(decision_buf, sizeof(decision_buf), "Chosen %s  eval %.2f", action_name(sd->selected_action), sd->value);
+        DrawText(decision_buf, rx, ry, tf->small, tc->text_secondary); ry += tf->small + ts->gap_y;
+    } else if (s->type == AGENT_MCTS) {
+        const SearchDiagnostics* sd = &s->agent.diagnostics;
+        snprintf(decision_buf, sizeof(decision_buf), "MCTS  simulations %d  nodes %d", sd->simulations, sd->nodes);
+        DrawText(decision_buf, rx, ry, tf->small, tc->agent); ry += tf->small + ts->gap_y;
+        snprintf(decision_buf, sizeof(decision_buf), "Chosen %s  value %.2f  visits %d", action_name(sd->selected_action), sd->value, sd->visits[sd->selected_action]);
+        DrawText(decision_buf, rx, ry, tf->small, tc->text_secondary); ry += tf->small + ts->gap_y;
+    } else if (s->type == AGENT_EXTERNAL) {
+        DrawText("Training: external checkpoint | eval via holdout matrix", rx, ry, tf->small, tc->agent); ry += tf->small + ts->gap_y;
+    }
+
     ry += ts->gap_y;
 
     /* Section: Agent Stats */
@@ -444,7 +460,7 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: bomber_viz [options]\n");
             printf("Options:\n");
-            printf("  --agent <type>   Agent type (repeat for multiple): random, scripted, heuristic, greedy\n");
+            printf("  --agent <type>   Agent type: random, scripted, heuristic, greedy, alpha-beta, mcts\n");
             printf("  --enemy <type>   Shared opponent policy; omit for built-in-random\n");
             printf("  --agents <n>     Arena agent count, 1-%d (default 2)\n", MAX_AGENTS);
             printf("  --seed <n>       Random seed (default 1337)\n");
@@ -467,9 +483,11 @@ int main(int argc, char** argv) {
     }
 
     if (agent_count == 0) {
-        agent_names[agent_count++] = "random";
+        agent_names[agent_count++] = "mcts";
         agent_names[agent_count++] = "heuristic";
         agent_names[agent_count++] = "greedy";
+        agent_names[agent_count++] = "alpha-beta";
+        agent_names[agent_count++] = "random";
     }
 
     InitWindow(SCREEN_W, SCREEN_H, "AI Bomber - Visualizer");

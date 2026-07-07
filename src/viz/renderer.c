@@ -60,6 +60,80 @@ Color agent_color(int agent_id) {
     return colors[agent_id % 8];
 }
 
+static void draw_block_sprite(TileType tile, int px, int py, int size, Color base) {
+    int inset = size > 12 ? 2 : 1;
+    DrawRectangle(px + inset, py + inset, size - inset * 2, size - inset * 2, base);
+
+    if (tile == TILE_SOLID_WALL) {
+        Color mortar = (Color){24, 34, 48, 255};
+        Color shine = (Color){105, 122, 145, 255};
+        int half = size / 2;
+        DrawLine(px + inset, py + half, px + size - inset - 1, py + half, mortar);
+        DrawLine(px + half, py + inset, px + half, py + half, mortar);
+        DrawLine(px + size / 4, py + half, px + size / 4, py + size - inset - 1, mortar);
+        DrawLine(px + inset + 1, py + inset + 1, px + size - inset - 2, py + inset + 1, shine);
+    } else if (tile == TILE_CRATE) {
+        Color plank = (Color){104, 61, 31, 255};
+        Color nail = (Color){43, 31, 24, 255};
+        DrawRectangleLines(px + inset, py + inset, size - inset * 2, size - inset * 2, plank);
+        DrawLine(px + inset + 2, py + inset + 2, px + size - inset - 3, py + size - inset - 3, plank);
+        DrawLine(px + size - inset - 3, py + inset + 2, px + inset + 2, py + size - inset - 3, plank);
+        DrawCircle(px + inset + 3, py + inset + 3, size > 20 ? 2.0f : 1.0f, nail);
+        DrawCircle(px + size - inset - 4, py + size - inset - 4, size > 20 ? 2.0f : 1.0f, nail);
+    }
+}
+
+static void draw_powerup_sprite(TileType tile, int px, int py, int size) {
+    int cx = px + size / 2;
+    int cy = py + size / 2;
+    int radius = size / 3;
+    Color color = tile == TILE_POWERUP_BOMB ? (Color){244, 83, 83, 255} :
+                  tile == TILE_POWERUP_RANGE ? (Color){255, 184, 62, 255} :
+                                               (Color){78, 190, 255, 255};
+    DrawCircle(cx + 1, cy + 2, radius + 2, (Color){7, 12, 20, 180});
+    DrawCircle(cx, cy, radius, color);
+    DrawCircleLines(cx, cy, radius, (Color){245, 248, 255, 255});
+
+    if (tile == TILE_POWERUP_BOMB) {
+        DrawCircle(cx, cy + 1, radius / 2, (Color){20, 24, 31, 255});
+        DrawLine(cx + 2, cy - radius / 2, cx + radius / 2, cy - radius, (Color){255, 230, 120, 255});
+    } else if (tile == TILE_POWERUP_RANGE) {
+        DrawLine(cx - radius / 2, cy, cx + radius / 2, cy, WHITE);
+        DrawLine(cx, cy - radius / 2, cx, cy + radius / 2, WHITE);
+    } else {
+        DrawLine(cx - radius / 2, cy + radius / 3, cx, cy - radius / 3, WHITE);
+        DrawLine(cx, cy - radius / 3, cx + radius / 2, cy + radius / 3, WHITE);
+    }
+}
+
+static void draw_agent_sprite(int agent_id, int px, int py, int size, Color body) {
+    int unit = size / 8;
+    if (unit < 1) unit = 1;
+    int cx = px + size / 2;
+    int top = py + unit;
+    Color outline = (Color){8, 13, 22, 255};
+    Color face = (Color){246, 202, 164, 255};
+
+    DrawEllipse(cx + unit / 2, py + size - unit, size * 0.30f, unit * 0.8f, (Color){5, 8, 14, 130});
+    DrawRectangle(cx - 3 * unit, top + 2 * unit, 6 * unit, 4 * unit, outline);
+    DrawRectangle(cx - 2 * unit, top + 3 * unit, 4 * unit, 3 * unit, body);
+    DrawCircle(cx, top + 2 * unit, 2.4f * unit, outline);
+    DrawCircle(cx, top + 2 * unit, 1.8f * unit, face);
+    DrawRectangle(cx - 2 * unit, top, 4 * unit, 2 * unit, body);
+    DrawRectangle(cx - 3 * unit, top + unit, unit, 2 * unit, body);
+    DrawRectangle(cx + 2 * unit, top + unit, unit, 2 * unit, body);
+    DrawRectangle(cx - 2 * unit, top + 6 * unit, 2 * unit, unit, outline);
+    DrawRectangle(cx + unit, top + 6 * unit, 2 * unit, unit, outline);
+    DrawCircle(cx - unit, top + 2 * unit, size > 20 ? 1.5f : 1.0f, outline);
+    DrawCircle(cx + unit, top + 2 * unit, size > 20 ? 1.5f : 1.0f, outline);
+
+    if (size >= 28) {
+        char label[4];
+        snprintf(label, sizeof(label), "%d", agent_id);
+        DrawText(label, cx - 3, top + 3 * unit, 9, WHITE);
+    }
+}
+
 void renderer_draw_arena(const DebugSnapshot* snap, int ox, int oy, int tile_size) {
     const BomberState* state = &snap->state;
     const DangerMap* dm = &snap->danger;
@@ -85,18 +159,10 @@ void renderer_draw_arena(const DebugSnapshot* snap, int ox, int oy, int tile_siz
                 case TILE_POWERUP_SPEED: tile_c = (Color){80, 180, 255, 255}; break;
                 default:                 tile_c = BLACK; break;
             }
-            if (state->tiles[y][x] != TILE_FLOOR) {
-                DrawRectangle(px + 1, py + 1, tile_size - 2, tile_size - 2, tile_c);
-            }
-
-            if (state->tiles[y][x] == TILE_CRATE || state->tiles[y][x] == TILE_SOLID_WALL) {
-                Color hi = state->tiles[y][x] == TILE_CRATE ? (Color){218, 167, 104, 255} : (Color){72, 87, 108, 255};
-                Color lo = state->tiles[y][x] == TILE_CRATE ? (Color){92, 55, 31, 255} : (Color){10, 16, 27, 255};
-                DrawLine(px + 2, py + 2, px + tile_size - 3, py + 2, hi);
-                DrawLine(px + 2, py + 2, px + 2, py + tile_size - 3, hi);
-                DrawLine(px + 2, py + tile_size - 3, px + tile_size - 3, py + tile_size - 3, lo);
-                DrawLine(px + tile_size - 3, py + 2, px + tile_size - 3, py + tile_size - 3, lo);
-            }
+            if (state->tiles[y][x] == TILE_CRATE || state->tiles[y][x] == TILE_SOLID_WALL)
+                draw_block_sprite(state->tiles[y][x], px, py, tile_size, tile_c);
+            else if (state->tiles[y][x] >= TILE_POWERUP_BOMB)
+                draw_powerup_sprite(state->tiles[y][x], px, py, tile_size);
 
             if (s_show_grid) DrawRectangleLines(px, py, tile_size, tile_size, tc->grid);
 
@@ -143,18 +209,10 @@ void renderer_draw_arena(const DebugSnapshot* snap, int ox, int oy, int tile_siz
     /* Draw agents */
     for (int a = 0; a < state->agent_count; a++) {
         if (!state->agents[a].alive) continue;
-        int px = ox + state->agents[a].x * tile_size + tile_size / 2;
-        int py = oy + state->agents[a].y * tile_size + tile_size / 2;
-        int radius = tile_size / 3;
+        int px = ox + state->agents[a].x * tile_size;
+        int py = oy + state->agents[a].y * tile_size;
         Color body = a == 0 ? tc->agent : tc->enemy;
-        DrawCircle(px, py, radius + 2, (Color){5, 9, 16, 255});
-        DrawCircle(px, py, radius, body);
-        DrawCircle(px - radius / 3, py - radius / 3, 2.0f, (Color){240, 248, 255, 210});
-
-        /* Agent label */
-        char label[4];
-        snprintf(label, sizeof(label), "%d", a);
-        DrawText(label, px - 4, py - 6, 10, WHITE);
+        draw_agent_sprite(a, px, py, tile_size, body);
     }
 
 }

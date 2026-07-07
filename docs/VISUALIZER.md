@@ -37,7 +37,7 @@ The 1280x800 window is divided into three regions:
 ### Center: Arena
 - Full Bomberman arena with tiles, walls, crates, powerups.
 - Bomb rendering with pulsing effect and countdown labels.
-- Agent and enemy rendering with color-coded circles.
+- Agent and enemy rendering with color-coded Bomberman-style sprites.
 - Danger overlay (red gradient for blast zones).
 - Safe tile indicators (green dots).
 - Local observation box (yellow outline around agent's view).
@@ -63,7 +63,14 @@ The dashboard automatically detects and logs events:
 
 ## Rendering details
 
-- Tiles are color-coded by type (floor, wall, crate, powerup variants).
+- Tiles use simple procedural sprites: masonry pillars, wooden crates, and distinct powerup icons.
 - Bombs pulse based on remaining timer (closer to explosion = larger).
 - Danger overlay alpha decreases with time-to-blast (urgent = opaque red).
 - Agent colors are assigned per agent ID from a fixed palette.
+
+## Map generation
+
+Maps follow the classic Bomberman layout: odd dimensions, an indestructible
+outer border, indestructible pillars at every even/even coordinate, seeded
+random destructible crates on the remaining floor, and a three-tile L-shaped
+safe pocket at each of the four corner spawns.

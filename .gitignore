@@ -7,6 +7,9 @@ build_test.bat
 build_debug/
 build_w4/
 build_polish/
+build-codex*/
+results/
+results-smoke.json
 screenshots/
 ai-bomber-arena.png
 pr1.diff

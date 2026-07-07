@@ -18,8 +18,18 @@ typedef enum {
     AGENT_HEURISTIC,
     AGENT_GREEDY_CRATE,
     AGENT_ENEMY_BOT,
-    AGENT_EXTERNAL
+    AGENT_EXTERNAL,
+    AGENT_ALPHABETA,
+    AGENT_MCTS
 } AgentType;
+
+typedef struct {
+    int depth, nodes, simulations, prunes;
+    Action selected_action;
+    float value;
+    int visits[ACTION_COUNT];
+    float action_values[ACTION_COUNT];
+} SearchDiagnostics;
 
 typedef union {
     unsigned char bytes[AGENT_IMPL_CAPACITY];
@@ -35,6 +45,7 @@ struct Agent {
     void* impl; /* Pointer into storage or an external policy implementation. */
     AgentImplStorage storage;
     char name[32];
+    SearchDiagnostics diagnostics;
 };
 
 void agent_init(Agent* agent, AgentType type);

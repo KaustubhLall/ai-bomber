@@ -12,6 +12,8 @@ The project is built around a small fixed-size simulator that can run without a 
 - A local observation format designed to be exported to Python, C++, or another training loop
 - A raylib visualizer for inspecting reward, danger, bombs, local observations, and agent behavior
 - CTest coverage for core environment rules, determinism, replay, rewards, agents, metrics, and hardened invariants
+- Cloneable joint-action search API, alpha-beta and MCTS planning baselines
+- Fixed-seed tournament matrices plus NumPy AlphaZero-lite and PPO comparison pipelines
 
 ## Current status
 
@@ -78,7 +80,20 @@ unless both sides are explicitly configured with the same policy.
 
 ```bash
 ./build/bomber_benchmark --episodes 10000 --seed 1
+
+# Reproducible holdout policy matrix in machine-readable form.
+./build/bomber_benchmark --matrix --episodes 20 --seed 9001 --suite holdout --output results/matrix.json
 ```
+
+## Learning baselines
+
+```bash
+python tools/learning.py alphazero-lite --seed 1 --output results/az.json --checkpoint results/az.npz
+python tools/learning.py ppo --seed 1 --output results/ppo.json --checkpoint results/ppo.npz
+python tools/plot_results.py results/ppo.json results/ppo.svg
+```
+
+These framework-free reference pipelines provide reproducible policy/value, replay-target, rollout/advantage, clipped-update, entropy, checkpoint, and fixed-holdout evaluation paths. Their compact shaped-reward arena is intentionally easier than the full C simulator; see [experiment protocol](docs/EXPERIMENTS.md) before making comparative claims.
 
 ## Run visualizer
 
@@ -157,6 +172,8 @@ assets/       optional configs, sprites, and fonts
 | `scripted` | Avoids immediate danger, bombs adjacent crates, and seeks visible powerups. |
 | `heuristic` | Uses danger information and escape checks before bombing. |
 | `greedy` / `greedy_crate` | Prioritizes crate destruction while still avoiding known danger. |
+| `alpha-beta` | Depth-limited deterministic lookahead using the tactical evaluator. |
+| `mcts` | Fixed-budget Monte Carlo rollouts with action visits and values. |
 
 ## Documentation
 

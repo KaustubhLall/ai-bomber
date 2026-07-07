@@ -44,10 +44,25 @@ int main(void) {
         }
     }
 
-    /* Spawn corners are clear (floor) */
-    assert(env.state.tiles[1][1] == TILE_FLOOR);
-    assert(env.state.tiles[1][2] == TILE_FLOOR);
-    assert(env.state.tiles[2][1] == TILE_FLOOR);
+    /* Every classic corner spawn has an L-shaped three-tile safe pocket. */
+    int max_x = env.state.width - 2;
+    int max_y = env.state.height - 2;
+    int safe_tiles[12][2] = {
+        {1, 1}, {2, 1}, {1, 2},
+        {max_x, 1}, {max_x - 1, 1}, {max_x, 2},
+        {1, max_y}, {2, max_y}, {1, max_y - 1},
+        {max_x, max_y}, {max_x - 1, max_y}, {max_x, max_y - 1}
+    };
+    for (int i = 0; i < 12; i++) {
+        assert(env.state.tiles[safe_tiles[i][1]][safe_tiles[i][0]] == TILE_FLOOR);
+    }
+
+    /* The safe pockets remain clear even at maximum crate density. */
+    cfg.crate_density = 100;
+    env_reset(&env, 100);
+    for (int i = 0; i < 12; i++) {
+        assert(env.state.tiles[safe_tiles[i][1]][safe_tiles[i][0]] == TILE_FLOOR);
+    }
 
     /* Walkable check */
     assert(map_is_walkable(&env.state, 1, 1) == 1);

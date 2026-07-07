@@ -19,6 +19,7 @@ add_library(bomber_core STATIC
     agents/scripted_agent.c
     agents/heuristic_bomber_agent.c
     agents/greedy_crate_agent.c
+    agents/search_agent.c
     sim/runner.c
     sim/benchmark.c
     sim/evaluator.c

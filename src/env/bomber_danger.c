@@ -13,6 +13,7 @@ typedef struct {
 
 void danger_compute(DangerMap* dm, const BomberState* state) {
     memset(dm->current_blast, 0, sizeof(int) * MAX_HEIGHT * MAX_WIDTH);
+    memset(dm->bomb_occupied, 0, sizeof(int) * MAX_HEIGHT * MAX_WIDTH);
     for (int y = 0; y < MAX_HEIGHT; y++) {
         for (int x = 0; x < MAX_WIDTH; x++) {
             dm->time_to_blast[y][x] = -1;
@@ -24,6 +25,7 @@ void danger_compute(DangerMap* dm, const BomberState* state) {
     /* For each active bomb, compute predicted blast tiles and time-to-blast */
     for (int i = 0; i < MAX_BOMBS; i++) {
         if (!state->bombs[i].active) continue;
+        dm->bomb_occupied[state->bombs[i].y][state->bombs[i].x] = 1;
         int timer = state->bombs[i].timer;
         BlastResult blast;
         compute_blast_tiles(state, state->bombs[i].x, state->bombs[i].y,
@@ -117,6 +119,7 @@ int danger_is_action_safe_at_arrival(const DangerMap* dm, int x, int y, int arri
     /* A tile is safe at arrival if no blast is currently exploding there
        and the blast won't arrive before or at the same time the agent does. */
     if (dm->current_blast[y][x]) return 0;
+    if (dm->bomb_occupied[y][x]) return 0;
     int tblast = dm->time_to_blast[y][x];
     if (tblast < 0) return 1; /* no danger scheduled */
     return tblast > arrival_ticks;

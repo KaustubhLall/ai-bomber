@@ -15,16 +15,17 @@ void metrics_update(Metrics* m, Action action, StepResult result,
 
     if (action >= 0 && action < 6) {
         m->action_counts[action]++;
+        if (action == ACTION_PLACE_BOMB) m->bombs_placed++;
     }
 
     if (result.done) {
         m->episodes++;
         switch (result.terminal_reason) {
-            case TERMINAL_WIN:           m->wins++; break;
+            case TERMINAL_WIN:           m->wins++; m->enemies_killed++; break;
             case TERMINAL_LOSS:          m->losses++; break;
             case TERMINAL_DRAW:          m->draws++; break;
             case TERMINAL_TIMEOUT:       m->timeouts++; break;
-            case TERMINAL_AGENT_DEAD:    m->deaths++; break;
+            case TERMINAL_AGENT_DEAD:    m->deaths++; m->self_kills++; break;
             default: break;
         }
     }

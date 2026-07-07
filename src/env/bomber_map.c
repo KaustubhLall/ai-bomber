@@ -1,6 +1,24 @@
 #include "env/bomber_map.h"
 #include "core/math_util.h"
 
+/* Classic Bomberman starts each player in a corner with the two inward
+ * orthogonal tiles open, guaranteeing a small L-shaped escape pocket. */
+static int is_spawn_safe_tile(const BomberState* state, int x, int y) {
+    const int max_x = state->width - 2;
+    const int max_y = state->height - 2;
+    const int safe_tiles[12][2] = {
+        {1, 1},       {2, 1},       {1, 2},
+        {max_x, 1},   {max_x - 1, 1}, {max_x, 2},
+        {1, max_y},   {2, max_y},   {1, max_y - 1},
+        {max_x, max_y}, {max_x - 1, max_y}, {max_x, max_y - 1}
+    };
+
+    for (int i = 0; i < 12; i++) {
+        if (x == safe_tiles[i][0] && y == safe_tiles[i][1]) return 1;
+    }
+    return 0;
+}
+
 void map_generate(BomberState* state, const BomberConfig* cfg, RNG* rng) {
     state->width = cfg->width;
     state->height = cfg->height;
@@ -27,20 +45,7 @@ void map_generate(BomberState* state, const BomberConfig* cfg, RNG* rng) {
     for (int y = 1; y < state->height - 1; y++) {
         for (int x = 1; x < state->width - 1; x++) {
             if (state->tiles[y][x] != TILE_FLOOR) continue;
-            /* Keep spawn corners (agent start positions) clear */
-            int is_spawn = 0;
-            int spawn_positions[8][2] = {
-                {1, 1}, {2, 1}, {1, 2},
-                {state->width - 2, 1}, {state->width - 3, 1}, {state->width - 2, 2},
-                {1, state->height - 2}, {state->width - 2, state->height - 2}
-            };
-            for (int s = 0; s < 8; s++) {
-                if (x == spawn_positions[s][0] && y == spawn_positions[s][1]) {
-                    is_spawn = 1;
-                    break;
-                }
-            }
-            if (is_spawn) continue;
+            if (is_spawn_safe_tile(state, x, y)) continue;
             if (rng_range(rng, 0, 100) < cfg->crate_density) {
                 state->tiles[y][x] = TILE_CRATE;
             }
