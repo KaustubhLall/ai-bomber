@@ -25,10 +25,10 @@ static int find_nearest_powerup(const Observation* obs, int* out_dx, int* out_dy
 static int has_adjacent_crate(const Observation* obs) {
     int cx = LOCAL_OBS_HALF;
     int cy = LOCAL_OBS_HALF;
-    if (obs->local_tiles[cy][cx+1] == TILE_CRATE) return 1;
-    if (obs->local_tiles[cy][cx-1] == TILE_CRATE) return 1;
-    if (obs->local_tiles[cy+1][cx] == TILE_CRATE) return 1;
-    if (obs->local_tiles[cy-1][cx] == TILE_CRATE) return 1;
+    if (obs->local_tiles[cy][cx+1] == (int)TILE_CRATE) return 1;
+    if (obs->local_tiles[cy][cx-1] == (int)TILE_CRATE) return 1;
+    if (obs->local_tiles[cy+1][cx] == (int)TILE_CRATE) return 1;
+    if (obs->local_tiles[cy-1][cx] == (int)TILE_CRATE) return 1;
     return 0;
 }
 

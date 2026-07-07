@@ -35,10 +35,10 @@ static int find_nearest_target(const Observation* obs, int target_tile, int* out
 static int has_adjacent_tile_type(const Observation* obs, TileType t) {
     int cx = LOCAL_OBS_HALF;
     int cy = LOCAL_OBS_HALF;
-    if (obs->local_tiles[cy][cx+1] == t) return 1;
-    if (obs->local_tiles[cy][cx-1] == t) return 1;
-    if (obs->local_tiles[cy+1][cx] == t) return 1;
-    if (obs->local_tiles[cy-1][cx] == t) return 1;
+    if (obs->local_tiles[cy][cx+1] == (int)t) return 1;
+    if (obs->local_tiles[cy][cx-1] == (int)t) return 1;
+    if (obs->local_tiles[cy+1][cx] == (int)t) return 1;
+    if (obs->local_tiles[cy-1][cx] == (int)t) return 1;
     return 0;
 }
 

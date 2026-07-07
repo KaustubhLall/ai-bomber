@@ -11,7 +11,7 @@ static int find_nearest_crate(const Observation* obs, int* out_dx, int* out_dy) 
     int found = 0;
     for (int y = 0; y < LOCAL_OBS_SIZE; y++) {
         for (int x = 0; x < LOCAL_OBS_SIZE; x++) {
-            if (obs->local_tiles[y][x] == TILE_CRATE) {
+            if (obs->local_tiles[y][x] == (int)TILE_CRATE) {
                 int dx = (x - LOCAL_OBS_HALF);
                 int dy = (y - LOCAL_OBS_HALF);
                 int dist = absi(dx) + absi(dy);
@@ -32,10 +32,10 @@ static int find_nearest_crate(const Observation* obs, int* out_dx, int* out_dy) 
 static int has_adjacent_crate(const Observation* obs) {
     int cx = LOCAL_OBS_HALF;
     int cy = LOCAL_OBS_HALF;
-    return (obs->local_tiles[cy][cx+1] == TILE_CRATE ||
-            obs->local_tiles[cy][cx-1] == TILE_CRATE ||
-            obs->local_tiles[cy+1][cx] == TILE_CRATE ||
-            obs->local_tiles[cy-1][cx] == TILE_CRATE);
+    return (obs->local_tiles[cy][cx+1] == (int)TILE_CRATE ||
+            obs->local_tiles[cy][cx-1] == (int)TILE_CRATE ||
+            obs->local_tiles[cy+1][cx] == (int)TILE_CRATE ||
+            obs->local_tiles[cy-1][cx] == (int)TILE_CRATE);
 }
 
 Action greedy_crate_agent_act(Agent* agent, const Observation* obs, const DebugSnapshot* debug) {
