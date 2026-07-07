@@ -111,6 +111,10 @@ These framework-free reference pipelines provide reproducible policy/value, repl
 ./build/bomber_viz --replay replay.bin
 ```
 
+Windows users can run the preset launchers in `shortcuts/`, or execute
+`shortcuts/install-desktop-shortcuts.ps1` once to create MCTS, alpha-beta, and
+policy-comparison shortcuts on the Desktop.
+
 Visualizer matchup configuration mirrors the headless runner: `--agent` selects
 agent 0, `--enemy` selects the opponent policy, `--agents` sets the total arena
 agent count, and `--seed` controls deterministic setup. With three or more agents,
@@ -129,6 +133,8 @@ shown explicitly as `Opponent Policy: built-in-random`.
 - **SPACE**: pause or resume
 - **R**: reset all sessions
 - **+/-**: adjust speed multiplier
+- **[ / ]**: lower or raise render FPS through 15/30/60/120/240 (independent of simulation speed)
+- **H**: open the in-app controls and powerup guide
 - **S**: step once while paused
 - **TAB**: switch active agent
 - **1/2/3/4**: switch view (Arena/Compare/Graphs/Debug)
@@ -139,6 +145,14 @@ shown explicitly as `Opponent Policy: built-in-random`.
 - **G**: toggle grid lines
 - **P**: save screenshot to `screenshots/ai-bomber-arena.png`
 - **ESC**: quit
+
+### Powerups
+
+- **Bomb capacity (red)** adds one reusable bomb slot; its ammo returns after that bomb explodes.
+- **Blast range (orange)** extends future bomb flames by one tile in each open direction.
+- **Speed level (blue)** is recorded in state and observations, but does not currently alter grid movement speed.
+
+With the default configuration, a destroyed crate has a 30% chance to reveal one of the three powerups.
 
 ### Screenshots
 

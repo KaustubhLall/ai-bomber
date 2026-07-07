@@ -22,6 +22,8 @@ The visualizer is built with raylib and provides a portfolio-quality dashboard f
 | R | Reset episode |
 | + / = | Increase speed |
 | - | Decrease speed |
+| [ / ] | Decrease/increase render FPS (15, 30, 60, 120, 240) |
+| H | Toggle help and powerup guide |
 | S | Single step (when paused) |
 | ESC | Quit |
 

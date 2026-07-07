@@ -58,6 +58,8 @@ typedef struct {
     int max_epochs;
     int paused;
     int speed_mult;
+    int target_fps;
+    int show_help;
     int step_once;
     int auto_advance_epoch;
     ViewMode view_mode;

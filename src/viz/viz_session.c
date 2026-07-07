@@ -10,6 +10,8 @@ void viz_session_init(VizSession* vs, int max_epochs, uint64_t base_seed) {
     vs->active_session = 0;
     vs->paused = 0;
     vs->speed_mult = 1;
+    vs->target_fps = 60;
+    vs->show_help = 1;
     vs->step_once = 0;
     vs->auto_advance_epoch = 1;
     vs->view_mode = VIEW_ARENA;

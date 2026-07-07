@@ -28,6 +28,42 @@ static const char* action_name(Action action) {
     return action >= 0 && action < ACTION_COUNT ? names[action] : "NONE";
 }
 
+static int next_fps(int current, int direction) {
+    static const int choices[] = {15, 30, 60, 120, 240};
+    int idx = 2;
+    for (int i = 0; i < 5; i++) if (choices[i] == current) idx = i;
+    idx += direction;
+    if (idx < 0) idx = 0;
+    if (idx > 4) idx = 4;
+    return choices[idx];
+}
+
+static void draw_help_overlay(int screen_w, int screen_h) {
+    const ThemeColors* tc = theme_colors();
+    int w = 760, h = 520, x = (screen_w - w) / 2, y = (screen_h - h) / 2;
+    DrawRectangle(x - 4, y - 4, w + 8, h + 8, (Color){0, 0, 0, 190});
+    DrawRectangle(x, y, w, h, (Color){20, 27, 38, 250});
+    DrawRectangleLines(x, y, w, h, tc->panel_border);
+    DrawText("Help & Powerups", x + 24, y + 20, 24, tc->text_primary);
+    DrawText("Controls", x + 24, y + 62, 18, tc->agent);
+    DrawText("SPACE pause/resume    S single-step    R reset    TAB next policy", x + 24, y + 90, 15, tc->text_secondary);
+    DrawText("+/- simulation steps per frame    [/] render FPS (15/30/60/120/240)", x + 24, y + 116, 15, tc->text_secondary);
+    DrawText("1-4 views    D danger    O observation    G grid    L legend    P screenshot", x + 24, y + 142, 15, tc->text_secondary);
+    DrawText("H close help    ESC exit cleanly", x + 24, y + 168, 15, tc->text_secondary);
+    DrawText("Powerups", x + 24, y + 214, 18, tc->agent);
+    DrawCircle(x + 34, y + 254, 10, (Color){244, 83, 83, 255});
+    DrawText("Bomb capacity", x + 58, y + 244, 16, tc->text_primary);
+    DrawText("Adds one reusable bomb slot. Ammo returns when that bomb explodes.", x + 58, y + 266, 14, tc->text_secondary);
+    DrawCircle(x + 34, y + 320, 10, (Color){255, 184, 62, 255});
+    DrawText("Blast range", x + 58, y + 310, 16, tc->text_primary);
+    DrawText("Extends future bomb flames by one tile in each open direction.", x + 58, y + 332, 14, tc->text_secondary);
+    DrawCircle(x + 34, y + 386, 10, (Color){78, 190, 255, 255});
+    DrawText("Speed level", x + 58, y + 376, 16, tc->text_primary);
+    DrawText("Currently tracked in state/observations, but does not yet change grid movement.", x + 58, y + 398, 14, tc->warning);
+    DrawText("Powerups have a 30% default chance to replace a destroyed crate.", x + 24, y + 452, 14, tc->text_secondary);
+    DrawText("Press H to return", x + w - 150, y + h - 34, 14, tc->text_dim);
+}
+
 static void ensure_screenshot_dir(void) {
 #ifdef _WIN32
     (void)_mkdir("screenshots");
@@ -210,9 +246,9 @@ static void draw_arena_view(VizSession* vs, int screen_w, int screen_h) {
 
     /* Right side status in top bar */
     char status_buf[128];
-    snprintf(status_buf, sizeof(status_buf), "Ep: %d/%d | Step: %d | Speed: %dx | %s",
+    snprintf(status_buf, sizeof(status_buf), "Ep: %d/%d | Step: %d | Sim: %dx | FPS: %d | %s",
              s->epoch_count, vs->max_epochs, s->current_step, vs->speed_mult,
-             vs->paused ? "PAUSED" : "RUNNING");
+             vs->target_fps, vs->paused ? "PAUSED" : "RUNNING");
     int status_w = MeasureText(status_buf, tf->body);
     DrawText(status_buf, layout.top_bar.x + layout.top_bar.width - status_w - ts->padding_x, ty,
              tf->body, vs->paused ? tc->warning : tc->positive);
@@ -440,6 +476,8 @@ int main(int argc, char** argv) {
     int agent_count = 0;
     uint64_t seed = 1337;
     int max_epochs = 500;
+    int target_fps = 60;
+    int start_paused = 0;
     const char* replay_file = NULL;
     const char* enemy_name = NULL;
     int arena_agent_count = 2;
@@ -455,6 +493,11 @@ int main(int argc, char** argv) {
             seed = (uint64_t)strtoull(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--epochs") == 0 && i + 1 < argc) {
             max_epochs = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--fps") == 0 && i + 1 < argc) {
+            target_fps = atoi(argv[++i]);
+            if (target_fps != 15 && target_fps != 30 && target_fps != 60 && target_fps != 120 && target_fps != 240) target_fps = 60;
+        } else if (strcmp(argv[i], "--start-paused") == 0) {
+            start_paused = 1;
         } else if (strcmp(argv[i], "--replay") == 0 && i + 1 < argc) {
             replay_file = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -465,6 +508,8 @@ int main(int argc, char** argv) {
             printf("  --agents <n>     Arena agent count, 1-%d (default 2)\n", MAX_AGENTS);
             printf("  --seed <n>       Random seed (default 1337)\n");
             printf("  --epochs <n>     Max epochs to run (default 500)\n");
+            printf("  --fps <n>        Render FPS: 15, 30, 60, 120, or 240\n");
+            printf("  --start-paused   Open paused for inspection\n");
             printf("  --replay <file>  Load replay file instead of live mode\n");
             printf("  --help           Show this help\n");
             printf("\nControls:\n");
@@ -472,6 +517,8 @@ int main(int argc, char** argv) {
             printf("  [R]       Reset all sessions\n");
             printf("  [S]       Step once (when paused)\n");
             printf("  [+/-]     Speed up/down\n");
+            printf("  [[/]]     Render FPS down/up\n");
+            printf("  [H]       Help and powerup guide\n");
             printf("  [TAB]     Switch active agent\n");
             printf("  [1/2/3/4] Switch view: Arena / Compare / Graphs / Debug\n");
             printf("  [D/O/G/L] Toggle danger / observation / grid / legend\n");
@@ -491,7 +538,8 @@ int main(int argc, char** argv) {
     }
 
     InitWindow(SCREEN_W, SCREEN_H, "AI Bomber - Visualizer");
-    SetTargetFPS(60);
+    SetExitKey(KEY_NULL);
+    SetTargetFPS(target_fps);
     renderer_init(SCREEN_W, SCREEN_H);
     theme_init();
     layout_init(SCREEN_W, SCREEN_H);
@@ -504,6 +552,8 @@ int main(int argc, char** argv) {
 
     VizSession vs;
     viz_session_init(&vs, max_epochs, seed);
+    vs.target_fps = target_fps;
+    vs.paused = start_paused;
 
     if (replay_file) {
         Replay* replay = (Replay*)calloc(1, sizeof(Replay));
@@ -529,7 +579,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    while (!WindowShouldClose()) {
+    int should_exit = 0;
+    while (!should_exit && !WindowShouldClose()) {
+        if (IsKeyPressed(KEY_ESCAPE)) should_exit = 1;
         if (IsKeyPressed(KEY_SPACE)) vs.paused = !vs.paused;
         if (IsKeyPressed(KEY_R)) viz_session_reset_all(&vs);
         if (IsKeyPressed(KEY_S) && vs.paused) vs.step_once = 1;
@@ -537,6 +589,9 @@ int main(int argc, char** argv) {
             vs.speed_mult = (vs.speed_mult * 2 > 16) ? 16 : vs.speed_mult * 2;
         if (IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT))
             vs.speed_mult = (vs.speed_mult / 2 < 1) ? 1 : vs.speed_mult / 2;
+        if (IsKeyPressed(KEY_LEFT_BRACKET)) { vs.target_fps = next_fps(vs.target_fps, -1); SetTargetFPS(vs.target_fps); }
+        if (IsKeyPressed(KEY_RIGHT_BRACKET)) { vs.target_fps = next_fps(vs.target_fps, 1); SetTargetFPS(vs.target_fps); }
+        if (IsKeyPressed(KEY_H)) vs.show_help = !vs.show_help;
         if (IsKeyPressed(KEY_TAB)) {
             vs.active_session = (vs.active_session + 1) % vs.session_count;
         }
@@ -580,6 +635,7 @@ int main(int argc, char** argv) {
             case VIEW_GRAPHS:      draw_graphs_view(&vs, SCREEN_W, SCREEN_H); break;
             case VIEW_DEBUG:       draw_graphs_view(&vs, SCREEN_W, SCREEN_H); break;
         }
+        if (vs.show_help) draw_help_overlay(SCREEN_W, SCREEN_H);
 
         if (screenshot_toast_frames > 0) {
             DrawRectangle(SCREEN_W - 180, SCREEN_H - 48, 160, 30, (Color){18, 28, 38, 235});
@@ -590,6 +646,6 @@ int main(int argc, char** argv) {
         EndDrawing();
     }
 
-    CloseWindow();
+    if (IsWindowReady()) CloseWindow();
     return 0;
 }
