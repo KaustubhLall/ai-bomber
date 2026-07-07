@@ -11,35 +11,6 @@ typedef struct {
     int dist;
 } BFSNode;
 
-static void bfs_reachable(const BomberState* state, int sx, int sy, int max_dist,
-                          int reachable[MAX_HEIGHT][MAX_WIDTH]) {
-    BFSNode queue[MAX_WIDTH * MAX_HEIGHT];
-    int qhead = 0, qtail = 0;
-    memset(reachable, 0, sizeof(int) * MAX_HEIGHT * MAX_WIDTH);
-
-    queue[qtail].x = sx; queue[qtail].y = sy; queue[qtail].dist = 0;
-    qtail++;
-    reachable[sy][sx] = 1;
-
-    int dx[4] = {0, 0, -1, 1};
-    int dy[4] = {-1, 1, 0, 0};
-
-    while (qhead < qtail) {
-        BFSNode cur = queue[qhead++];
-        if (cur.dist >= max_dist) continue;
-        for (int d = 0; d < 4; d++) {
-            int nx = cur.x + dx[d];
-            int ny = cur.y + dy[d];
-            if (!map_in_bounds(state, nx, ny)) continue;
-            if (reachable[ny][nx]) continue;
-            if (!map_is_walkable(state, nx, ny)) continue;
-            reachable[ny][nx] = 1;
-            queue[qtail].x = nx; queue[qtail].y = ny; queue[qtail].dist = cur.dist + 1;
-            qtail++;
-        }
-    }
-}
-
 void danger_compute(DangerMap* dm, const BomberState* state) {
     memset(dm->current_blast, 0, sizeof(int) * MAX_HEIGHT * MAX_WIDTH);
     for (int y = 0; y < MAX_HEIGHT; y++) {
