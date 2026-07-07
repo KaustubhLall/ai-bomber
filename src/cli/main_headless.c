@@ -94,6 +94,9 @@ int main(int argc, char** argv) {
     printf("Agent: %s | Episodes: %d | Seed: %llu | Mode: %s\n",
            agent_name, episodes, (unsigned long long)seed,
            mode == MODE_BATTLE ? "battle" : "survival");
+    printf("Opponent: %s%s\n",
+           enemy_name ? enemy_name : "built-in-random",
+           cfg.agent_count > 2 ? " (shared by enemies 1..N)" : "");
     metrics_print(&metrics);
 
     if (export_file) {

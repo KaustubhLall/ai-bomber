@@ -11,8 +11,14 @@
 #include <string.h>
 #include <stdio.h>
 
+#define OPPONENT_WIRING_MAGIC UINT32_C(0xA17E0F05)
+
 void env_init(BomberEnv* env, const BomberConfig* config) {
+    Agent* opponent = env->opponent_wiring_magic == OPPONENT_WIRING_MAGIC
+        ? env->opponent : NULL;
     memset(env, 0, sizeof(BomberEnv));
+    env->opponent = opponent;
+    env->opponent_wiring_magic = OPPONENT_WIRING_MAGIC;
     env->config = *config;
     config_normalize(&env->config);
     rng_init(&env->rng, (uint64_t)env->config.seed);
@@ -160,6 +166,7 @@ void env_observe(const BomberEnv* env, int agent_id, Observation* obs) {
 
 void env_set_opponent(BomberEnv* env, Agent* opponent) {
     env->opponent = opponent;
+    env->opponent_wiring_magic = OPPONENT_WIRING_MAGIC;
 }
 
 void env_get_debug_snapshot(const BomberEnv* env, DebugSnapshot* out) {

@@ -16,23 +16,36 @@ void viz_session_init(VizSession* vs, int max_epochs, uint64_t base_seed) {
     vs->show_danger = 1;
     vs->show_obs = 1;
     vs->show_local_obs = 1;
+    vs->show_legend = 1;
+    vs->show_observation_window = 0;
+    vs->show_grid = 0;
 }
 
 int viz_session_add_agent(VizSession* vs, AgentType type, const char* name,
-                          const BomberConfig* config) {
+                          AgentType opponent_type, const char* opponent_name,
+                          int has_opponent_policy, const BomberConfig* config) {
     if (vs->session_count >= MAX_VIZ_AGENTS) return -1;
     int idx = vs->session_count;
     AgentSession* s = &vs->sessions[idx];
 
     memset(s, 0, sizeof(AgentSession));
     s->type = type;
+    s->opponent_type = opponent_type;
+    s->has_opponent_policy = has_opponent_policy;
     s->config = *config;
     strncpy(s->name, name, sizeof(s->name) - 1);
+    strncpy(s->opponent_name, has_opponent_policy ? opponent_name : "built-in-random",
+            sizeof(s->opponent_name) - 1);
 
     agent_init(&s->agent, type);
     env_init(&s->env, &s->config);
+    if (has_opponent_policy) {
+        agent_init(&s->opponent, opponent_type);
+        env_set_opponent(&s->env, &s->opponent);
+    }
     env_reset(&s->env, vs->base_seed);
     agent_reset(&s->agent, vs->base_seed);
+    if (has_opponent_policy) agent_reset(&s->opponent, vs->base_seed ^ UINT64_C(0x9E3779B97F4A7C15));
 
     dashboard_init(&s->dashboard);
     s->epoch_count = 0;
@@ -49,6 +62,7 @@ void viz_session_reset_epoch(VizSession* vs, int session_idx) {
     uint64_t ep_seed = vs->base_seed + (uint64_t)s->epoch_count;
     env_reset(&s->env, ep_seed);
     agent_reset(&s->agent, ep_seed);
+    if (s->has_opponent_policy) agent_reset(&s->opponent, ep_seed ^ UINT64_C(0x9E3779B97F4A7C15));
     dashboard_init(&s->dashboard);
     s->current_reward = 0.0f;
     s->current_step = 0;
@@ -127,15 +141,67 @@ void viz_session_step(VizSession* vs) {
         for (int sp = 0; sp < vs->speed_mult; sp++) {
             if (s->episode_done) break;
 
+            DebugSnapshot before;
+            env_get_debug_snapshot(&s->env, &before);
             env_observe(&s->env, 0, &obs);
             env_get_debug_snapshot(&s->env, &snap);
             Action action = agent_act(&s->agent, &obs, &snap);
             StepResult result = env_step(&s->env, action);
+            DebugSnapshot after;
+            env_get_debug_snapshot(&s->env, &after);
 
             dashboard_add_action(&s->dashboard, action);
             dashboard_add_reward(&s->dashboard, result.reward);
             s->current_reward += result.reward;
             s->current_step++;
+
+            char event[MAX_EVENT_LEN];
+            const char* action_names[] = {"UP", "DOWN", "LEFT", "RIGHT", "BOMB", "WAIT"};
+            if (before.state.agents[0].x != after.state.agents[0].x ||
+                before.state.agents[0].y != after.state.agents[0].y) {
+                snprintf(event, sizeof(event), "Step %d: Agent moved %s", after.state.step, action_names[action]);
+                dashboard_add_event(&s->dashboard, event);
+            } else if (action == ACTION_PLACE_BOMB) {
+                snprintf(event, sizeof(event), "Step %d: Agent placed bomb", after.state.step);
+                dashboard_add_event(&s->dashboard, event);
+            }
+            for (int a = 1; a < after.state.agent_count; a++) {
+                if (before.state.agents[a].alive && !after.state.agents[a].alive) {
+                    snprintf(event, sizeof(event), "Step %d: Enemy %d defeated", after.state.step, a);
+                    dashboard_add_event(&s->dashboard, event);
+                } else if (before.state.agents[a].x != after.state.agents[a].x ||
+                           before.state.agents[a].y != after.state.agents[a].y) {
+                    snprintf(event, sizeof(event), "Step %d: Enemy %d moved", after.state.step, a);
+                    dashboard_add_event(&s->dashboard, event);
+                }
+            }
+            int bombs_before = 0, bombs_after = 0;
+            for (int b = 0; b < MAX_BOMBS; b++) {
+                bombs_before += before.state.bombs[b].active;
+                bombs_after += after.state.bombs[b].active;
+            }
+            if (bombs_after < bombs_before) {
+                snprintf(event, sizeof(event), "Step %d: Bomb exploded", after.state.step);
+                dashboard_add_event(&s->dashboard, event);
+            }
+            int crates_before = map_count_crates(&before.state);
+            int crates_after = map_count_crates(&after.state);
+            if (crates_after < crates_before) {
+                snprintf(event, sizeof(event), "Step %d: Crate destroyed", after.state.step);
+                dashboard_add_event(&s->dashboard, event);
+            }
+            int danger_before = before.danger.time_to_blast[before.state.agents[0].y][before.state.agents[0].x] >= 0;
+            int danger_after = after.danger.time_to_blast[after.state.agents[0].y][after.state.agents[0].x] >= 0;
+            if (danger_before != danger_after) {
+                snprintf(event, sizeof(event), "Step %d: Agent %s danger", after.state.step,
+                         danger_after ? "entered" : "escaped");
+                dashboard_add_event(&s->dashboard, event);
+            }
+            if (result.done) {
+                snprintf(event, sizeof(event), "Step %d: Episode ended (%d)", after.state.step,
+                         (int)result.terminal_reason);
+                dashboard_add_event(&s->dashboard, event);
+            }
 
             if (result.done) {
                 s->episode_done = 1;

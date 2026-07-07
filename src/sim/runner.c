@@ -7,8 +7,9 @@ void runner_run_single(BomberEnv* env, Agent* agent, uint64_t seed,
                        Metrics* metrics, Replay* replay, int record) {
     BomberConfig cfg = env->config;
     env_init(env, &cfg);
-    env_reset(env, seed);
     agent_reset(agent, seed);
+    if (env->opponent) agent_reset(env->opponent, seed ^ UINT64_C(0x9E3779B97F4A7C15));
+    env_reset(env, seed);
 
     Observation obs;
     DebugSnapshot debug;
@@ -42,7 +43,7 @@ void runner_run_single(BomberEnv* env, Agent* agent, uint64_t seed,
 }
 
 void runner_run(const RunConfig* rc, Metrics* metrics) {
-    BomberEnv env;
+    BomberEnv env = {0};
     env.config = rc->config;
     Agent agent;
     agent_init(&agent, rc->agent_type);

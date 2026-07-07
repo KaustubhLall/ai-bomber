@@ -1,10 +1,18 @@
 #include "viz/renderer.h"
+#include "viz/theme.h"
 #include "env/bomber_map.h"
 #include "core/math_util.h"
 #include <stdio.h>
 #include <string.h>
 
 static Font s_font;
+static int s_show_danger = 1;
+static int s_show_grid = 0;
+
+void renderer_set_arena_options(int show_danger, int show_grid) {
+    s_show_danger = show_danger;
+    s_show_grid = show_grid;
+}
 
 static Color s_session_colors[] = {
     {80, 180, 255, 255},
@@ -55,49 +63,81 @@ Color agent_color(int agent_id) {
 void renderer_draw_arena(const DebugSnapshot* snap, int ox, int oy, int tile_size) {
     const BomberState* state = &snap->state;
     const DangerMap* dm = &snap->danger;
-
-    /* Draw tiles */
+    const ThemeColors* tc = theme_colors();
+    /* Floor first: a quiet checkerboard gives the arena shape without noise. */
     for (int y = 0; y < state->height; y++) {
         for (int x = 0; x < state->width; x++) {
             int px = ox + x * tile_size;
             int py = oy + y * tile_size;
-            DrawRectangle(px, py, tile_size, tile_size, tile_color(state->tiles[y][x]));
 
-            /* Draw grid lines */
-            DrawRectangleLines(px, py, tile_size, tile_size, (Color){50, 50, 60, 128});
+            Color floor = tc->floor;
+            if ((x + y) & 1) floor = (Color){floor.r + 4, floor.g + 5, floor.b + 7, floor.a};
+            DrawRectangle(px, py, tile_size, tile_size, floor);
 
-            /* Draw danger overlay */
+            /* Blocks sit on top of the floor with highlight and shadow. */
+            Color tile_c;
+            switch (state->tiles[y][x]) {
+                case TILE_FLOOR:         tile_c = floor; break;
+                case TILE_SOLID_WALL:    tile_c = tc->solid_wall; break;
+                case TILE_CRATE:         tile_c = tc->destructible_wall; break;
+                case TILE_POWERUP_BOMB:  tile_c = (Color){255, 80, 80, 255}; break;
+                case TILE_POWERUP_RANGE: tile_c = (Color){80, 255, 80, 255}; break;
+                case TILE_POWERUP_SPEED: tile_c = (Color){80, 180, 255, 255}; break;
+                default:                 tile_c = BLACK; break;
+            }
+            if (state->tiles[y][x] != TILE_FLOOR) {
+                DrawRectangle(px + 1, py + 1, tile_size - 2, tile_size - 2, tile_c);
+            }
+
+            if (state->tiles[y][x] == TILE_CRATE || state->tiles[y][x] == TILE_SOLID_WALL) {
+                Color hi = state->tiles[y][x] == TILE_CRATE ? (Color){218, 167, 104, 255} : (Color){72, 87, 108, 255};
+                Color lo = state->tiles[y][x] == TILE_CRATE ? (Color){92, 55, 31, 255} : (Color){10, 16, 27, 255};
+                DrawLine(px + 2, py + 2, px + tile_size - 3, py + 2, hi);
+                DrawLine(px + 2, py + 2, px + 2, py + tile_size - 3, hi);
+                DrawLine(px + 2, py + tile_size - 3, px + tile_size - 3, py + tile_size - 3, lo);
+                DrawLine(px + tile_size - 3, py + 2, px + tile_size - 3, py + tile_size - 3, lo);
+            }
+
+            if (s_show_grid) DrawRectangleLines(px, py, tile_size, tile_size, tc->grid);
+
+            /* Draw danger overlay using theme colors */
             int tblast = dm->time_to_blast[y][x];
-            if (tblast >= 0 && tblast <= 3) {
-                int alpha = 200 - tblast * 50;
-                Color dc = (tblast == 0) ? (Color){255, 50, 50, 200} : (Color){255, 100, 50, alpha};
+            if (s_show_danger && tblast >= 0 && tblast <= 3) {
+                Color dc = (tblast == 0) ? tc->danger_now : tc->danger_soon;
                 DrawRectangle(px, py, tile_size, tile_size, dc);
             }
 
-            /* Draw safe tile overlay (subtle green) */
-            if (dm->reachable_safe[y][x] && tblast < 0) {
-                DrawRectangle(px + tile_size - 4, py + tile_size - 4, 4, 4,
-                              (Color){50, 200, 50, 128});
+            /* Draw safe tile overlay */
+            if (s_show_danger && dm->reachable_safe[y][x] && tblast < 0) {
+                DrawCircle(px + tile_size / 2, py + tile_size / 2, 2.0f, tc->safe_reachable);
             }
         }
     }
 
-    /* Draw bombs */
+    /* Draw bombs with improved visuals */
     for (int i = 0; i < MAX_BOMBS; i++) {
         if (!state->bombs[i].active) continue;
         int px = ox + state->bombs[i].x * tile_size + tile_size / 2;
         int py = oy + state->bombs[i].y * tile_size + tile_size / 2;
         int radius = tile_size / 3;
+
         /* Pulsing effect based on timer */
         float pulse = 1.0f - (float)state->bombs[i].timer / 4.0f;
         radius = (int)(radius * (1.0f + pulse * 0.3f));
-        DrawCircle(px, py, radius, (Color){40, 40, 40, 255});
-        DrawCircle(px, py, radius - 2, (Color){200, 50, 50, 255});
+
+        /* Bomb shadow */
+        DrawCircle(px + 2, py + 2, radius, (Color){20, 20, 20, 128});
+        DrawCircle(px, py, radius, (Color){8, 10, 14, 255});
+        DrawCircle(px - radius / 3, py - radius / 3, radius / 4, (Color){74, 80, 89, 255});
+        DrawLine(px + radius / 3, py - radius + 1, px + radius / 2, py - radius - 4, (Color){218, 155, 48, 255});
+        DrawCircle(px + radius / 2, py - radius - 4, 2.0f, (Color){255, 193, 61, 255});
+        DrawCircleLines(px, py, radius + 1, (Color){255, 181, 48, 255});
 
         /* Timer label */
         char timer_str[8];
         snprintf(timer_str, sizeof(timer_str), "%d", state->bombs[i].timer);
-        DrawText(timer_str, px - 4, py - 6, 12, WHITE);
+        int tw = MeasureText(timer_str, 12);
+        DrawText(timer_str, px - tw / 2, py - 6, 12, WHITE);
     }
 
     /* Draw agents */
@@ -106,8 +146,10 @@ void renderer_draw_arena(const DebugSnapshot* snap, int ox, int oy, int tile_siz
         int px = ox + state->agents[a].x * tile_size + tile_size / 2;
         int py = oy + state->agents[a].y * tile_size + tile_size / 2;
         int radius = tile_size / 3;
-        DrawCircle(px, py, radius, agent_color(a));
-        DrawCircleLines(px, py, radius, BLACK);
+        Color body = a == 0 ? tc->agent : tc->enemy;
+        DrawCircle(px, py, radius + 2, (Color){5, 9, 16, 255});
+        DrawCircle(px, py, radius, body);
+        DrawCircle(px - radius / 3, py - radius / 3, 2.0f, (Color){240, 248, 255, 210});
 
         /* Agent label */
         char label[4];
@@ -115,7 +157,10 @@ void renderer_draw_arena(const DebugSnapshot* snap, int ox, int oy, int tile_siz
         DrawText(label, px - 4, py - 6, 10, WHITE);
     }
 
-    /* Draw local observation box around agent 0 */
+}
+
+void renderer_draw_observation_overlay(const DebugSnapshot* snap, int ox, int oy, int tile_size) {
+    const BomberState* state = &snap->state;
     if (state->agent_count > 0 && state->agents[0].alive) {
         int ax = state->agents[0].x;
         int ay = state->agents[0].y;
@@ -124,7 +169,18 @@ void renderer_draw_arena(const DebugSnapshot* snap, int ox, int oy, int tile_siz
         int by = oy + (ay - half) * tile_size;
         int bw = LOCAL_OBS_SIZE * tile_size;
         int bh = LOCAL_OBS_SIZE * tile_size;
-        DrawRectangleLines(bx, by, bw, bh, (Color){255, 255, 100, 100});
+        Color c = theme_colors()->observation_border;
+        int dash = 8;
+        for (int x = 0; x < bw; x += dash * 2) {
+            DrawLine(bx + x, by, bx + (x + dash < bw ? x + dash : bw), by, c);
+            DrawLine(bx + x, by + bh, bx + (x + dash < bw ? x + dash : bw), by + bh, c);
+        }
+        for (int y = 0; y < bh; y += dash * 2) {
+            DrawLine(bx, by + y, bx, by + (y + dash < bh ? y + dash : bh), c);
+            DrawLine(bx + bw, by + y, bx + bw, by + (y + dash < bh ? y + dash : bh), c);
+        }
+        DrawRectangle(bx + 4, by + 4, 118, 18, (Color){12, 19, 29, 220});
+        DrawText("11x11 Observation", bx + 8, by + 7, 11, c);
     }
 }
 
@@ -735,4 +791,57 @@ void renderer_draw_view_controls(const VizSession* vs, int ox, int oy, int w, in
 
     snprintf(buf, sizeof(buf), "Auto-advance: %s", vs->auto_advance_epoch ? "ON" : "OFF");
     DrawText(buf, ox + 8, y, 11, vs->auto_advance_epoch ? GREEN : (Color){200, 100, 100, 255});
+}
+
+void renderer_draw_legend(int ox, int oy, int w, int h) {
+    const ThemeColors* tc = theme_colors();
+    const ThemeFonts* tf = theme_fonts();
+    const ThemeSpacing* ts = theme_spacing();
+
+    /* Draw legend background */
+    DrawRectangle(ox, oy, w, h, (Color){20, 25, 35, 220});
+    DrawRectangleLines(ox, oy, w, h, tc->panel_border);
+
+    int x = ox + ts->padding_x;
+    int y = oy + ts->padding_y;
+    int item_h = tf->small + 4;
+    int col_w = (w - 2 * ts->padding_x) / 2;
+
+    /* Title */
+    DrawText("Legend", x, y, tf->section, tc->text_primary);
+    y += tf->section + ts->gap_y;
+
+    /* Column 1 */
+    DrawCircle(x + 6, y + 6, 6, tc->agent);
+    DrawText("Agent", x + 16, y, tf->small, tc->text_secondary); y += item_h;
+
+    DrawRectangle(x, y, 12, 12, tc->solid_wall);
+    DrawText("Solid Wall", x + 16, y, tf->small, tc->text_secondary); y += item_h;
+
+    DrawRectangle(x, y, 12, 12, tc->destructible_wall);
+    DrawText("Crate", x + 16, y, tf->small, tc->text_secondary); y += item_h;
+
+    DrawCircle(x + 6, y + 6, 6, tc->enemy);
+    DrawText("Enemy", x + 16, y, tf->small, tc->text_secondary); y += item_h;
+
+    DrawCircle(x + 6, y + 6, 5, (Color){92, 224, 138, 255});
+    DrawText("Powerup", x + 16, y, tf->small, tc->text_secondary); y += item_h;
+
+    /* Column 2 */
+    x = ox + ts->padding_x + col_w;
+    y = oy + ts->padding_y + tf->section + ts->gap_y;
+
+    DrawCircle(x + 6, y + 6, 6, (Color){8, 10, 14, 255});
+    DrawCircleLines(x + 6, y + 6, 7, (Color){255, 181, 48, 255});
+    DrawText("Bomb", x + 16, y, tf->small, tc->text_secondary); y += item_h;
+
+    DrawRectangle(x, y, 12, 12, tc->danger_now);
+    DrawText("Danger Now", x + 16, y, tf->small, tc->text_secondary); y += item_h;
+
+    DrawRectangle(x, y, 12, 12, tc->danger_soon);
+    DrawText("Danger Soon", x + 16, y, tf->small, tc->text_secondary); y += item_h;
+
+    DrawRectangle(x, y, 12, 12, tc->observation_border);
+    DrawRectangle(x + 2, y + 2, 8, 8, tc->observation_fill);
+    DrawText("Observation", x + 16, y, tf->small, tc->text_secondary);
 }

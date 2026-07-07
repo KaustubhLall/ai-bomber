@@ -44,3 +44,15 @@ AgentType agent_parse_type(const char* name) {
     if (strcmp(name, "external") == 0) return AGENT_EXTERNAL;
     return AGENT_RANDOM;
 }
+
+const char* agent_type_name(AgentType type) {
+    switch (type) {
+        case AGENT_RANDOM: return "random";
+        case AGENT_SCRIPTED: return "scripted";
+        case AGENT_HEURISTIC: return "heuristic";
+        case AGENT_GREEDY_CRATE: return "greedy";
+        case AGENT_ENEMY_BOT: return "enemy-bot";
+        case AGENT_EXTERNAL: return "external";
+        default: return "unknown";
+    }
+}

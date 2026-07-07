@@ -69,6 +69,11 @@ ctest --test-dir build --output-on-failure
 ./build/bomber_headless --agent heuristic --episodes 1 --seed 42 --replay replay.bin
 ```
 
+`--agent` controls agent 0. `--enemy` installs one shared opponent policy for
+enemies 1..N; when it is omitted, enemies use the environment's
+`built-in-random` fallback. These are independent choices: a run is not self-play
+unless both sides are explicitly configured with the same policy.
+
 ## Run benchmark
 
 ```bash
@@ -85,17 +90,24 @@ ctest --test-dir build --output-on-failure
 ./build/bomber_viz --agent random --agent scripted --agent heuristic --agent greedy
 
 # Single agent.
-./build/bomber_viz --agent heuristic --seed 1337
+./build/bomber_viz --agent heuristic --enemy random --agents 2 --seed 1337
 
 # Replay mode.
 ./build/bomber_viz --replay replay.bin
 ```
 
+Visualizer matchup configuration mirrors the headless runner: `--agent` selects
+agent 0, `--enemy` selects the opponent policy, `--agents` sets the total arena
+agent count, and `--seed` controls deterministic setup. With three or more agents,
+the selected opponent policy is shared by enemies 1..N. Omitting `--enemy` is
+shown explicitly as `Opponent Policy: built-in-random`.
+
 ### Visualizer views
 
-- **Arena View (1)**: board view with danger overlay, local observation, status panel, reward graph, action distribution, bomb timeline, decision trace, event log, and controls
-- **Graphs View (2)**: per-epoch reward, running average reward, action distribution, and training overview table for all agents
-- **Comparison View (3)**: side-by-side mini arenas for all configured agents with a shared training overview panel
+- **Arena View (1)**: redesigned dashboard with large centered arena, top status bar, right inspector panel (decision trace, agent/enemy stats, active bombs), bottom event timeline, and optional legend
+- **Compare View (2)**: side-by-side mini arenas for all configured agents with a shared training overview panel
+- **Graphs View (3)**: per-epoch reward, running average reward, action distribution, and training overview table for all agents
+- **Debug View (4)**: detailed technical view with raw local observation, danger map, and event log
 
 ### Visualizer controls
 
@@ -104,9 +116,23 @@ ctest --test-dir build --output-on-failure
 - **+/-**: adjust speed multiplier
 - **S**: step once while paused
 - **TAB**: switch active agent
-- **1/2/3**: switch view
+- **1/2/3/4**: switch view (Arena/Compare/Graphs/Debug)
 - **N**: start a new epoch for the active agent
+- **L**: toggle legend
+- **O**: toggle observation window overlay
+- **D**: toggle danger overlay
+- **G**: toggle grid lines
+- **P**: save screenshot to `screenshots/ai-bomber-arena.png`
 - **ESC**: quit
+
+### Screenshots
+
+To capture a screenshot of the current visualizer state:
+1. Navigate to the desired view (typically Arena View for best results)
+2. Press **P** to save a screenshot
+3. Screenshots are saved to the `screenshots/` directory
+
+Note: The `screenshots/` directory is created automatically on first screenshot capture. Generated screenshots should not be committed to version control unless specifically intended for documentation.
 
 ## Project structure
 

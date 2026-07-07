@@ -11,16 +11,21 @@
 
 typedef enum {
     VIEW_ARENA = 0,
+    VIEW_COMPARE,
     VIEW_GRAPHS,
-    VIEW_COMPARISON
+    VIEW_DEBUG
 } ViewMode;
 
 typedef struct {
     Agent agent;
+    Agent opponent;
+    int has_opponent_policy;
     BomberEnv env;
     BomberConfig config;
     char name[32];
     AgentType type;
+    AgentType opponent_type;
+    char opponent_name[32];
 
     /* Per-epoch metrics (lightweight, just numbers) */
     float epoch_rewards[MAX_VIZ_EPOCHS];
@@ -60,11 +65,15 @@ typedef struct {
     int show_danger;
     int show_obs;
     int show_local_obs;
+    int show_legend;
+    int show_observation_window;
+    int show_grid;
 } VizSession;
 
 void viz_session_init(VizSession* vs, int max_epochs, uint64_t base_seed);
 int viz_session_add_agent(VizSession* vs, AgentType type, const char* name,
-                          const BomberConfig* config);
+                          AgentType opponent_type, const char* opponent_name,
+                          int has_opponent_policy, const BomberConfig* config);
 void viz_session_step(VizSession* vs);
 void viz_session_reset_epoch(VizSession* vs, int session_idx);
 void viz_session_reset_all(VizSession* vs);

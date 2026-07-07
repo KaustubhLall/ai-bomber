@@ -17,6 +17,8 @@ typedef struct {
 
 void renderer_init(int screen_w, int screen_h);
 void renderer_draw_arena(const DebugSnapshot* snap, int ox, int oy, int tile_size);
+void renderer_set_arena_options(int show_danger, int show_grid);
+void renderer_draw_observation_overlay(const DebugSnapshot* snap, int ox, int oy, int tile_size);
 void renderer_draw_danger_map(const DebugSnapshot* snap, int ox, int oy, int panel_w, int panel_h);
 void renderer_draw_local_obs(const Observation* obs, int ox, int oy, int cell_size);
 void renderer_draw_bomb_timeline(const DebugSnapshot* snap, int ox, int oy, int w);
@@ -42,5 +44,8 @@ void renderer_draw_mini_arena(const DebugSnapshot* snap, int ox, int oy, int cel
 Color tile_color(TileType t);
 Color agent_color(int agent_id);
 Color session_color(int session_idx);
+
+/* Legend rendering */
+void renderer_draw_legend(int ox, int oy, int w, int h);
 
 #endif /* BOMBER_RENDERER_H */

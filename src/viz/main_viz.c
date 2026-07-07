@@ -9,12 +9,45 @@
 #include "viz/ui_controls.h"
 #include "viz/charts.h"
 #include "viz/viz_session.h"
+#include "viz/theme.h"
+#include "viz/layout.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
 
 #define SCREEN_W 1400
 #define SCREEN_H 860
+
+static const char* action_name(Action action) {
+    static const char* names[] = {"UP", "DOWN", "LEFT", "RIGHT", "BOMB", "WAIT"};
+    return action >= 0 && action < ACTION_COUNT ? names[action] : "NONE";
+}
+
+static void ensure_screenshot_dir(void) {
+#ifdef _WIN32
+    (void)_mkdir("screenshots");
+#else
+    (void)mkdir("screenshots", 0755);
+#endif
+}
+
+static int action_is_valid(const DebugSnapshot* snap, Action action) {
+    const BomberAgentState* a = &snap->state.agents[0];
+    int x = a->x, y = a->y;
+    if (action == ACTION_UP) y--;
+    else if (action == ACTION_DOWN) y++;
+    else if (action == ACTION_LEFT) x--;
+    else if (action == ACTION_RIGHT) x++;
+    if (action >= ACTION_UP && action <= ACTION_RIGHT)
+        return map_in_bounds(&snap->state, x, y) && map_is_walkable(&snap->state, x, y);
+    if (action == ACTION_PLACE_BOMB) return a->bomb_ammo > 0;
+    return action == ACTION_WAIT;
+}
 
 static void draw_agent_tabs(VizSession* vs, int ox, int oy, int w) {
     int tab_w = w / vs->session_count;
@@ -147,44 +180,201 @@ static void draw_arena_view(VizSession* vs, int screen_w, int screen_h) {
     AgentSession* s = viz_session_active(vs);
     if (!s) return;
 
+    const ThemeColors* tc = theme_colors();
+    const ThemeFonts* tf = theme_fonts();
+    const ThemeSpacing* ts = theme_spacing();
+    ArenaLayout layout = layout_get_arena();
+
     Observation obs;
     DebugSnapshot snap;
     env_observe(&s->env, 0, &obs);
     env_get_debug_snapshot(&s->env, &snap);
 
-    int tile_size = TILE_SIZE;
-    int arena_w = snap.state.width * tile_size;
-    int arena_h = snap.state.height * tile_size;
-    int arena_ox = 280 + (screen_w - 280 - 320 - arena_w) / 2;
-    if (arena_ox < 280) arena_ox = 280;
-    int arena_oy = 50;
+    /* Draw top bar */
+    DrawRectangle(layout.top_bar.x, layout.top_bar.y, layout.top_bar.width, layout.top_bar.height, tc->panel);
+    DrawRectangleLines(layout.top_bar.x, layout.top_bar.y, layout.top_bar.width, layout.top_bar.height, tc->panel_border);
 
-    int left_w = 260;
-    int left_ox = 8;
+    int tx = layout.top_bar.x + ts->padding_x;
+    int ty = layout.top_bar.y + (layout.top_bar.height - tf->header) / 2;
+    DrawText("AI Bomber", tx, ty, tf->header, tc->text_primary);
 
-    renderer_draw_status_panel(&snap, left_ox, 50, left_w, 140);
-    renderer_draw_local_obs(&obs, left_ox, 200, 16);
-    renderer_draw_danger_map(&snap, left_ox, 430, left_w, 200);
+    tx += MeasureText("AI Bomber", tf->header) + ts->gap_x * 4;
+    DrawText("Arena Inspector", tx, ty, tf->section, tc->text_secondary);
 
-    int right_w = 300;
-    int right_ox = screen_w - right_w - 8;
+    tx += MeasureText("Arena Inspector", tf->section) + ts->gap_x * 4;
+    char policy_buf[160];
+    snprintf(policy_buf, sizeof(policy_buf), "Agent Policy: %s   Opponent Policy: %s%s",
+             s->name, s->opponent_name,
+             snap.state.agent_count > 2 && s->has_opponent_policy ? " shared by enemies 1..N" : "");
+    DrawText(policy_buf, tx, ty, tf->section, tc->agent);
 
-    renderer_draw_reward_graph(s->dashboard.reward_history, s->dashboard.reward_count,
-                               right_ox, 50, right_w, 120, 2.0f);
-    renderer_draw_action_dist(s->dashboard.action_counts, s->dashboard.total_actions,
-                              right_ox, 180, right_w, 130);
-    renderer_draw_bomb_timeline(&snap, right_ox, 320, right_w);
-    renderer_draw_decision_trace(snap.decision_text, right_ox, 450, right_w, 60);
-    renderer_draw_event_log((const char**)s->dashboard.events, s->dashboard.event_count,
-                            right_ox, 520, right_w, 120);
-    renderer_draw_controls(right_ox, 650, right_w, 120, vs->paused, vs->speed_mult);
+    /* Right side status in top bar */
+    char status_buf[128];
+    snprintf(status_buf, sizeof(status_buf), "Ep: %d/%d | Step: %d | Speed: %dx | %s",
+             s->epoch_count, vs->max_epochs, s->current_step, vs->speed_mult,
+             vs->paused ? "PAUSED" : "RUNNING");
+    int status_w = MeasureText(status_buf, tf->body);
+    DrawText(status_buf, layout.top_bar.x + layout.top_bar.width - status_w - ts->padding_x, ty,
+             tf->body, vs->paused ? tc->warning : tc->positive);
 
+    /* Calculate tile size to fit arena in available space */
+    int tile_size = layout_calc_tile_size(snap.state.width, snap.state.height,
+                                          layout.arena.width - 2 * ts->padding_x,
+                                          layout.arena.height - 2 * ts->padding_y);
+    int arena_pixel_w = snap.state.width * tile_size;
+    int arena_pixel_h = snap.state.height * tile_size;
+    int arena_ox = layout.arena.x + (layout.arena.width - arena_pixel_w) / 2;
+    int arena_oy = layout.arena.y + (layout.arena.height - arena_pixel_h) / 2;
+
+    /* Draw arena background */
+    DrawRectangle(layout.arena.x, layout.arena.y, layout.arena.width, layout.arena.height, tc->background);
+
+    /* Draw arena */
+    renderer_set_arena_options(vs->show_danger, vs->show_grid);
     renderer_draw_arena(&snap, arena_ox, arena_oy, tile_size);
 
-    char epoch_info[128];
-    snprintf(epoch_info, sizeof(epoch_info), "Agent: %s | Epoch: %d/%d | Step: %d | Reward: %.2f",
-             s->name, s->epoch_count, vs->max_epochs, s->current_step, s->current_reward);
-    DrawText(epoch_info, arena_ox, arena_oy + arena_h + 8, 14, (Color){200, 200, 220, 255});
+    /* Draw legend if enabled */
+    if (vs->show_legend) {
+        renderer_draw_legend(layout.legend.x, layout.legend.y, layout.legend.width, layout.legend.height);
+    }
+
+    /* Draw right inspector panel */
+    DrawRectangle(layout.right_panel.x, layout.right_panel.y, layout.right_panel.width, layout.right_panel.height, tc->panel);
+    DrawRectangleLines(layout.right_panel.x, layout.right_panel.y, layout.right_panel.width, layout.right_panel.height, tc->panel_border);
+
+    int rx = layout.right_panel.x + ts->padding_x;
+    int ry = layout.right_panel.y + ts->padding_y;
+
+    /* Section: Current Decision */
+    DrawText("Current Decision", rx, ry, tf->section, tc->text_primary);
+    ry += tf->section + ts->gap_y;
+
+    char decision_buf[128];
+    snprintf(decision_buf, sizeof(decision_buf), "Last action: %s", action_name(snap.last_action));
+    DrawText(decision_buf, rx, ry, tf->body, tc->text_secondary); ry += tf->body + ts->gap_y;
+
+    if (snap.decision_text[0] != '\0') {
+        DrawText("Reason: No decision trace emitted by this policy.", rx, ry, tf->small, tc->text_dim); ry += tf->small + ts->gap_y;
+    } else {
+        DrawText("No decision trace emitted by this policy.", rx, ry, tf->small, tc->text_dim); ry += tf->small + ts->gap_y;
+    }
+
+    /* Danger status */
+    const BomberAgentState* agent = &snap.state.agents[0];
+    int in_danger = (snap.danger.time_to_blast[agent->y][agent->x] >= 0 &&
+                     snap.danger.time_to_blast[agent->y][agent->x] <= 3);
+    snprintf(decision_buf, sizeof(decision_buf), "Danger: %s", in_danger ? "IMMEDIATE" : "None");
+    DrawText(decision_buf, rx, ry, tf->body, in_danger ? tc->danger : tc->positive); ry += tf->body + ts->gap_y;
+
+    char valid[128] = "Valid actions:";
+    char safe[128] = "Safe actions:";
+    for (int a = 0; a < ACTION_COUNT; a++) {
+        if (action_is_valid(&snap, (Action)a)) { strncat(valid, " ", sizeof(valid) - strlen(valid) - 1); strncat(valid, action_name((Action)a), sizeof(valid) - strlen(valid) - 1); }
+        if (snap.danger.action_safe[a]) { strncat(safe, " ", sizeof(safe) - strlen(safe) - 1); strncat(safe, action_name((Action)a), sizeof(safe) - strlen(safe) - 1); }
+    }
+    DrawText(valid, rx, ry, tf->small, tc->text_secondary); ry += tf->small + ts->gap_y;
+    DrawText(safe, rx, ry, tf->small, tc->positive); ry += tf->small + ts->gap_y;
+
+    ry += ts->gap_y;
+
+    /* Section: Agent Stats */
+    DrawText("Agent Stats", rx, ry, tf->section, tc->text_primary);
+    ry += tf->section + ts->gap_y;
+
+    snprintf(decision_buf, sizeof(decision_buf), "Position: (%d, %d)", agent->x, agent->y);
+    DrawText(decision_buf, rx, ry, tf->body, tc->text_secondary); ry += tf->body + ts->gap_y;
+
+    snprintf(decision_buf, sizeof(decision_buf), "Status: %s", agent->alive ? "ALIVE" : "DEAD");
+    DrawText(decision_buf, rx, ry, tf->body, agent->alive ? tc->positive : tc->danger); ry += tf->body + ts->gap_y;
+
+    snprintf(decision_buf, sizeof(decision_buf), "Bomb Ammo: %d", agent->bomb_ammo);
+    DrawText(decision_buf, rx, ry, tf->body, tc->text_secondary); ry += tf->body + ts->gap_y;
+
+    snprintf(decision_buf, sizeof(decision_buf), "Bomb Range: %d", agent->blast_range);
+    DrawText(decision_buf, rx, ry, tf->body, tc->text_secondary); ry += tf->body + ts->gap_y;
+
+    snprintf(decision_buf, sizeof(decision_buf), "Score: %d", agent->score);
+    DrawText(decision_buf, rx, ry, tf->body, tc->text_secondary); ry += tf->body + ts->gap_y;
+
+    snprintf(decision_buf, sizeof(decision_buf), "Last reward: %.2f", snap.last_reward.total);
+    DrawText(decision_buf, rx, ry, tf->body, tc->positive); ry += tf->body + ts->gap_y;
+
+    ry += ts->gap_y;
+
+    /* Section: Enemy Stats */
+    if (snap.state.agent_count > 1) {
+        const BomberAgentState* enemy = &snap.state.agents[1];
+        DrawText("Enemy Stats", rx, ry, tf->section, tc->text_primary);
+        ry += tf->section + ts->gap_y;
+
+        snprintf(decision_buf, sizeof(decision_buf), "Position: (%d, %d)", enemy->x, enemy->y);
+        DrawText(decision_buf, rx, ry, tf->body, tc->text_secondary); ry += tf->body + ts->gap_y;
+
+        snprintf(decision_buf, sizeof(decision_buf), "Status: %s", enemy->alive ? "ALIVE" : "DEAD");
+        DrawText(decision_buf, rx, ry, tf->body, enemy->alive ? tc->danger : tc->positive); ry += tf->body + ts->gap_y;
+    }
+
+    ry += ts->gap_y;
+
+    /* Section: Active Bombs */
+    DrawText("Active Bombs", rx, ry, tf->section, tc->text_primary);
+    ry += tf->section + ts->gap_y;
+
+    int bomb_count = 0;
+    for (int i = 0; i < MAX_BOMBS; i++) {
+        if (snap.state.bombs[i].active) bomb_count++;
+    }
+
+    if (bomb_count == 0) {
+        DrawText("No active bombs", rx, ry, tf->body, tc->text_dim); ry += tf->body + ts->gap_y;
+    } else {
+        snprintf(decision_buf, sizeof(decision_buf), "%d active bomb(s)", bomb_count);
+        DrawText(decision_buf, rx, ry, tf->body, tc->warning); ry += tf->body + ts->gap_y;
+    }
+
+    ry += ts->gap_y;
+    DrawText("Last Reward Breakdown", rx, ry, tf->section, tc->text_primary);
+    ry += tf->section + ts->gap_y;
+    snprintf(decision_buf, sizeof(decision_buf), "Survival %+.2f   Crate %+.2f",
+             snap.last_reward.survival, snap.last_reward.crate_destroyed);
+    DrawText(decision_buf, rx, ry, tf->small, tc->text_secondary); ry += tf->small + ts->gap_y;
+    snprintf(decision_buf, sizeof(decision_buf), "Powerup %+.2f   Enemy %+.2f",
+             snap.last_reward.powerup,
+             snap.last_reward.enemy_damage + snap.last_reward.enemy_elimination);
+    DrawText(decision_buf, rx, ry, tf->small, tc->text_secondary); ry += tf->small + ts->gap_y;
+    snprintf(decision_buf, sizeof(decision_buf), "Penalties %+.2f   Total %+.2f",
+             snap.last_reward.invalid_action_penalty + snap.last_reward.suicidal_bomb_penalty +
+             snap.last_reward.stall_penalty + snap.last_reward.death_penalty + snap.last_reward.timeout_penalty,
+             snap.last_reward.total);
+    DrawText(decision_buf, rx, ry, tf->small, tc->text_secondary);
+
+    /* Draw bottom timeline/log panel */
+    DrawRectangle(layout.bottom_panel.x, layout.bottom_panel.y, layout.bottom_panel.width, layout.bottom_panel.height, tc->panel);
+    DrawRectangleLines(layout.bottom_panel.x, layout.bottom_panel.y, layout.bottom_panel.width, layout.bottom_panel.height, tc->panel_border);
+
+    int bx = layout.bottom_panel.x + ts->padding_x;
+    int by = layout.bottom_panel.y + ts->padding_y;
+
+    DrawText("Recent Events", bx, by, tf->section, tc->text_primary);
+    by += tf->section + ts->gap_y;
+
+    if (s->dashboard.event_count == 0) {
+        DrawText("No events recorded yet. Press SPACE to run.", bx, by, tf->body, tc->text_dim);
+    } else {
+        int show_count = (layout.bottom_panel.height - tf->section - 2 * ts->padding_y) / (tf->body + ts->gap_y);
+        if (show_count > s->dashboard.event_count) show_count = s->dashboard.event_count;
+
+        for (int i = 0; i < show_count; i++) {
+            int idx = s->dashboard.event_count - show_count + i;
+            DrawText(s->dashboard.events[idx], bx, by, tf->body, tc->text_secondary);
+            by += tf->body + ts->gap_y;
+        }
+    }
+
+    /* Draw observation window if enabled */
+    if (vs->show_observation_window) {
+        renderer_draw_observation_overlay(&snap, arena_ox, arena_oy, tile_size);
+    }
 }
 
 static void draw_graphs_view(VizSession* vs, int screen_w, int screen_h) {
@@ -235,10 +425,16 @@ int main(int argc, char** argv) {
     uint64_t seed = 1337;
     int max_epochs = 500;
     const char* replay_file = NULL;
+    const char* enemy_name = NULL;
+    int arena_agent_count = 2;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--agent") == 0 && i + 1 < argc) {
             if (agent_count < 8) agent_names[agent_count++] = argv[++i];
+        } else if (strcmp(argv[i], "--enemy") == 0 && i + 1 < argc) {
+            enemy_name = argv[++i];
+        } else if (strcmp(argv[i], "--agents") == 0 && i + 1 < argc) {
+            arena_agent_count = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             seed = (uint64_t)strtoull(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--epochs") == 0 && i + 1 < argc) {
@@ -249,6 +445,8 @@ int main(int argc, char** argv) {
             printf("Usage: bomber_viz [options]\n");
             printf("Options:\n");
             printf("  --agent <type>   Agent type (repeat for multiple): random, scripted, heuristic, greedy\n");
+            printf("  --enemy <type>   Shared opponent policy; omit for built-in-random\n");
+            printf("  --agents <n>     Arena agent count, 1-%d (default 2)\n", MAX_AGENTS);
             printf("  --seed <n>       Random seed (default 1337)\n");
             printf("  --epochs <n>     Max epochs to run (default 500)\n");
             printf("  --replay <file>  Load replay file instead of live mode\n");
@@ -259,7 +457,9 @@ int main(int argc, char** argv) {
             printf("  [S]       Step once (when paused)\n");
             printf("  [+/-]     Speed up/down\n");
             printf("  [TAB]     Switch active agent\n");
-            printf("  [1/2/3]   Switch view: Arena / Graphs / Comparison\n");
+            printf("  [1/2/3/4] Switch view: Arena / Compare / Graphs / Debug\n");
+            printf("  [D/O/G/L] Toggle danger / observation / grid / legend\n");
+            printf("  [P]       Save screenshots/ai-bomber-arena.png\n");
             printf("  [N]       New epoch for active agent\n");
             printf("  [ESC]     Quit\n");
             return 0;
@@ -275,10 +475,14 @@ int main(int argc, char** argv) {
     InitWindow(SCREEN_W, SCREEN_H, "AI Bomber - Visualizer");
     SetTargetFPS(60);
     renderer_init(SCREEN_W, SCREEN_H);
+    theme_init();
+    layout_init(SCREEN_W, SCREEN_H);
 
     BomberConfig cfg;
     config_survival(&cfg);
     cfg.seed = (int)seed;
+    cfg.agent_count = arena_agent_count;
+    config_normalize(&cfg);
 
     VizSession vs;
     viz_session_init(&vs, max_epochs, seed);
@@ -287,7 +491,8 @@ int main(int argc, char** argv) {
         Replay* replay = (Replay*)calloc(1, sizeof(Replay));
         if (replay_load(replay, replay_file)) {
             cfg = replay->config;
-            viz_session_add_agent(&vs, AGENT_RANDOM, "replay", &cfg);
+            viz_session_add_agent(&vs, AGENT_RANDOM, "replay", AGENT_RANDOM,
+                                  "built-in-random", 0, &cfg);
             AgentSession* s = &vs.sessions[0];
             for (int i = 0; i < replay->action_count; i++) {
                 env_step(&s->env, replay->actions[i]);
@@ -299,7 +504,10 @@ int main(int argc, char** argv) {
     } else {
         for (int i = 0; i < agent_count; i++) {
             AgentType type = agent_parse_type(agent_names[i]);
-            viz_session_add_agent(&vs, type, agent_names[i], &cfg);
+            AgentType opponent_type = enemy_name ? agent_parse_type(enemy_name) : AGENT_RANDOM;
+            viz_session_add_agent(&vs, type, agent_names[i], opponent_type,
+                                  enemy_name ? enemy_name : "built-in-random",
+                                  enemy_name != NULL, &cfg);
         }
     }
 
@@ -315,8 +523,19 @@ int main(int argc, char** argv) {
             vs.active_session = (vs.active_session + 1) % vs.session_count;
         }
         if (IsKeyPressed(KEY_ONE)) vs.view_mode = VIEW_ARENA;
-        if (IsKeyPressed(KEY_TWO)) vs.view_mode = VIEW_GRAPHS;
-        if (IsKeyPressed(KEY_THREE)) vs.view_mode = VIEW_COMPARISON;
+        if (IsKeyPressed(KEY_TWO)) vs.view_mode = VIEW_COMPARE;
+        if (IsKeyPressed(KEY_THREE)) vs.view_mode = VIEW_GRAPHS;
+        if (IsKeyPressed(KEY_FOUR)) vs.view_mode = VIEW_DEBUG;
+        if (IsKeyPressed(KEY_L)) vs.show_legend = !vs.show_legend;
+        if (IsKeyPressed(KEY_O)) vs.show_observation_window = !vs.show_observation_window;
+        if (IsKeyPressed(KEY_D)) vs.show_danger = !vs.show_danger;
+        if (IsKeyPressed(KEY_G)) vs.show_grid = !vs.show_grid;
+        static int screenshot_toast_frames = 0;
+        if (IsKeyPressed(KEY_P)) {
+            ensure_screenshot_dir();
+            TakeScreenshot("screenshots/ai-bomber-arena.png");
+            screenshot_toast_frames = 150;
+        }
         if (IsKeyPressed(KEY_N)) {
             AgentSession* s = viz_session_active(&vs);
             if (s && s->epoch_count < vs.max_epochs) {
@@ -335,17 +554,19 @@ int main(int argc, char** argv) {
         BeginDrawing();
         ClearBackground((Color){15, 15, 20, 255});
 
-        DrawText("AI Bomber - Training Sandbox", 8, 2, 16, (Color){200, 200, 220, 255});
-
-        draw_agent_tabs(&vs, 8, 22, SCREEN_W - 16);
-
-        const char* view_names[] = {"Arena", "Graphs", "Comparison"};
-        DrawText(view_names[vs.view_mode], SCREEN_W - 100, 4, 12, (Color){150, 150, 170, 255});
+        if (vs.view_mode != VIEW_ARENA) draw_agent_tabs(&vs, 8, 4, SCREEN_W - 16);
 
         switch (vs.view_mode) {
             case VIEW_ARENA:       draw_arena_view(&vs, SCREEN_W, SCREEN_H); break;
+            case VIEW_COMPARE:     draw_comparison_view(&vs, SCREEN_W, SCREEN_H); break;
             case VIEW_GRAPHS:      draw_graphs_view(&vs, SCREEN_W, SCREEN_H); break;
-            case VIEW_COMPARISON:  draw_comparison_view(&vs, SCREEN_W, SCREEN_H); break;
+            case VIEW_DEBUG:       draw_graphs_view(&vs, SCREEN_W, SCREEN_H); break;
+        }
+
+        if (screenshot_toast_frames > 0) {
+            DrawRectangle(SCREEN_W - 180, SCREEN_H - 48, 160, 30, (Color){18, 28, 38, 235});
+            DrawText("Screenshot saved", SCREEN_W - 165, SCREEN_H - 40, 14, (Color){115, 225, 160, 255});
+            screenshot_toast_frames--;
         }
 
         EndDrawing();

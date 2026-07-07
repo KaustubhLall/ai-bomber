@@ -41,6 +41,7 @@ void agent_init(Agent* agent, AgentType type);
 Action agent_act(Agent* agent, const Observation* obs, const DebugSnapshot* debug);
 void agent_reset(Agent* agent, uint64_t seed);
 AgentType agent_parse_type(const char* name);
+const char* agent_type_name(AgentType type);
 void* agent_impl_storage(Agent* agent, size_t required_size);
 
 #endif /* BOMBER_AGENT_H */
