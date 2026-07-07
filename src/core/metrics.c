@@ -1,6 +1,7 @@
 #include "core/metrics.h"
 #include <stdio.h>
 #include <string.h>
+#include "env/bomber_state.h"
 
 void metrics_init(Metrics* m) {
     memset(m, 0, sizeof(Metrics));
@@ -21,13 +22,25 @@ void metrics_update(Metrics* m, Action action, StepResult result,
     if (result.done) {
         m->episodes++;
         switch (result.terminal_reason) {
-            case TERMINAL_WIN:           m->wins++; m->enemies_killed++; break;
+            case TERMINAL_WIN:           m->wins++; break;
             case TERMINAL_LOSS:          m->losses++; break;
             case TERMINAL_DRAW:          m->draws++; break;
             case TERMINAL_TIMEOUT:       m->timeouts++; break;
-            case TERMINAL_AGENT_DEAD:    m->deaths++; m->self_kills++; break;
+            case TERMINAL_AGENT_DEAD:    m->deaths++; break;
             default: break;
         }
+    }
+}
+
+void metrics_record_elimination_causes(Metrics* m, const BomberState* state) {
+    if (!m || !state) return;
+    if (!state->agents[0].alive) {
+        if (state->death_owner[0] == 0) m->self_kills++;
+        else if (state->death_owner[0] > 0) m->opponent_kills++;
+    }
+    for (int a = 1; a < state->agent_count; a++) if (!state->agents[a].alive) {
+        if (state->death_owner[a] == 0) m->enemies_killed++;
+        else if (state->death_owner[a] == a) m->opponent_self_kills++;
     }
 }
 
@@ -44,6 +57,10 @@ void metrics_print(const Metrics* m) {
     printf("Deaths:            %d\n", m->deaths);
     printf("Crates destroyed:  %d\n", m->crates_destroyed);
     printf("Powerups collected:%d\n", m->powerups_collected);
+    printf("Owned eliminations: %d\n", m->enemies_killed);
+    printf("Own self-kills:     %d\n", m->self_kills);
+    printf("Opponent self-kills:%d\n", m->opponent_self_kills);
+    printf("Opponent kills:     %d\n", m->opponent_kills);
 
     const char* action_names[] = {"UP", "DOWN", "LEFT", "RIGHT", "BOMB", "WAIT"};
     printf("Action distribution:\n");

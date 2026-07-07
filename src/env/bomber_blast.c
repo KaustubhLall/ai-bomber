@@ -48,20 +48,21 @@ int explode_bomb(BomberState* state, int bomb_index, RNG* rng, float powerup_rat
 
     destroy_crates(state, &blast, rng, powerup_rate);
 
-    apply_blast_damage(state, &blast);
+    apply_blast_damage(state, &blast, owner);
 
     trigger_chain_reactions(state, &blast, rng, powerup_rate);
 
     return 1;
 }
 
-void apply_blast_damage(BomberState* state, const BlastResult* blast) {
+void apply_blast_damage(BomberState* state, const BlastResult* blast, int owner_id) {
     for (int i = 0; i < blast->count; i++) {
         int bx = blast->tiles[i].x;
         int by = blast->tiles[i].y;
         for (int a = 0; a < state->agent_count; a++) {
             if (state->agents[a].alive && state->agents[a].x == bx && state->agents[a].y == by) {
                 state->agents[a].alive = 0;
+                state->death_owner[a] = owner_id;
             }
         }
     }

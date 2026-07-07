@@ -62,16 +62,18 @@ int rules_pickup_powerup(BomberState* state, int agent_id) {
 TerminalReason rules_check_terminal(const BomberState* state, int agent_id, int max_steps) {
     if (state->step >= max_steps) return TERMINAL_TIMEOUT;
 
-    if (!state->agents[agent_id].alive) return TERMINAL_AGENT_DEAD;
-
     /* Check for win/loss in multi-agent */
     if (state->agent_count > 1) {
         int alive_enemies = 0;
         for (int a = 0; a < state->agent_count; a++) {
             if (a != agent_id && state->agents[a].alive) alive_enemies++;
         }
+        if (!state->agents[agent_id].alive && alive_enemies == 0) return TERMINAL_DRAW;
+        if (!state->agents[agent_id].alive) return TERMINAL_AGENT_DEAD;
         if (alive_enemies == 0) return TERMINAL_WIN;
     }
+
+    if (!state->agents[agent_id].alive) return TERMINAL_AGENT_DEAD;
 
     return TERMINAL_NONE;
 }

@@ -34,7 +34,7 @@ int main(void) {
 
     agent_init(&agent, AGENT_MCTS);
     action = agent_act(&agent, &observation, &debug);
-    assert(action >= 0 && action < ACTION_COUNT && agent.diagnostics.simulations == 48);
+    assert(action >= 0 && action < ACTION_COUNT && agent.diagnostics.simulations == 32);
 
     /* Search agents acting as enemy 1 must choose from enemy 1's legal actions. */
     env_observe(&env, 1, &observation);

@@ -10,6 +10,7 @@ build_polish/
 build-codex*/
 results/
 results-smoke.json
+history/
 screenshots/
 ai-bomber-arena.png
 pr1.diff

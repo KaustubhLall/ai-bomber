@@ -69,5 +69,10 @@ void config_battle(BomberConfig* cfg) {
     config_defaults(cfg);
     cfg->mode = MODE_BATTLE;
     cfg->agent_count = 2;
+    cfg->max_steps = 200;
+    /* Battle rewards must not make surviving to the time limit profitable. */
+    cfg->survival_reward = 0.0f;
+    cfg->timeout_penalty = -1.0f;
+    cfg->stall_penalty = -0.03f;
     config_normalize(cfg);
 }

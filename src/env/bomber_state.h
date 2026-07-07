@@ -33,13 +33,14 @@ typedef struct {
     int active;
 } BombState;
 
-typedef struct {
+typedef struct BomberState {
     int width;
     int height;
     TileType tiles[MAX_HEIGHT][MAX_WIDTH];
     BomberAgentState agents[MAX_AGENTS];
     BombState bombs[MAX_BOMBS];
     int agent_count;
+    int death_owner[MAX_AGENTS]; /* bomb owner that eliminated each agent, -1 if alive/unknown */
     int step;
     float total_reward;
 } BomberState;

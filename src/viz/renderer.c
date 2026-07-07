@@ -839,7 +839,7 @@ void renderer_draw_view_controls(const VizSession* vs, int ox, int oy, int w, in
 
     y += 4;
     char buf[128];
-    snprintf(buf, sizeof(buf), "Speed: %dx | %s", vs->speed_mult,
+    snprintf(buf, sizeof(buf), "Game: %d step/s | %s", vs->simulation_hz,
              vs->paused ? "PAUSED" : "RUNNING");
     DrawText(buf, ox + 8, y, 11, vs->paused ? YELLOW : GREEN); y += 14;
 

@@ -27,6 +27,9 @@ typedef struct BomberEnv {
     int steps_since_progress;
     struct Agent* opponent; /* Optional opponent policy; NULL = built-in AI */
     uint32_t opponent_wiring_magic;
+    Action last_joint_actions[MAX_AGENTS];
+    int last_joint_action_count;
+    RNG last_rng_before_joint;
 } BomberEnv;
 
 void env_init(BomberEnv* env, const BomberConfig* config);

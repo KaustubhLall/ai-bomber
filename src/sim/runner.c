@@ -33,9 +33,10 @@ void runner_run_single(BomberEnv* env, Agent* agent, uint64_t seed,
         if (env->last_reward.powerup > 0) powerups = 1;
 
         metrics_update(metrics, action, result, crates_destroyed, powerups);
+        if (result.done) metrics_record_elimination_causes(metrics, &env->state);
 
         if (record && replay) {
-            replay_record(replay, action, &env->state, result.reward, result.terminal_reason);
+            replay_record_env(replay, env, result);
         }
 
         if (result.done) break;

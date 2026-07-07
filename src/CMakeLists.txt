@@ -6,6 +6,8 @@ add_library(bomber_core STATIC
     core/ring_buffer.c
     core/replay.c
     core/metrics.c
+    core/playback_clock.c
+    core/match_history.c
     env/bomber_env.c
     env/bomber_rules.c
     env/bomber_map.c

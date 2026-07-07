@@ -22,7 +22,7 @@ int main(void) {
     for (int i = 0; i < 10; i++) {
         Action a = (i % 3 == 0) ? ACTION_RIGHT : (i % 3 == 1) ? ACTION_DOWN : ACTION_WAIT;
         StepResult r = env_step(&env, a);
-        replay_record(replay, a, &env.state, r.reward, r.terminal_reason);
+        replay_record_env(replay, &env, r);
         if (r.done) break;
     }
 
@@ -49,10 +49,13 @@ int main(void) {
 
     /* Playback should produce same final state */
     BomberEnv pb_env;
-    replay_playback(loaded, &pb_env);
+    assert(replay_playback(loaded, &pb_env));
 
     /* The playback should have gone through same steps */
     assert(pb_env.state.step == env.state.step || pb_env.state.step == 10);
+    uint64_t final_hash = 0;
+    assert(replay_validate(loaded, &final_hash));
+    assert(final_hash == loaded->frames[loaded->frame_count - 1].state_hash);
 
     free(replay);
     free(loaded);

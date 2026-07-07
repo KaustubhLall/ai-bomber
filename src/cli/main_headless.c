@@ -113,6 +113,10 @@ int main(int argc, char** argv) {
             fprintf(f, "  \"deaths\": %d,\n", metrics.deaths);
             fprintf(f, "  \"crates_destroyed\": %d,\n", metrics.crates_destroyed);
             fprintf(f, "  \"powerups_collected\": %d,\n", metrics.powerups_collected);
+            fprintf(f, "  \"owned_eliminations\": %d,\n", metrics.enemies_killed);
+            fprintf(f, "  \"self_kills\": %d,\n", metrics.self_kills);
+            fprintf(f, "  \"opponent_self_kills\": %d,\n", metrics.opponent_self_kills);
+            fprintf(f, "  \"opponent_kills\": %d,\n", metrics.opponent_kills);
             fprintf(f, "  \"steps_per_sec\": %.1f\n",
                     metrics.total_time_ms > 0 ? (double)metrics.total_steps / (metrics.total_time_ms / 1000.0) : 0.0);
             fprintf(f, "}\n");

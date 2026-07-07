@@ -112,8 +112,8 @@ These framework-free reference pipelines provide reproducible policy/value, repl
 ```
 
 Windows users can run the preset launchers in `shortcuts/`, or execute
-`shortcuts/install-desktop-shortcuts.ps1` once to create MCTS, alpha-beta, and
-policy-comparison shortcuts on the Desktop.
+`shortcuts/install-desktop-shortcuts.ps1` once to create MCTS, alpha-beta,
+policy-comparison, live-policy-arena, and match-history shortcuts on the Desktop.
 
 Visualizer matchup configuration mirrors the headless runner: `--agent` selects
 agent 0, `--enemy` selects the opponent policy, `--agents` sets the total arena
@@ -127,18 +127,21 @@ shown explicitly as `Opponent Policy: built-in-random`.
 - **Compare View (2)**: side-by-side mini arenas for all configured agents with a shared training overview panel
 - **Graphs View (3)**: per-epoch reward, running average reward, action distribution, and training overview table for all agents
 - **Debug View (4)**: detailed technical view with raw local observation, danger map, and event log
+- **Match History (5)**: persistent recorded matches with seed, policies, outcome, causal eliminations, state hash, and frame-by-frame replay
 
 ### Visualizer controls
 
 - **SPACE**: pause or resume
 - **R**: reset all sessions
-- **F2/F3** or the visible **Sim - / Sim +** buttons: adjust simulation steps per rendered frame
-- **F5/F6** or the visible **FPS - / FPS +** buttons: change render FPS presets
-- **F7** or **Set FPS**: type an exact render FPS from 5 to 1000
+- **F2/F3**, **+/-**, or the visible **Game - / Game +** buttons: choose 1/2/3/5/10/30 simulation steps per second
+- **F5/F6** or **Render - / Render +**: change only the window refresh rate
+- **F7** or **Set Game**: type an exact simulation rate from 1 to 60 steps per second
+- **M**: choose two policies, seed, open/standard/dense map, and 1-20 matches, then launch recorded live play
+- **5**: open match history; use PageUp/PageDown for matches and Left/Right for frames
 - **H**: open the in-app controls and powerup guide
 - **S**: step once while paused
 - **TAB**: switch active agent
-- **1/2/3/4**: switch view (Arena/Compare/Graphs/Debug)
+- **1/2/3/4/5**: switch view (Arena/Compare/Graphs/Debug/History)
 - **N**: start a new epoch for the active agent
 - **L**: toggle legend
 - **O**: toggle observation window overlay
@@ -155,7 +158,7 @@ shown explicitly as `Opponent Policy: built-in-random`.
 
 With the default configuration, a destroyed crate has a 30% chance to reveal one of the three powerups.
 
-The default visualizer now runs only MCTS against the heuristic opponent for one match and then pauses. Use the Policy Comparison shortcut for five simultaneous policy sessions, `--epochs N` for repeated matches, or `--enemy builtin-random` for the old non-adversarial fallback.
+The default visualizer now runs only MCTS against the heuristic opponent for one match and then pauses. Use the Live Policy Arena shortcut to choose any two built-in policies, the Match History shortcut to inspect recorded games, the Policy Comparison shortcut for five simultaneous policy sessions, `--epochs N` for repeated matches, or `--enemy builtin-random` for the old non-adversarial fallback. Battle matches terminate after 200 steps instead of running indefinitely.
 
 ### Screenshots
 

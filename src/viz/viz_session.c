@@ -2,6 +2,7 @@
 #include "env/bomber_map.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 void viz_session_init(VizSession* vs, int max_epochs, uint64_t base_seed) {
     memset(vs, 0, sizeof(VizSession));
@@ -9,7 +10,7 @@ void viz_session_init(VizSession* vs, int max_epochs, uint64_t base_seed) {
     vs->base_seed = base_seed;
     vs->active_session = 0;
     vs->paused = 0;
-    vs->speed_mult = 1;
+    vs->simulation_hz = 1;
     vs->target_fps = 60;
     vs->show_help = 1;
     vs->step_once = 0;
@@ -21,6 +22,12 @@ void viz_session_init(VizSession* vs, int max_epochs, uint64_t base_seed) {
     vs->show_legend = 1;
     vs->show_observation_window = 0;
     vs->show_grid = 0;
+    vs->matchup_blue = AGENT_MCTS;
+    vs->matchup_red = AGENT_HEURISTIC;
+    vs->matchup_seed = base_seed;
+    vs->matchup_map_preset = 1;
+    vs->matchup_matches = 1;
+    (void)match_history_init(&vs->history, "history");
 }
 
 int viz_session_add_agent(VizSession* vs, AgentType type, const char* name,
@@ -52,6 +59,11 @@ int viz_session_add_agent(VizSession* vs, AgentType type, const char* name,
     dashboard_init(&s->dashboard);
     s->epoch_count = 0;
     s->episode_done = 0;
+    s->replay = (Replay*)calloc(1, sizeof(Replay));
+    if (s->replay) {
+        replay_init(s->replay, &s->config, vs->base_seed);
+        replay_set_policies(s->replay, s->name, s->opponent_name);
+    }
 
     vs->session_count++;
     return idx;
@@ -69,6 +81,13 @@ void viz_session_reset_epoch(VizSession* vs, int session_idx) {
     s->current_reward = 0.0f;
     s->current_step = 0;
     s->episode_done = 0;
+    s->epoch_recorded = 0;
+    s->history_recorded = 0;
+    s->outcome = TERMINAL_NONE;
+    if (s->replay) {
+        replay_init(s->replay, &s->config, ep_seed);
+        replay_set_policies(s->replay, s->name, s->opponent_name);
+    }
 }
 
 void viz_session_reset_all(VizSession* vs) {
@@ -131,7 +150,7 @@ void viz_session_step(VizSession* vs) {
         AgentSession* s = &vs->sessions[i];
         if (s->episode_done) {
             if (vs->auto_advance_epoch && s->epoch_count < vs->max_epochs) {
-                record_epoch(vs, i);
+                if (!s->epoch_recorded) { record_epoch(vs, i); s->epoch_recorded = 1; }
                 if (s->epoch_count < vs->max_epochs) viz_session_reset_epoch(vs, i);
             }
             continue;
@@ -140,7 +159,7 @@ void viz_session_step(VizSession* vs) {
         Observation obs;
         DebugSnapshot snap;
 
-        for (int sp = 0; sp < vs->speed_mult; sp++) {
+        for (int sp = 0; sp < 1; sp++) {
             if (s->episode_done) break;
 
             DebugSnapshot before;
@@ -156,6 +175,7 @@ void viz_session_step(VizSession* vs) {
             dashboard_add_reward(&s->dashboard, result.reward);
             s->current_reward += result.reward;
             s->current_step++;
+            if (s->replay) replay_record_env(s->replay, &s->env, result);
 
             char event[MAX_EVENT_LEN];
             const char* action_names[] = {"UP", "DOWN", "LEFT", "RIGHT", "BOMB", "WAIT"};
@@ -207,6 +227,24 @@ void viz_session_step(VizSession* vs) {
 
             if (result.done) {
                 s->episode_done = 1;
+                s->outcome = result.terminal_reason;
+                if (!s->epoch_recorded && s->epoch_count < vs->max_epochs) {
+                    record_epoch(vs, i);
+                    s->epoch_recorded = 1;
+                }
+                if (!s->history_recorded && s->replay) {
+                    int owned = 0, self_kills = 0, opponent_self = 0, opponent_kills = 0;
+                    if (!s->env.state.agents[0].alive) {
+                        if (s->env.state.death_owner[0] == 0) self_kills++;
+                        else if (s->env.state.death_owner[0] > 0) opponent_kills++;
+                    }
+                    for (int a = 1; a < s->env.state.agent_count; a++) if (!s->env.state.agents[a].alive) {
+                        if (s->env.state.death_owner[a] == 0) owned++;
+                        else if (s->env.state.death_owner[a] == a) opponent_self++;
+                    }
+                    s->history_recorded = match_history_add(&vs->history, s->replay, result.terminal_reason,
+                                                            owned, self_kills, opponent_self, opponent_kills);
+                }
                 break;
             }
         }
@@ -215,4 +253,54 @@ void viz_session_step(VizSession* vs) {
     for (int i = 0; i < vs->session_count; i++)
         if (!vs->sessions[i].episode_done || vs->sessions[i].epoch_count < vs->max_epochs) all_complete = 0;
     if (all_complete) vs->paused = 1;
+}
+
+int viz_session_start_match(VizSession* vs, AgentType blue, AgentType red, uint64_t seed) {
+    if (!vs) return 0;
+    for (int i = 0; i < vs->session_count; i++) { free(vs->sessions[i].replay); vs->sessions[i].replay = NULL; }
+    memset(vs->sessions, 0, sizeof(vs->sessions));
+    vs->session_count = 0;
+    vs->active_session = 0;
+    vs->base_seed = seed;
+    vs->max_epochs = vs->matchup_matches;
+    vs->paused = 0;
+    vs->matchup_blue = blue;
+    vs->matchup_red = red;
+    vs->matchup_seed = seed;
+    BomberConfig config; config_battle(&config); config.agent_count = 2; config.seed = (int)seed;
+    static const int densities[] = {30, 50, 70};
+    int preset = vs->matchup_map_preset;
+    if (preset < 0) preset = 0;
+    if (preset > 2) preset = 2;
+    config.crate_density = densities[preset];
+    return viz_session_add_agent(vs, blue, agent_type_name(blue), red, agent_type_name(red), 1, &config) >= 0;
+}
+
+int viz_session_load_history(VizSession* vs, int index) {
+    if (!vs || index < 0 || index >= vs->history.count) return 0;
+    if (!vs->history_replay) vs->history_replay = (Replay*)calloc(1, sizeof(Replay));
+    if (!vs->history_replay || !match_history_load_replay(&vs->history, index, vs->history_replay)) return 0;
+    vs->history.selected = index;
+    vs->history_frame = 0;
+    vs->history_playing = 0;
+    vs->view_mode = VIEW_HISTORY;
+    vs->paused = 1;
+    return 1;
+}
+
+void viz_session_history_step(VizSession* vs, int delta) {
+    if (!vs || !vs->history_replay || vs->history_replay->frame_count <= 0) return;
+    vs->history_frame += delta;
+    if (vs->history_frame < 0) vs->history_frame = 0;
+    if (vs->history_frame >= vs->history_replay->frame_count) {
+        vs->history_frame = vs->history_replay->frame_count - 1;
+        vs->history_playing = 0;
+    }
+}
+
+void viz_session_shutdown(VizSession* vs) {
+    if (!vs) return;
+    for (int i = 0; i < vs->session_count; i++) free(vs->sessions[i].replay);
+    free(vs->history_replay);
+    vs->history_replay = NULL;
 }

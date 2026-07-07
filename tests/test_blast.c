@@ -1,6 +1,7 @@
 #include "env/env.h"
 #include "env/bomber_map.h"
 #include "env/bomber_blast.h"
+#include "core/metrics.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -83,6 +84,11 @@ int main(void) {
 
     explode_bomb(&env.state, 0, &env.rng, cfg.powerup_rate);
     assert(env.state.agents[0].alive == 0);
+    assert(env.state.death_owner[0] == 0);
+    Metrics metrics;
+    metrics_init(&metrics);
+    metrics_record_elimination_causes(&metrics, &env.state);
+    assert(metrics.self_kills == 1 && metrics.opponent_kills == 0);
 
     printf("test_blast: ALL PASSED\n");
     return 0;

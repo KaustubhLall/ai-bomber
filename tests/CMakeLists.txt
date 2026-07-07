@@ -1,9 +1,11 @@
 if(MSVC)
-    add_compile_options(/wd4189)
+    # C tests use assert() as their executable contract. Release normally defines
+    # NDEBUG, which silently removed both checks and setup calls inside assert.
+    add_compile_options(/wd4189 /UNDEBUG)
 endif()
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    add_compile_options(-Wno-unused-variable -Wno-unused-but-set-variable)
+    add_compile_options(-Wno-unused-variable -Wno-unused-but-set-variable -UNDEBUG)
 endif()
 
 add_executable(test_rng test_rng.c)
@@ -68,3 +70,10 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME test_learning COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_learning.py)
   set_tests_properties(test_learning PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
+
+add_executable(test_playback_clock test_playback_clock.c)
+target_link_libraries(test_playback_clock PRIVATE bomber_core)
+add_test(NAME test_playback_clock COMMAND test_playback_clock)
+add_executable(test_match_history test_match_history.c)
+target_link_libraries(test_match_history PRIVATE bomber_core)
+add_test(NAME test_match_history COMMAND test_match_history)

@@ -7,7 +7,7 @@
 #define MAX_HEIGHT 31
 #define MAX_AGENTS 8
 #define MAX_BOMBS 64
-#define MAX_REPLAY_STEPS 20000
+#define MAX_REPLAY_STEPS 2000
 #define LOCAL_OBS_SIZE 11
 #define MAX_BLAST_TILES 128
 

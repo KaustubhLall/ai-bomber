@@ -32,8 +32,15 @@ float reward_compute(RewardBreakdown* rb, BomberEnv* env, Action action,
         if (a != agent_id && state->agents[a].alive) cur_enemies_alive++;
     }
     int enemies_killed = prev_enemies_alive - cur_enemies_alive;
+    int owned_eliminations = 0;
     if (enemies_killed > 0) {
-        rb->enemy_elimination = cfg->enemy_elimination_reward * (float)enemies_killed;
+        for (int a = 0; a < state->agent_count; a++) {
+            if (a != agent_id && !state->agents[a].alive && state->death_owner[a] == agent_id)
+                owned_eliminations++;
+        }
+    }
+    if (owned_eliminations > 0) {
+        rb->enemy_elimination = cfg->enemy_elimination_reward * (float)owned_eliminations;
     }
 
     if (!agent->alive) {

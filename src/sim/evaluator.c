@@ -8,22 +8,41 @@ float evaluator_score_state(const BomberEnv* env, int agent_id) {
     const BomberAgentState* me = &env->state.agents[agent_id];
     if (!me->alive) return -10000.0f;
     if (env->state.step >= env->config.max_steps) return -500.0f;
-    int enemies = 0, mobility = 0, nearby_crates = 0, nearest_enemy = 999, owned_bombs = 0;
+    int enemies = 0, mobility = 0, nearby_crates = 0, nearest_enemy = 999;
+    int owned_bombs = 0, threatened_enemies = 0, threatened_crates = 0, owned_eliminations = 0;
     for (int a = 0; a < env->state.agent_count; a++) if (a != agent_id && env->state.agents[a].alive) {
         int dx = env->state.agents[a].x - me->x; if (dx < 0) dx = -dx;
         int dy = env->state.agents[a].y - me->y; if (dy < 0) dy = -dy;
         int distance = dx + dy; if (distance < nearest_enemy) nearest_enemy = distance;
         enemies++;
     }
-    for (int b = 0; b < MAX_BOMBS; b++) if (env->state.bombs[b].active && env->state.bombs[b].owner_id == agent_id) owned_bombs++;
-    if (env->state.agent_count > 1 && enemies == 0) return 10000.0f;
+    for (int a = 0; a < env->state.agent_count; a++)
+        if (a != agent_id && !env->state.agents[a].alive && env->state.death_owner[a] == agent_id)
+            owned_eliminations++;
+    for (int b = 0; b < MAX_BOMBS; b++) if (env->state.bombs[b].active && env->state.bombs[b].owner_id == agent_id) {
+        const BombState* bomb = &env->state.bombs[b]; owned_bombs++;
+        static const int dx[] = {0, 0, -1, 1}; static const int dy[] = {-1, 1, 0, 0};
+        for (int d = 0; d < 4; d++) for (int r = 1; r <= bomb->range; r++) {
+            int x = bomb->x + dx[d] * r, y = bomb->y + dy[d] * r;
+            if (x < 0 || y < 0 || x >= env->state.width || y >= env->state.height ||
+                env->state.tiles[y][x] == TILE_SOLID_WALL) break;
+            for (int a = 0; a < env->state.agent_count; a++)
+                if (a != agent_id && env->state.agents[a].alive &&
+                    env->state.agents[a].x == x && env->state.agents[a].y == y)
+                    threatened_enemies++;
+            if (env->state.tiles[y][x] == TILE_CRATE) { threatened_crates++; break; }
+        }
+    }
+    if (env->state.agent_count > 1 && enemies == 0)
+        return owned_eliminations > 0 ? 10000.0f : 2500.0f;
     Action legal[ACTION_COUNT]; env_legal_actions(env, agent_id, legal, &mobility);
     for (int y = me->y - 2; y <= me->y + 2; y++) for (int x = me->x - 2; x <= me->x + 2; x++)
         if (x >= 0 && y >= 0 && x < env->state.width && y < env->state.height && env->state.tiles[y][x] == TILE_CRATE) nearby_crates++;
     int danger = env->danger.time_to_blast[me->y][me->x];
     float score = 100.0f - enemies * 60.0f + me->bomb_ammo + me->blast_range * 3.0f;
-    score += mobility * 3.0f + nearby_crates * 1.5f + owned_bombs * 12.0f;
-    if (nearest_enemy < 999) score -= nearest_enemy * 1.5f;
+    score += mobility * 3.0f + nearby_crates * 1.5f - owned_bombs * 1.0f;
+    score += threatened_enemies * 35.0f + threatened_crates * 4.0f;
+    if (nearest_enemy < 999) score -= nearest_enemy * 2.0f;
     score -= env->state.step * 0.10f;
     if (danger >= 0) score -= 20.0f / (float)(danger + 1);
     return score;

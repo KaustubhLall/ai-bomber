@@ -89,24 +89,26 @@ void env_legal_actions(const BomberEnv* env, int agent_id, Action* out, int* cou
     *count = n;
 }
 
-static int apply_action(BomberState* state, int agent_id, Action action, int bomb_timer) {
+static int movement_delta(Action action, int* dx, int* dy) {
+    *dx = 0; *dy = 0;
     switch (action) {
-        case ACTION_UP: case ACTION_DOWN: case ACTION_LEFT: case ACTION_RIGHT:
-            return rules_try_move(state, agent_id, action);
-        case ACTION_PLACE_BOMB:
-            return rules_try_place_bomb(state, agent_id, bomb_timer);
-        case ACTION_WAIT:
-            return 1;
-        default:
-            return 0;
+        case ACTION_UP: *dy = -1; return 1;
+        case ACTION_DOWN: *dy = 1; return 1;
+        case ACTION_LEFT: *dx = -1; return 1;
+        case ACTION_RIGHT: *dx = 1; return 1;
+        default: return 0;
     }
 }
 
 StepResult env_step_joint(BomberEnv* env, const Action* actions, int action_count) {
     StepResult result = {0.0f, 0, TERMINAL_NONE};
+    env->last_rng_before_joint = env->rng;
     BomberState* state = &env->state;
     BomberAgentState* agent = &state->agents[0];
     const BomberConfig* cfg = &env->config;
+    env->last_joint_action_count = state->agent_count;
+    for (int a = 0; a < state->agent_count; a++)
+        env->last_joint_actions[a] = actions && a < action_count ? actions[a] : ACTION_WAIT;
 
     int prev_crates = map_count_crates(state);
     int prev_enemies_alive = 0;
@@ -122,7 +124,42 @@ StepResult env_step_joint(BomberEnv* env, const Action* actions, int action_coun
     env->prev_agent_x = agent->x;
     env->prev_agent_y = agent->y;
 
-    action_valid = apply_action(state, 0, action, cfg->bomb_timer);
+    int desired_x[MAX_AGENTS], desired_y[MAX_AGENTS], moving[MAX_AGENTS], valid[MAX_AGENTS];
+    for (int a = 0; a < state->agent_count; a++) {
+        desired_x[a] = state->agents[a].x;
+        desired_y[a] = state->agents[a].y;
+        moving[a] = 0;
+        valid[a] = state->agents[a].alive ? 1 : 0;
+        Action current = actions && a < action_count ? actions[a] : ACTION_WAIT;
+        int dx, dy;
+        if (movement_delta(current, &dx, &dy)) {
+            moving[a] = 1;
+            desired_x[a] += dx;
+            desired_y[a] += dy;
+            if (!map_is_walkable(state, desired_x[a], desired_y[a])) valid[a] = 0;
+        } else if (current != ACTION_WAIT && current != ACTION_PLACE_BOMB) {
+            valid[a] = 0;
+        }
+    }
+    /* Agents are solid: reject contested destinations and moves into occupied tiles. */
+    for (int a = 0; a < state->agent_count; a++) if (moving[a] && valid[a]) {
+        for (int b = 0; b < state->agent_count; b++) if (a != b && state->agents[b].alive) {
+            if ((desired_x[a] == state->agents[b].x && desired_y[a] == state->agents[b].y) ||
+                (moving[b] && desired_x[a] == desired_x[b] && desired_y[a] == desired_y[b])) {
+                valid[a] = 0;
+                if (moving[b] && desired_x[a] == desired_x[b] && desired_y[a] == desired_y[b]) valid[b] = 0;
+            }
+        }
+    }
+    for (int a = 0; a < state->agent_count; a++) if (moving[a] && valid[a]) {
+        state->agents[a].x = desired_x[a];
+        state->agents[a].y = desired_y[a];
+    }
+    for (int a = 0; a < state->agent_count; a++) if (state->agents[a].alive) {
+        Action current = actions && a < action_count ? actions[a] : ACTION_WAIT;
+        if (current == ACTION_PLACE_BOMB && !rules_try_place_bomb(state, a, cfg->bomb_timer)) valid[a] = 0;
+    }
+    action_valid = valid[0];
 
     if (agent->x != env->prev_agent_x || agent->y != env->prev_agent_y) {
         env->steps_since_progress = 0;
@@ -132,12 +169,8 @@ StepResult env_step_joint(BomberEnv* env, const Action* actions, int action_coun
 
     int powerups_collected = rules_pickup_powerup(state, 0);
 
-    for (int a = 1; a < state->agent_count; a++) {
-        if (!state->agents[a].alive) continue;
-        Action enemy_action = actions && a < action_count ? actions[a] : ACTION_WAIT;
-        (void)apply_action(state, a, enemy_action, cfg->bomb_timer);
+    for (int a = 1; a < state->agent_count; a++) if (state->agents[a].alive)
         (void)rules_pickup_powerup(state, a);
-    }
 
     tick_bombs(state, &env->rng, cfg->powerup_rate);
 

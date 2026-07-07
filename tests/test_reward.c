@@ -39,6 +39,20 @@ int main(void) {
     (void)powerup_reward;
     assert(fabsf(env.last_reward.powerup - cfg.powerup_reward) < 0.001f);
 
+    /* An opponent self-elimination is a win, but not our elimination credit. */
+    env.state.agents[1].alive = 0;
+    env.state.death_owner[1] = 1;
+    (void)reward_compute(&env.last_reward, &env, ACTION_WAIT, 0,
+                         prev_crates, 0, prev_enemies, 0);
+    assert(env.last_reward.enemy_elimination == 0.0f);
+    assert(env.last_reward.win == cfg.win_reward);
+    env.state.death_owner[1] = 0;
+    (void)reward_compute(&env.last_reward, &env, ACTION_WAIT, 0,
+                         prev_crates, 0, prev_enemies, 0);
+    assert(env.last_reward.enemy_elimination == cfg.enemy_elimination_reward);
+    env.state.agents[1].alive = 1;
+    env.state.death_owner[1] = -1;
+
     env.state.agents[0].x = 1;
     env.state.agents[0].y = 1;
     float r2 = reward_compute(&env.last_reward, &env, ACTION_UP, 0,

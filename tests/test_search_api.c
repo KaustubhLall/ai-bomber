@@ -1,5 +1,6 @@
 #include "env/env.h"
 #include "core/config.h"
+#include "env/bomber_rules.h"
 #include <assert.h>
 #include <stdio.h>
 
@@ -27,6 +28,20 @@ int main(void) {
     assert(a.reward == b.reward && a.done == b.done);
     assert(env_state_hash(&source) == original);
     assert(env_state_hash(&clone) != original);
+
+    /* Simultaneous movement into one tile is rejected for both agents. */
+    env_reset(&clone, 99);
+    clone.state.agents[0].x = 3; clone.state.agents[0].y = 3;
+    clone.state.agents[1].x = 5; clone.state.agents[1].y = 3;
+    clone.state.tiles[3][3] = clone.state.tiles[3][4] = clone.state.tiles[3][5] = TILE_FLOOR;
+    Action collide[2] = {ACTION_RIGHT, ACTION_LEFT};
+    env_step_joint(&clone, collide, 2);
+    assert(clone.state.agents[0].x == 3 && clone.state.agents[1].x == 5);
+
+    /* Simultaneous mutual elimination is a draw, not a one-sided loss. */
+    clone.state.agents[0].alive = 0;
+    clone.state.agents[1].alive = 0;
+    assert(rules_check_terminal(&clone.state, 0, clone.config.max_steps) == TERMINAL_DRAW);
     puts("search API tests passed");
     return 0;
 }

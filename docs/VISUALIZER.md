@@ -22,12 +22,19 @@ The visualizer is built with raylib and provides a portfolio-quality dashboard f
 | R | Reset episode |
 | + / = | Increase speed |
 | - | Decrease speed |
-| F2 / F3 or Sim buttons | Decrease/increase simulation steps per frame |
-| F5 / F6 or FPS buttons | Decrease/increase render FPS preset |
-| F7 or Set FPS | Enter an exact FPS from 5 to 1000 |
+| F2 / F3, +/- or Game buttons | Choose simulation steps per second (1/2/3/5/10/30) |
+| F5 / F6 or Render buttons | Change only the window render FPS |
+| F7 or Set Game | Enter exact simulation steps per second (1-60) |
+| M | Open live policy-vs-policy arena picker |
+| 5 | Open persistent match history and replay |
 | H | Toggle help and powerup guide |
 | S | Single step (when paused) |
 | ESC | Quit |
+
+Simulation speed is a real-time game clock, independent of rendering. At 1 step/s
+the state advances once per wall-clock second whether the window renders at 15,
+60, or 240 FPS. Match history controls are PageUp/PageDown (match), Left/Right
+(frame), Home (restart), and Space (play/pause).
 
 ## Dashboard layout
 

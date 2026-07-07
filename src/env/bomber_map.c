@@ -1,20 +1,23 @@
 #include "env/bomber_map.h"
 #include "core/math_util.h"
 
-/* Classic Bomberman starts each player in a corner with the two inward
- * orthogonal tiles open, guaranteeing a small L-shaped escape pocket. */
-static int is_spawn_safe_tile(const BomberState* state, int x, int y) {
-    const int max_x = state->width - 2;
-    const int max_y = state->height - 2;
-    const int safe_tiles[12][2] = {
-        {1, 1},       {2, 1},       {1, 2},
-        {max_x, 1},   {max_x - 1, 1}, {max_x, 2},
-        {1, max_y},   {2, max_y},   {1, max_y - 1},
-        {max_x, max_y}, {max_x - 1, max_y}, {max_x, max_y - 1}
-    };
+static void spawn_position(const BomberState* state, int index, int* x, int* y) {
+    int max_x = state->width - 2, max_y = state->height - 2;
+    int mid_x = state->width / 2, mid_y = state->height / 2;
+    static const int slot_x[] = {0, 1, 0, 1, 2, 2, 0, 1};
+    static const int slot_y[] = {0, 0, 1, 1, 0, 1, 2, 2};
+    int xs[] = {1, max_x, mid_x}; int ys[] = {1, max_y, mid_y};
+    *x = xs[slot_x[index % MAX_AGENTS]]; *y = ys[slot_y[index % MAX_AGENTS]];
+}
 
-    for (int i = 0; i < 12; i++) {
-        if (x == safe_tiles[i][0] && y == safe_tiles[i][1]) return 1;
+/* Clear each configured spawn and its cardinal exits. Corner spawns retain the
+ * classic three-tile L; edge spawns for players 5-8 get equivalent exits. */
+static int is_spawn_safe_tile(const BomberState* state, const BomberConfig* cfg, int x, int y) {
+    int spawn_count = cfg->agent_count < 4 ? 4 : cfg->agent_count;
+    for (int i = 0; i < spawn_count && i < MAX_AGENTS; i++) {
+        int sx, sy; spawn_position(state, i, &sx, &sy);
+        int distance = (x > sx ? x - sx : sx - x) + (y > sy ? y - sy : sy - y);
+        if (distance <= 1 && state->tiles[y][x] != TILE_SOLID_WALL) return 1;
     }
     return 0;
 }
@@ -45,7 +48,7 @@ void map_generate(BomberState* state, const BomberConfig* cfg, RNG* rng) {
     for (int y = 1; y < state->height - 1; y++) {
         for (int x = 1; x < state->width - 1; x++) {
             if (state->tiles[y][x] != TILE_FLOOR) continue;
-            if (is_spawn_safe_tile(state, x, y)) continue;
+            if (is_spawn_safe_tile(state, cfg, x, y)) continue;
             if (rng_range(rng, 0, 100) < cfg->crate_density) {
                 state->tiles[y][x] = TILE_CRATE;
             }
@@ -54,17 +57,15 @@ void map_generate(BomberState* state, const BomberConfig* cfg, RNG* rng) {
 
     /* Initialize agents */
     state->agent_count = cfg->agent_count;
-    int spawn_x[4] = {1, state->width - 2, 1, state->width - 2};
-    int spawn_y[4] = {1, 1, state->height - 2, state->height - 2};
     for (int i = 0; i < cfg->agent_count && i < MAX_AGENTS; i++) {
-        state->agents[i].x = spawn_x[i % 4];
-        state->agents[i].y = spawn_y[i % 4];
+        spawn_position(state, i, &state->agents[i].x, &state->agents[i].y);
         state->agents[i].alive = 1;
         state->agents[i].bomb_ammo = 1;
         state->agents[i].bombs_active = 0;
         state->agents[i].blast_range = cfg->blast_range;
         state->agents[i].speed = 1;
         state->agents[i].score = 0;
+        state->death_owner[i] = -1;
     }
 
     /* Clear bombs */

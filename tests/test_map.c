@@ -59,6 +59,7 @@ int main(void) {
 
     /* The safe pockets remain clear even at maximum crate density. */
     cfg.crate_density = 100;
+    env.config = cfg;
     env_reset(&env, 100);
     for (int i = 0; i < 12; i++) {
         assert(env.state.tiles[safe_tiles[i][1]][safe_tiles[i][0]] == TILE_FLOOR);
@@ -70,6 +71,16 @@ int main(void) {
     assert(map_in_bounds(&env.state, 0, 0) == 1);
     assert(map_in_bounds(&env.state, -1, 0) == 0);
     assert(map_in_bounds(&env.state, cfg.width, 0) == 0);
+
+    /* All supported agents receive unique, crate-free spawn tiles. */
+    config_battle(&cfg); cfg.agent_count = MAX_AGENTS; cfg.crate_density = 100;
+    env.config = cfg; env_reset(&env, 100);
+    for (int a = 0; a < MAX_AGENTS; a++) {
+        assert(env.state.tiles[env.state.agents[a].y][env.state.agents[a].x] == TILE_FLOOR);
+        for (int b = a + 1; b < MAX_AGENTS; b++)
+            assert(env.state.agents[a].x != env.state.agents[b].x ||
+                   env.state.agents[a].y != env.state.agents[b].y);
+    }
 
     printf("test_map: ALL PASSED\n");
     return 0;

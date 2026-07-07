@@ -5,6 +5,8 @@
 #include "env/bomber_observation.h"
 #include "agents/agent.h"
 #include "viz/dashboard.h"
+#include "core/replay.h"
+#include "core/match_history.h"
 
 #define MAX_VIZ_AGENTS 8
 #define MAX_VIZ_EPOCHS 2000
@@ -13,7 +15,8 @@ typedef enum {
     VIEW_ARENA = 0,
     VIEW_COMPARE,
     VIEW_GRAPHS,
-    VIEW_DEBUG
+    VIEW_DEBUG,
+    VIEW_HISTORY
 } ViewMode;
 
 typedef struct {
@@ -46,6 +49,10 @@ typedef struct {
     float current_reward;
     int current_step;
     int episode_done;
+    int epoch_recorded;
+    TerminalReason outcome;
+    Replay* replay;
+    int history_recorded;
 
     /* Dashboard for this agent */
     DashboardState dashboard;
@@ -57,7 +64,7 @@ typedef struct {
     int active_session;
     int max_epochs;
     int paused;
-    int speed_mult;
+    int simulation_hz;
     int target_fps;
     int show_help;
     int step_once;
@@ -70,6 +77,16 @@ typedef struct {
     int show_legend;
     int show_observation_window;
     int show_grid;
+    MatchHistory history;
+    Replay* history_replay;
+    int history_frame;
+    int history_playing;
+    AgentType matchup_blue;
+    AgentType matchup_red;
+    uint64_t matchup_seed;
+    int matchup_map_preset; /* 0=open, 1=standard, 2=dense */
+    int matchup_matches;
+    int show_matchup;
 } VizSession;
 
 void viz_session_init(VizSession* vs, int max_epochs, uint64_t base_seed);
@@ -84,5 +101,9 @@ void viz_session_switch_view(VizSession* vs, ViewMode mode);
 
 /* Get the active session's current state for rendering */
 AgentSession* viz_session_active(VizSession* vs);
+int viz_session_start_match(VizSession* vs, AgentType blue, AgentType red, uint64_t seed);
+int viz_session_load_history(VizSession* vs, int index);
+void viz_session_history_step(VizSession* vs, int delta);
+void viz_session_shutdown(VizSession* vs);
 
 #endif /* VIZ_SESSION_H */
