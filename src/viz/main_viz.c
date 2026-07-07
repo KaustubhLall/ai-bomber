@@ -712,7 +712,7 @@ int main(int argc, char** argv) {
             printf("  --start-paused   Open paused for inspection\n");
             printf("  --replay <file>  Load replay file instead of live mode\n");
             printf("  --smoke-screenshot <png>  Render, capture, and exit (verification)\n");
-            printf("  --smoke-view <matchup|history>  Surface captured by smoke mode\n");
+            printf("  --smoke-view <matchup|history|arena|compare|graphs>  Surface captured by smoke mode\n");
             printf("  --smoke-blue/--smoke-red <policy>  Verification matchup\n");
             printf("  --matchup        Open the live policy arena picker\n");
             printf("  --history        Open the latest match replay/history\n");
@@ -755,7 +755,10 @@ int main(int argc, char** argv) {
     cfg.agent_count = arena_agent_count;
     config_normalize(&cfg);
 
-    VizSession vs;
+    /* Keep the multi-session dashboards and replay buffers off the Windows
+       thread stack; live MCTS adds its own search tree and recursive safety
+       proof on the same thread. */
+    static VizSession vs;
     viz_session_init(&vs, max_epochs, seed);
     vs.target_fps = target_fps;
     vs.simulation_hz = simulation_hz;
@@ -796,6 +799,14 @@ int main(int argc, char** argv) {
         } else if (strcmp(smoke_view, "history") == 0) {
             (void)viz_session_start_match(&vs, agent_parse_type(smoke_blue), agent_parse_type(smoke_red), seed);
             apply_simulation_hz(&vs, &(PlaybackClock){0}, 60);
+        } else if (strcmp(smoke_view, "arena") == 0 ||
+                   strcmp(smoke_view, "compare") == 0 ||
+                   strcmp(smoke_view, "graphs") == 0) {
+            vs.show_matchup = 0;
+            vs.view_mode = strcmp(smoke_view, "arena") == 0 ? VIEW_ARENA :
+                           strcmp(smoke_view, "compare") == 0 ? VIEW_COMPARE : VIEW_GRAPHS;
+            vs.paused = 0;
+            vs.simulation_hz = 60;
         } else {
             vs.show_matchup = 1;
             vs.paused = 1;
@@ -975,8 +986,14 @@ int main(int argc, char** argv) {
 
         EndDrawing();
         if (smoke_screenshot) {
-            int ready = strcmp(smoke_view, "history") != 0 ||
-                        (vs.view_mode == VIEW_HISTORY && vs.history_replay && vs.history_replay->frame_count > 0);
+            int live_view_smoke = strcmp(smoke_view, "arena") == 0 ||
+                                  strcmp(smoke_view, "compare") == 0 ||
+                                  strcmp(smoke_view, "graphs") == 0;
+            AgentSession* smoke_active = viz_session_active(&vs);
+            int ready = live_view_smoke
+                ? (smoke_active && smoke_active->current_step >= 3)
+                : (strcmp(smoke_view, "history") != 0 ||
+                   (vs.view_mode == VIEW_HISTORY && vs.history_replay && vs.history_replay->frame_count > 0));
             if (ready && ++smoke_ready_frames >= 3) {
                 TakeScreenshot(smoke_screenshot);
                 should_exit = 1;
