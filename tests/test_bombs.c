@@ -45,14 +45,14 @@ int main(void) {
 
     /* Set timer and tick */
     bomb->timer = 3;
-    tick_bombs(&env.state);
+    tick_bombs(&env.state, &env.rng, cfg.powerup_rate);
     assert(bomb->timer == 2);
     assert(bomb->active == 1);
 
-    tick_bombs(&env.state);
+    tick_bombs(&env.state, &env.rng, cfg.powerup_rate);
     assert(bomb->timer == 1);
 
-    tick_bombs(&env.state);
+    tick_bombs(&env.state, &env.rng, cfg.powerup_rate);
     /* At timer 0, bomb should explode */
     assert(bomb->active == 0);
 

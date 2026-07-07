@@ -2,6 +2,7 @@
 #include "env/bomber_map.h"
 #include "core/math_util.h"
 #include <string.h>
+#include <assert.h>
 
 void obs_compute(const BomberState* state, const DangerMap* dm, int agent_id,
                  int prev_action, Observation* obs) {
@@ -47,7 +48,7 @@ void obs_compute(const BomberState* state, const DangerMap* dm, int agent_id,
 
     /* Enemy info */
     obs->enemy_count = 0;
-    for (int a = 0; a < state->agent_count; a++) {
+    for (int a = 0; a < state->agent_count && obs->enemy_count < MAX_AGENTS; a++) {
         if (a == agent_id) continue;
         obs->enemy_x[obs->enemy_count] = state->agents[a].x;
         obs->enemy_y[obs->enemy_count] = state->agents[a].y;
@@ -87,8 +88,9 @@ void obs_compute(const BomberState* state, const DangerMap* dm, int agent_id,
     }
 
     /* Danger info */
-    obs->in_danger = (dm->time_to_blast[agent->y][agent->x] >= 0) ? 1 : 0;
+    obs->in_danger = dm->current_blast[agent->y][agent->x];
     obs->danger_timer = dm->time_to_blast[agent->y][agent->x];
+    obs->imminent_danger = (obs->danger_timer >= 0 && obs->danger_timer <= 2) ? 1 : 0;
 }
 
 void obs_to_flat(const Observation* obs, float* out, int* out_size) {
@@ -131,12 +133,14 @@ void obs_to_flat(const Observation* obs, float* out, int* out_size) {
     /* Safe actions (6) */
     for (int a = 0; a < ACTION_COUNT; a++) out[idx++] = (float)obs->safe_actions[a];
 
-    /* Danger info (2) */
+    /* Danger info (3) */
     out[idx++] = (float)obs->in_danger;
     out[idx++] = (float)obs->danger_timer;
+    out[idx++] = (float)obs->imminent_danger;
 
     /* Previous action (1) */
     out[idx++] = (float)obs->prev_action;
 
     *out_size = idx;
+    assert(idx <= OBS_FLAT_SIZE);
 }

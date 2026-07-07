@@ -9,6 +9,7 @@
 typedef struct {
     BomberConfig config;
     AgentType agent_type;
+    AgentType enemy_type;
     uint64_t seed;
     int episodes;
     int record_replay;

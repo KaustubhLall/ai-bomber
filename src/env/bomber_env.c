@@ -7,12 +7,9 @@
 #include "env/bomber_reward.h"
 #include "env/bomber_rules.h"
 #include "core/math_util.h"
+#include "agents/agent.h"
 #include <string.h>
 #include <stdio.h>
-
-static int is_powerup_tile(TileType tile) {
-    return tile == TILE_POWERUP_BOMB || tile == TILE_POWERUP_RANGE || tile == TILE_POWERUP_SPEED;
-}
 
 void env_init(BomberEnv* env, const BomberConfig* config) {
     memset(env, 0, sizeof(BomberEnv));
@@ -81,32 +78,56 @@ StepResult env_step(BomberEnv* env, Action action) {
         env->steps_since_progress++;
     }
 
-    int powerups_collected = is_powerup_tile(state->tiles[agent->y][agent->x]) ? 1 : 0;
-    rules_pickup_powerup(state, 0);
+    int powerups_collected = rules_pickup_powerup(state, 0);
 
     for (int a = 1; a < state->agent_count; a++) {
         if (!state->agents[a].alive) continue;
-        int dirs[4] = {ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT};
-        int shuffled[4];
-        for (int i = 0; i < 4; i++) shuffled[i] = dirs[i];
-        for (int i = 3; i > 0; i--) {
-            int j = rng_range(&env->rng, 0, i + 1);
-            int tmp = shuffled[i]; shuffled[i] = shuffled[j]; shuffled[j] = tmp;
-        }
-        int moved = 0;
-        for (int i = 0; i < 4; i++) {
-            if (rules_try_move(state, a, (Action)shuffled[i])) {
-                moved = 1;
-                break;
+
+        Action enemy_action;
+        if (env->opponent) {
+            Observation enemy_obs;
+            env_observe(env, a, &enemy_obs);
+            DebugSnapshot snap;
+            env_get_debug_snapshot(env, &snap);
+            enemy_action = agent_act(env->opponent, &enemy_obs, &snap);
+        } else {
+            int dirs[4] = {ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT};
+            int shuffled[4];
+            for (int i = 0; i < 4; i++) shuffled[i] = dirs[i];
+            for (int i = 3; i > 0; i--) {
+                int j = rng_range(&env->rng, 0, i + 1);
+                int tmp = shuffled[i]; shuffled[i] = shuffled[j]; shuffled[j] = tmp;
             }
+            int moved = 0;
+            for (int i = 0; i < 4; i++) {
+                if (rules_try_move(state, a, (Action)shuffled[i])) {
+                    moved = 1;
+                    break;
+                }
+            }
+            (void)rules_pickup_powerup(state, a);
+            if (moved && state->agents[a].bomb_ammo > 0 && rng_bool(&env->rng)) {
+                rules_try_place_bomb(state, a, cfg->bomb_timer);
+            }
+            continue;
         }
-        rules_pickup_powerup(state, a);
-        if (moved && state->agents[a].bomb_ammo > 0 && rng_bool(&env->rng)) {
-            rules_try_place_bomb(state, a, cfg->bomb_timer);
+
+        switch (enemy_action) {
+            case ACTION_UP: case ACTION_DOWN:
+            case ACTION_LEFT: case ACTION_RIGHT:
+                rules_try_move(state, a, enemy_action);
+                break;
+            case ACTION_PLACE_BOMB:
+                rules_try_place_bomb(state, a, cfg->bomb_timer);
+                break;
+            case ACTION_WAIT:
+            default:
+                break;
         }
+        (void)rules_pickup_powerup(state, a);
     }
 
-    tick_bombs(state);
+    tick_bombs(state, &env->rng, cfg->powerup_rate);
 
     danger_compute(&env->danger, state);
     danger_compute_escape(&env->danger, state, 0);
@@ -135,6 +156,10 @@ StepResult env_step(BomberEnv* env, Action action) {
 void env_observe(const BomberEnv* env, int agent_id, Observation* obs) {
     obs_compute(&env->state, &env->danger, agent_id,
                 rb_get(&env->action_history, rb_size(&env->action_history) - 1), obs);
+}
+
+void env_set_opponent(BomberEnv* env, Agent* opponent) {
+    env->opponent = opponent;
 }
 
 void env_get_debug_snapshot(const BomberEnv* env, DebugSnapshot* out) {

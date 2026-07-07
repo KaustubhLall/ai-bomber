@@ -28,7 +28,13 @@ Computes `current_blast`, `time_to_blast`, and `safe_now` for all tiles based on
 ### `danger_compute_escape`
 BFS from the agent's position to find reachable safe tiles:
 - `reachable_safe[y][x]` = 1 if the agent can reach (x,y) before any bomb explodes there.
-- `action_safe[a]` = 1 if taking action `a` leads to a safe tile.
+- `action_safe[a]` = 1 if taking action `a` leads to a safe tile. Movement actions use arrival-time safety: a tile is safe if the blast arrives after the agent does (time_to_blast > arrival_tick), not just if it's safe this tick.
+
+### `danger_is_action_safe_at_arrival`
+```c
+int danger_is_action_safe_at_arrival(const DangerMap* dm, int x, int y, int arrival_tick);
+```
+Checks whether a tile is safe for an agent arriving at `arrival_tick` ticks from now. Returns 1 if the tile has no blast (`time_to_blast == -1`) or the blast arrives after the agent (`time_to_blast > arrival_tick`), and the tile is not currently exploding (`current_blast == 0`).
 
 ### `danger_would_trap_agent`
 Simulates placing a bomb at a given position and checks if the agent can escape:

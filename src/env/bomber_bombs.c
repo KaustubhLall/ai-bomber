@@ -25,13 +25,12 @@ int place_bomb(BomberState* state, int agent_id) {
     return 0;
 }
 
-void tick_bombs(BomberState* state) {
-    /* Decrement timers and explode any at zero */
+void tick_bombs(BomberState* state, RNG* rng, float powerup_rate) {
     for (int i = 0; i < MAX_BOMBS; i++) {
         if (!state->bombs[i].active) continue;
         state->bombs[i].timer--;
         if (state->bombs[i].timer <= 0) {
-            explode_bomb(state, i);
+            explode_bomb(state, i, rng, powerup_rate);
         }
     }
 }

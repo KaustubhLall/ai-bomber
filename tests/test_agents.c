@@ -52,6 +52,18 @@ int main(void) {
     assert(b.impl != NULL);
     assert(a.impl != b.impl);
 
+    agent_init(&a, AGENT_HEURISTIC);
+    agent_init(&b, AGENT_HEURISTIC);
+    assert(a.impl != NULL);
+    assert(b.impl != NULL);
+    assert(a.impl != b.impl);
+
+    agent_init(&a, AGENT_GREEDY_CRATE);
+    agent_init(&b, AGENT_GREEDY_CRATE);
+    assert(a.impl != NULL);
+    assert(b.impl != NULL);
+    assert(a.impl != b.impl);
+
     assert(agent_parse_type("random") == AGENT_RANDOM);
     assert(agent_parse_type("scripted") == AGENT_SCRIPTED);
     assert(agent_parse_type("heuristic") == AGENT_HEURISTIC);

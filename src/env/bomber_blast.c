@@ -29,7 +29,7 @@ void compute_blast_tiles(const BomberState* state, int bx, int by, int range, Bl
     }
 }
 
-int explode_bomb(BomberState* state, int bomb_index) {
+int explode_bomb(BomberState* state, int bomb_index, RNG* rng, float powerup_rate) {
     BombState* bomb = &state->bombs[bomb_index];
     if (!bomb->active) return 0;
 
@@ -46,18 +46,11 @@ int explode_bomb(BomberState* state, int bomb_index) {
 
     bomb->active = 0;
 
-    /* Destroy crates and spawn powerups - use a local RNG derived from position+step */
-    /* We need the env's RNG for determinism; pass via a temporary approach */
-    /* For now, use a deterministic seed from bomb position and current step */
-    RNG local_rng;
-    rng_init(&local_rng, (uint64_t)(bomb->x * 1000 + bomb->y + state->step * 100000 + 1));
-    destroy_crates(state, &blast, &local_rng, 0.3f);
+    destroy_crates(state, &blast, rng, powerup_rate);
 
-    /* Apply blast damage to agents */
     apply_blast_damage(state, &blast);
 
-    /* Trigger chain reactions */
-    trigger_chain_reactions(state, &blast);
+    trigger_chain_reactions(state, &blast, rng, powerup_rate);
 
     return 1;
 }
@@ -95,13 +88,13 @@ void spawn_powerups(BomberState* state, const BlastResult* blast, RNG* rng, floa
     (void)state; (void)blast; (void)rng; (void)powerup_rate;
 }
 
-void trigger_chain_reactions(BomberState* state, const BlastResult* blast) {
+void trigger_chain_reactions(BomberState* state, const BlastResult* blast, RNG* rng, float powerup_rate) {
     for (int i = 0; i < blast->count; i++) {
         int bx = blast->tiles[i].x;
         int by = blast->tiles[i].y;
         for (int b = 0; b < MAX_BOMBS; b++) {
             if (state->bombs[b].active && state->bombs[b].x == bx && state->bombs[b].y == by) {
-                explode_bomb(state, b);
+                explode_bomb(state, b, rng, powerup_rate);
             }
         }
     }

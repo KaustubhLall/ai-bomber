@@ -16,6 +16,7 @@ typedef struct {
 void danger_compute(DangerMap* dm, const BomberState* state);
 void danger_compute_escape(DangerMap* dm, const BomberState* state, int agent_id);
 int danger_is_tile_safe(const DangerMap* dm, int x, int y, int ticks_ahead);
+int danger_is_action_safe_at_arrival(const DangerMap* dm, int x, int y, int arrival_ticks);
 int danger_detect_dead_end(const BomberState* state, int x, int y);
 int danger_would_trap_agent(const BomberState* state, int agent_id, int bomb_x, int bomb_y);
 

@@ -85,6 +85,28 @@ int main(void) {
     /* This depends on map layout, so just verify it runs without crashing */
     (void)traps;
 
+    /* Time-aware safety: bomb with timer=3 at (5,5), agent at (4,5) */
+    env_reset(&env, 1);
+    env.state.bombs[0].x = 5;
+    env.state.bombs[0].y = 5;
+    env.state.bombs[0].owner_id = 0;
+    env.state.bombs[0].timer = 3;
+    env.state.bombs[0].range = 2;
+    env.state.bombs[0].active = 1;
+    env.state.agents[0].x = 4;
+    env.state.agents[0].y = 5;
+    env.state.agents[0].alive = 1;
+
+    danger_compute(&env.danger, &env.state);
+    danger_compute_escape(&env.danger, &env.state, 0);
+
+    /* Tile (4,5) has time_to_blast=3. Moving away (e.g. to (3,5)) should be safe */
+    assert(env.danger.time_to_blast[5][4] == 3);
+    /* Moving to (3,5) which is outside blast range should be safe */
+    assert(danger_is_action_safe_at_arrival(&env.danger, 3, 5, 1) == 1);
+    /* Moving to (5,5) which is the bomb center should be unsafe */
+    assert(danger_is_action_safe_at_arrival(&env.danger, 5, 5, 1) == 0);
+
     printf("test_danger: ALL PASSED\n");
     return 0;
 }

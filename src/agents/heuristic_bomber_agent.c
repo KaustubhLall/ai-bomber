@@ -68,8 +68,8 @@ Action heuristic_agent_act(Agent* agent, const Observation* obs, const DebugSnap
     (void)debug;
     HeuristicBomberAgent* ha = (HeuristicBomberAgent*)agent->impl;
 
-    /* Priority 1: If in danger, escape immediately */
-    if (obs->in_danger) {
+    /* Priority 1: If in imminent danger, escape immediately */
+    if (obs->in_danger || obs->imminent_danger) {
         for (int a = 0; a < 4; a++) {
             if (obs->safe_actions[a] && obs->valid_actions[a]) {
                 snprintf(ha->decision_text, sizeof(ha->decision_text),
@@ -144,12 +144,13 @@ void heuristic_agent_reset(Agent* agent, uint64_t seed) {
 }
 
 void heuristic_agent_init(Agent* agent) {
-    static HeuristicBomberAgent impl;
-    memset(&impl, 0, sizeof(impl));
-    rng_init(&impl.rng, 99);
+    HeuristicBomberAgent* impl = (HeuristicBomberAgent*)agent_impl_storage(agent, sizeof(HeuristicBomberAgent));
+    if (!impl) return;
+    memset(impl, 0, sizeof(*impl));
+    rng_init(&impl->rng, 99);
     agent->type = AGENT_HEURISTIC;
     agent->act = heuristic_agent_act;
     agent->reset = heuristic_agent_reset;
-    agent->impl = &impl;
+    agent->impl = impl;
     strncpy(agent->name, "heuristic", sizeof(agent->name) - 1);
 }

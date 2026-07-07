@@ -6,15 +6,26 @@ on:
     branches: [ main ]
 
 jobs:
-  build-test:
+  gcc-clang:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y cmake ninja-build build-essential
       - name: Configure headless build
-        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DAI_BOMBER_BUILD_VIZ=OFF
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DAI_BOMBER_BUILD_VIZ=OFF -DCMAKE_C_FLAGS="-Werror"
       - name: Build
         run: cmake --build build
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+  msvc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure headless build
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DAI_BOMBER_BUILD_VIZ=OFF
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure

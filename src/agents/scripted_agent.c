@@ -36,7 +36,7 @@ Action scripted_agent_act(Agent* agent, const Observation* obs, const DebugSnaps
     (void)debug;
     ScriptedAgent* sa = (ScriptedAgent*)agent->impl;
 
-    if (obs->in_danger) {
+    if (obs->in_danger || obs->imminent_danger) {
         for (int a = 0; a < 4; a++) {
             if (obs->safe_actions[a] && obs->valid_actions[a]) {
                 sa->last_action = a;

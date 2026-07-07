@@ -43,7 +43,7 @@ Action greedy_crate_agent_act(Agent* agent, const Observation* obs, const DebugS
     GreedyCrateAgent* ga = (GreedyCrateAgent*)agent->impl;
 
     /* Always escape danger first */
-    if (obs->in_danger) {
+    if (obs->in_danger || obs->imminent_danger) {
         for (int a = 0; a < 4; a++) {
             if (obs->safe_actions[a] && obs->valid_actions[a]) return (Action)a;
         }
@@ -94,12 +94,13 @@ void greedy_crate_agent_reset(Agent* agent, uint64_t seed) {
 }
 
 void greedy_crate_agent_init(Agent* agent) {
-    static GreedyCrateAgent impl;
-    memset(&impl, 0, sizeof(impl));
-    rng_init(&impl.rng, 77);
+    GreedyCrateAgent* impl = (GreedyCrateAgent*)agent_impl_storage(agent, sizeof(GreedyCrateAgent));
+    if (!impl) return;
+    memset(impl, 0, sizeof(*impl));
+    rng_init(&impl->rng, 77);
     agent->type = AGENT_GREEDY_CRATE;
     agent->act = greedy_crate_agent_act;
     agent->reset = greedy_crate_agent_reset;
-    agent->impl = &impl;
+    agent->impl = impl;
     strncpy(agent->name, "greedy_crate", sizeof(agent->name) - 1);
 }

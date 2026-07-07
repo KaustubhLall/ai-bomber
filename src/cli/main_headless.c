@@ -16,7 +16,7 @@ static void usage(const char* prog) {
     printf("  --episodes <n>       Number of episodes (default 100)\n");
     printf("  --seed <n>           Random seed (default 1337)\n");
     printf("  --mode <mode>        Game mode: survival, battle (default survival)\n");
-    printf("  --enemy <type>       Reserved for explicit opponent policy wiring\n");
+    printf("  --enemy <type>       Opponent agent type: random, scripted, heuristic, greedy\n");
     printf("  --export <file>      Export metrics to file\n");
     printf("  --replay <file>      Save replay to file\n");
     printf("  --compare            Compare all agents\n");
@@ -58,10 +58,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (enemy_name) {
-        fprintf(stderr, "Warning: --enemy=%s is parsed but not yet wired into the runner; using the environment opponent behavior.\n",
-                enemy_name);
-    }
 
     BomberConfig cfg;
     if (mode == MODE_BATTLE) config_battle(&cfg);
@@ -77,6 +73,7 @@ int main(int argc, char** argv) {
     RunConfig rc;
     rc.config = cfg;
     rc.agent_type = agent_parse_type(agent_name);
+    rc.enemy_type = enemy_name ? agent_parse_type(enemy_name) : -1;
     rc.seed = seed;
     rc.episodes = episodes;
     rc.record_replay = (replay_file != NULL) ? 1 : 0;

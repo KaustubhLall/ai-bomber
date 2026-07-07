@@ -113,7 +113,10 @@ void danger_compute_escape(DangerMap* dm, const BomberState* state, int agent_id
         }
     }
 
-    /* Compute action_safe: which actions lead to safe tiles */
+    /* Compute action_safe: which actions lead to safe tiles.
+       Movement actions are checked at arrival time (1 tick from now),
+       not just safe_now, so a tile that will blast in 3 ticks is still
+       safe to move into. WAIT and BOMB remain conservative. */
     dm->action_safe[ACTION_WAIT] = dm->safe_now[ay][ax] ? 1 : 0;
 
     int move_dx[4] = {0, 0, -1, 1};
@@ -124,7 +127,7 @@ void danger_compute_escape(DangerMap* dm, const BomberState* state, int agent_id
         if (!map_in_bounds(state, nx, ny) || !map_is_walkable(state, nx, ny)) {
             dm->action_safe[a] = 0;
         } else {
-            dm->action_safe[a] = dm->safe_now[ny][nx] ? 1 : 0;
+            dm->action_safe[a] = danger_is_action_safe_at_arrival(dm, nx, ny, 1);
         }
     }
 
@@ -136,6 +139,16 @@ int danger_is_tile_safe(const DangerMap* dm, int x, int y, int ticks_ahead) {
     int tblast = dm->time_to_blast[y][x];
     if (tblast < 0) return 1; /* no danger */
     return tblast > ticks_ahead;
+}
+
+int danger_is_action_safe_at_arrival(const DangerMap* dm, int x, int y, int arrival_ticks) {
+    if (x < 0 || x >= MAX_WIDTH || y < 0 || y >= MAX_HEIGHT) return 0;
+    /* A tile is safe at arrival if no blast is currently exploding there
+       and the blast won't arrive before or at the same time the agent does. */
+    if (dm->current_blast[y][x]) return 0;
+    int tblast = dm->time_to_blast[y][x];
+    if (tblast < 0) return 1; /* no danger scheduled */
+    return tblast > arrival_ticks;
 }
 
 int danger_detect_dead_end(const BomberState* state, int x, int y) {

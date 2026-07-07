@@ -14,6 +14,7 @@ void runner_run_single(BomberEnv* env, Agent* agent, uint64_t seed,
     DebugSnapshot debug;
 
     int prev_crates = map_count_crates(&env->state);
+    (void)prev_crates;
 
     for (int step = 0; step < env->config.max_steps; step++) {
         env_observe(env, 0, &obs);
@@ -46,6 +47,13 @@ void runner_run(const RunConfig* rc, Metrics* metrics) {
     Agent agent;
     agent_init(&agent, rc->agent_type);
 
+    Agent enemy;
+    Agent* enemy_ptr = NULL;
+    if (rc->enemy_type >= 0) {
+        agent_init(&enemy, rc->enemy_type);
+        enemy_ptr = &enemy;
+    }
+
     metrics_init(metrics);
 
     clock_t start = clock();
@@ -58,6 +66,7 @@ void runner_run(const RunConfig* rc, Metrics* metrics) {
             replay_init(replay_ptr, &rc->config, ep_seed);
         }
 
+        env_set_opponent(&env, enemy_ptr);
         runner_run_single(&env, &agent, ep_seed, metrics, replay_ptr,
                          replay_ptr && ep == 0);
     }

@@ -49,8 +49,9 @@ typedef struct {
     int prev_action;
 
     /* Danger info */
-    int in_danger;
-    int danger_timer;
+    int in_danger;       /* 1 if current_blast at agent position (exploding now) */
+    int danger_timer;    /* time_to_blast at agent position (-1 if no danger) */
+    int imminent_danger; /* 1 if blast will arrive within 2 ticks */
 
     /* Flat observation vector for ML */
     float flat[OBS_FLAT_SIZE];

@@ -98,5 +98,5 @@ All game state is stored in `BomberState`:
 - PRNG state is explicit and local to the environment or the agent instance.
 - Map generation is seeded and deterministic.
 - Built-in agent RNG state must be per instance; file-static agent state would make side-by-side sessions interfere with each other.
-- The simple one-agent stepping API still owns the current environment opponent behavior. Explicit opponent policy wiring is tracked as a future runner improvement.
+- Opponent policy is explicitly wired via `env_set_opponent()` and the `--enemy` CLI flag. When no opponent is set, a built-in AI controls enemy agents.
 - Replays currently record the controlled agent action stream; full multi-policy replay should also store opponent policy metadata and seed schedule.

@@ -10,6 +10,9 @@
 #include "env/bomber_observation.h"
 #include "env/bomber_reward.h"
 
+/* Forward declaration to avoid circular include with agents/agent.h */
+struct Agent;
+
 /* Generic environment API */
 
 typedef struct BomberEnv {
@@ -22,12 +25,14 @@ typedef struct BomberEnv {
     int prev_agent_x;
     int prev_agent_y;
     int steps_since_progress;
+    struct Agent* opponent; /* Optional opponent policy; NULL = built-in AI */
 } BomberEnv;
 
 void env_init(BomberEnv* env, const BomberConfig* config);
 void env_reset(BomberEnv* env, uint64_t seed);
 StepResult env_step(BomberEnv* env, Action action);
 void env_observe(const BomberEnv* env, int agent_id, Observation* obs);
+void env_set_opponent(BomberEnv* env, struct Agent* opponent);
 
 /* Debug snapshot for visualizer */
 typedef struct {
