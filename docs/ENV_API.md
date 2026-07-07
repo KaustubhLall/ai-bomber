@@ -58,7 +58,7 @@ StepResult env_step(BomberEnv* env, Action action);
 ```
 Executes one step for agent 0 with the given action. Internally:
 1. Executes the agent's action (move, bomb, wait).
-2. Runs enemy AI for other agents.
+2. Runs enemy AI for other agents (uses opponent agent if set via `env_set_opponent`, otherwise built-in AI).
 3. Picks up powerups.
 4. Ticks all bombs (decrement timers, explode at zero).
 5. Recomputes danger map.
@@ -66,6 +66,12 @@ Executes one step for agent 0 with the given action. Internally:
 7. Checks terminal conditions.
 
 Returns the step reward, done flag, and terminal reason.
+
+### `env_set_opponent`
+```c
+void env_set_opponent(BomberEnv* env, Agent* opponent);
+```
+Sets an explicit opponent agent for enemy agents in battle mode. Pass `NULL` to revert to built-in AI. The opponent agent is queried each step for each enemy agent's action.
 
 ### `env_observe`
 ```c

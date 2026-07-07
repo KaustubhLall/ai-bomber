@@ -40,7 +40,9 @@ float reward_compute(RewardBreakdown* rb, BomberEnv* env, Action action,
         rb->death_penalty = cfg->death_penalty;
     }
 
-    int in_danger_now = (env->danger.time_to_blast[agent->y][agent->x] >= 0) ? 1 : 0;
+    int in_danger_now = (env->danger.current_blast[agent->y][agent->x] ||
+                         (env->danger.time_to_blast[agent->y][agent->x] >= 0 &&
+                          env->danger.time_to_blast[agent->y][agent->x] <= 2)) ? 1 : 0;
     if (was_in_danger && !in_danger_now && agent->alive) {
         rb->escape_danger = cfg->escape_danger_reward;
     }

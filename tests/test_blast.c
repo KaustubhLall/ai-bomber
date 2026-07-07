@@ -64,7 +64,7 @@ int main(void) {
     env.state.bombs[0].range = 2; env.state.bombs[0].active = 1;
 
     /* Explode the bomb */
-    explode_bomb(&env.state, 0);
+    explode_bomb(&env.state, 0, &env.rng, cfg.powerup_rate);
 
     /* Crate should be destroyed (turned to floor or powerup) */
     TileType t = env.state.tiles[5][6];
@@ -81,7 +81,7 @@ int main(void) {
     env.state.bombs[0].owner_id = 0; env.state.bombs[0].timer = 1;
     env.state.bombs[0].range = 2; env.state.bombs[0].active = 1;
 
-    explode_bomb(&env.state, 0);
+    explode_bomb(&env.state, 0, &env.rng, cfg.powerup_rate);
     assert(env.state.agents[0].alive == 0);
 
     printf("test_blast: ALL PASSED\n");

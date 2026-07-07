@@ -25,10 +25,10 @@ static int find_nearest_powerup(const Observation* obs, int* out_dx, int* out_dy
 static int has_adjacent_crate(const Observation* obs) {
     int cx = LOCAL_OBS_HALF;
     int cy = LOCAL_OBS_HALF;
-    if (obs->local_tiles[cy][cx+1] == TILE_CRATE) return 1;
-    if (obs->local_tiles[cy][cx-1] == TILE_CRATE) return 1;
-    if (obs->local_tiles[cy+1][cx] == TILE_CRATE) return 1;
-    if (obs->local_tiles[cy-1][cx] == TILE_CRATE) return 1;
+    if (obs->local_tiles[cy][cx+1] == (int)TILE_CRATE) return 1;
+    if (obs->local_tiles[cy][cx-1] == (int)TILE_CRATE) return 1;
+    if (obs->local_tiles[cy+1][cx] == (int)TILE_CRATE) return 1;
+    if (obs->local_tiles[cy-1][cx] == (int)TILE_CRATE) return 1;
     return 0;
 }
 
@@ -36,7 +36,7 @@ Action scripted_agent_act(Agent* agent, const Observation* obs, const DebugSnaps
     (void)debug;
     ScriptedAgent* sa = (ScriptedAgent*)agent->impl;
 
-    if (obs->in_danger) {
+    if (obs->in_danger || obs->imminent_danger) {
         for (int a = 0; a < 4; a++) {
             if (obs->safe_actions[a] && obs->valid_actions[a]) {
                 sa->last_action = a;

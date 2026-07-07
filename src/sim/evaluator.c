@@ -8,6 +8,7 @@ EvalResult evaluator_run(AgentType agent_type, const BomberConfig* cfg,
     RunConfig rc;
     rc.config = *cfg;
     rc.agent_type = agent_type;
+    rc.enemy_type = (AgentType)-1;
     rc.seed = seed;
     rc.episodes = episodes;
     rc.record_replay = 0;

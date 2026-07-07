@@ -40,6 +40,7 @@ Centered on the agent, providing:
 ### Danger info
 - `in_danger`: Whether agent is currently in a blast zone
 - `danger_timer`: Ticks until blast reaches agent (-1 if safe)
+- `imminent_danger`: 1 if blast is imminent (danger_timer >= 0 and <= 2)
 
 ## Flat observation vector
 
@@ -54,9 +55,9 @@ For ML models, `obs_to_flat()` converts the observation to a flat float array:
 | Local danger | 121 | 11x11 time-to-blast |
 | Valid actions | 6 | One-hot valid action mask |
 | Safe actions | 6 | One-hot safe action mask |
-| Danger info | 2 | in_danger, danger_timer |
+| Danger info | 3 | in_danger, danger_timer, imminent_danger |
 | Previous action | 1 | Last action |
-| **Total** | **506** | Fixed size |
+| **Total** | **507** | Fixed size |
 
 The flat vector has a fixed shape for a given config, making it suitable for neural network input.
 

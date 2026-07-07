@@ -1,3 +1,11 @@
+if(MSVC)
+    add_compile_options(/wd4189)
+endif()
+
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-Wno-unused-variable -Wno-unused-but-set-variable)
+endif()
+
 add_executable(test_rng test_rng.c)
 target_link_libraries(test_rng PRIVATE bomber_core)
 add_test(NAME test_rng COMMAND test_rng)
@@ -41,3 +49,7 @@ add_test(NAME test_agents COMMAND test_agents)
 add_executable(test_determinism test_determinism.c)
 target_link_libraries(test_determinism PRIVATE bomber_core)
 add_test(NAME test_determinism COMMAND test_determinism)
+
+add_executable(test_hardened test_hardened.c)
+target_link_libraries(test_hardened PRIVATE bomber_core)
+add_test(NAME test_hardened COMMAND test_hardened)

@@ -11,7 +11,7 @@ The project is built around a small fixed-size simulator that can run without a 
 - Pluggable agents for random, scripted, heuristic, and crate-focused baselines
 - A local observation format designed to be exported to Python, C++, or another training loop
 - A raylib visualizer for inspecting reward, danger, bombs, local observations, and agent behavior
-- CTest coverage for core environment rules, determinism, replay, rewards, agents, and metrics
+- CTest coverage for core environment rules, determinism, replay, rewards, agents, metrics, and hardened invariants
 
 ## Current status
 
@@ -56,7 +56,10 @@ ctest --test-dir build --output-on-failure
 # Heuristic agent with metrics export.
 ./build/bomber_headless --agent heuristic --episodes 1000 --seed 1337 --export metrics.json
 
-# Battle mode with the current deterministic environment opponent behavior.
+# Battle mode with a heuristic opponent.
+./build/bomber_headless --mode battle --agent heuristic --enemy scripted --episodes 100
+
+# Battle mode with built-in opponent AI (no --enemy flag).
 ./build/bomber_headless --mode battle --agent heuristic --episodes 100
 
 # Compare the built-in agents.
@@ -143,6 +146,5 @@ assets/       optional configs, sprites, and fonts
 ## Roadmap
 
 - External policy bridge for Python or another model runtime
-- Explicit opponent policy wiring in the headless runner
 - Better replay metadata for full multi-policy reproduction
 - Stable benchmark fixtures for comparing simulator changes over time

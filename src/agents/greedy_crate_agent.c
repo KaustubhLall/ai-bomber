@@ -11,7 +11,7 @@ static int find_nearest_crate(const Observation* obs, int* out_dx, int* out_dy) 
     int found = 0;
     for (int y = 0; y < LOCAL_OBS_SIZE; y++) {
         for (int x = 0; x < LOCAL_OBS_SIZE; x++) {
-            if (obs->local_tiles[y][x] == TILE_CRATE) {
+            if (obs->local_tiles[y][x] == (int)TILE_CRATE) {
                 int dx = (x - LOCAL_OBS_HALF);
                 int dy = (y - LOCAL_OBS_HALF);
                 int dist = absi(dx) + absi(dy);
@@ -32,10 +32,10 @@ static int find_nearest_crate(const Observation* obs, int* out_dx, int* out_dy) 
 static int has_adjacent_crate(const Observation* obs) {
     int cx = LOCAL_OBS_HALF;
     int cy = LOCAL_OBS_HALF;
-    return (obs->local_tiles[cy][cx+1] == TILE_CRATE ||
-            obs->local_tiles[cy][cx-1] == TILE_CRATE ||
-            obs->local_tiles[cy+1][cx] == TILE_CRATE ||
-            obs->local_tiles[cy-1][cx] == TILE_CRATE);
+    return (obs->local_tiles[cy][cx+1] == (int)TILE_CRATE ||
+            obs->local_tiles[cy][cx-1] == (int)TILE_CRATE ||
+            obs->local_tiles[cy+1][cx] == (int)TILE_CRATE ||
+            obs->local_tiles[cy-1][cx] == (int)TILE_CRATE);
 }
 
 Action greedy_crate_agent_act(Agent* agent, const Observation* obs, const DebugSnapshot* debug) {
@@ -43,7 +43,7 @@ Action greedy_crate_agent_act(Agent* agent, const Observation* obs, const DebugS
     GreedyCrateAgent* ga = (GreedyCrateAgent*)agent->impl;
 
     /* Always escape danger first */
-    if (obs->in_danger) {
+    if (obs->in_danger || obs->imminent_danger) {
         for (int a = 0; a < 4; a++) {
             if (obs->safe_actions[a] && obs->valid_actions[a]) return (Action)a;
         }
@@ -94,12 +94,13 @@ void greedy_crate_agent_reset(Agent* agent, uint64_t seed) {
 }
 
 void greedy_crate_agent_init(Agent* agent) {
-    static GreedyCrateAgent impl;
-    memset(&impl, 0, sizeof(impl));
-    rng_init(&impl.rng, 77);
+    GreedyCrateAgent* impl = (GreedyCrateAgent*)agent_impl_storage(agent, sizeof(GreedyCrateAgent));
+    if (!impl) return;
+    memset(impl, 0, sizeof(*impl));
+    rng_init(&impl->rng, 77);
     agent->type = AGENT_GREEDY_CRATE;
     agent->act = greedy_crate_agent_act;
     agent->reset = greedy_crate_agent_reset;
-    agent->impl = &impl;
+    agent->impl = impl;
     strncpy(agent->name, "greedy_crate", sizeof(agent->name) - 1);
 }

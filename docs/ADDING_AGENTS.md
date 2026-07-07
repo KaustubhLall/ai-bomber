@@ -56,7 +56,7 @@ Action my_agent_act(Agent* agent, const Observation* obs, const DebugSnapshot* d
     (void)debug;
     MyAgent* ma = (MyAgent*)agent->impl;
 
-    if (obs->in_danger) {
+    if (obs->in_danger || obs->imminent_danger) {
         for (int a = 0; a < 4; a++) {
             if (obs->safe_actions[a] && obs->valid_actions[a]) {
                 ma->last_action = a;
@@ -126,7 +126,7 @@ Action my_agent_act(Agent* agent, const Observation* obs, const DebugSnapshot* d
     (void)agent;
     (void)debug;
 
-    if (obs->in_danger) {
+    if (obs->in_danger || obs->imminent_danger) {
         for (int a = 0; a < 4; a++) {
             if (obs->safe_actions[a] && obs->valid_actions[a]) {
                 return (Action)a;
@@ -148,4 +148,5 @@ Action my_agent_act(Agent* agent, const Observation* obs, const DebugSnapshot* d
 - Reset RNG and transient state in your reset function.
 - Prefer `obs->valid_actions` before choosing a move.
 - Treat `obs->safe_actions` as a danger-map hint, not as a full proof of long-term safety.
+- Check `obs->imminent_danger` in addition to `obs->in_danger` to react to blasts that are about to hit (within 2 ticks).
 - Add a smoke test that creates two instances of the same agent type and verifies their `impl` pointers do not alias.
