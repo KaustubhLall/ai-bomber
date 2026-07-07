@@ -73,7 +73,7 @@ int main(int argc, char** argv) {
     RunConfig rc;
     rc.config = cfg;
     rc.agent_type = agent_parse_type(agent_name);
-    rc.enemy_type = enemy_name ? agent_parse_type(enemy_name) : -1;
+    rc.enemy_type = enemy_name ? agent_parse_type(enemy_name) : (AgentType)-1;
     rc.seed = seed;
     rc.episodes = episodes;
     rc.record_replay = (replay_file != NULL) ? 1 : 0;

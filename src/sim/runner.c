@@ -49,7 +49,7 @@ void runner_run(const RunConfig* rc, Metrics* metrics) {
 
     Agent enemy;
     Agent* enemy_ptr = NULL;
-    if (rc->enemy_type >= 0) {
+    if ((int)rc->enemy_type >= 0) {
         agent_init(&enemy, rc->enemy_type);
         enemy_ptr = &enemy;
     }
