@@ -34,6 +34,39 @@ static const AgentType selectable_policies[] = {
     AGENT_HEURISTIC, AGENT_EVASIVE, AGENT_ALPHABETA, AGENT_MCTS
 };
 
+typedef struct {
+    AgentType blue;
+    AgentType red;
+} MatchupPair;
+
+static int parse_policy_name(const char* name, AgentType* type) {
+    int count = (int)(sizeof(selectable_policies) / sizeof(selectable_policies[0]));
+    for (int i = 0; i < count; i++) if (strcmp(name, agent_type_name(selectable_policies[i])) == 0) {
+        *type = selectable_policies[i]; return 1;
+    }
+    if (strcmp(name, "alphabeta") == 0) { *type = AGENT_ALPHABETA; return 1; }
+    if (strcmp(name, "greedy_crate") == 0) { *type = AGENT_GREEDY_CRATE; return 1; }
+    if (strcmp(name, "survivor") == 0) { *type = AGENT_EVASIVE; return 1; }
+    return 0;
+}
+
+static int parse_matchup_pair(const char* text, MatchupPair* pair) {
+    const char* colon = text ? strchr(text, ':') : NULL;
+    if (!colon || colon == text || !colon[1]) return 0;
+    size_t blue_len = (size_t)(colon - text), red_len = strlen(colon + 1);
+    if (blue_len >= 32 || red_len >= 32) return 0;
+    char blue[32], red[32];
+    memcpy(blue, text, blue_len); blue[blue_len] = '\0';
+    memcpy(red, colon + 1, red_len + 1);
+    return parse_policy_name(blue, &pair->blue) && parse_policy_name(red, &pair->red);
+}
+
+static const MatchupPair default_matchup_board[] = {
+    {AGENT_MCTS, AGENT_HEURISTIC}, {AGENT_HEURISTIC, AGENT_MCTS},
+    {AGENT_MCTS, AGENT_GREEDY_CRATE}, {AGENT_GREEDY_CRATE, AGENT_MCTS},
+    {AGENT_MCTS, AGENT_ALPHABETA}, {AGENT_ALPHABETA, AGENT_MCTS}
+};
+
 static AgentType cycle_policy(AgentType current, int direction) {
     int count = (int)(sizeof(selectable_policies) / sizeof(selectable_policies[0]));
     int index = 0;
@@ -187,19 +220,30 @@ static void apply_simulation_hz(VizSession* vs, PlaybackClock* clock, int hz) {
     playback_clock_reset(clock);
 }
 
+static Rectangle runtime_button_rect(const VizSession* vs, int index) {
+    if (vs->view_mode == VIEW_COMPARE)
+        return (Rectangle){20.0f + index * 61.0f, SCREEN_H - 68.0f, 57.0f, 22.0f};
+    return (Rectangle){575.0f + index * 90.0f, 61.0f, 82.0f, 22.0f};
+}
+
 static void draw_runtime_controls(const VizSession* vs, int editing, const char* entry) {
     const ThemeColors* tc = theme_colors();
-    const char* labels[] = {"Game -", "Game +", "Render -", "Render +", "Set Game"};
-    DrawRectangle(570, 58, 465, 28, (Color){18, 24, 34, 245});
+    const char* normal_labels[] = {"Game -", "Game +", "Render -", "Render +", "Set Game"};
+    const char* compact_labels[] = {"Game-", "Game+", "FPS-", "FPS+", "Set Hz"};
+    int compact = vs->view_mode == VIEW_COMPARE;
+    if (compact) DrawRectangle(16, SCREEN_H - 74, 310, 66, (Color){18, 24, 34, 245});
+    else DrawRectangle(570, 58, 465, 28, (Color){18, 24, 34, 245});
     for (int i = 0; i < 5; i++) {
-        int x = 575 + i * 90;
-        DrawRectangle(x, 61, 82, 22, tc->button);
-        DrawRectangleLines(x, 61, 82, 22, tc->panel_border);
-        DrawText(labels[i], x + 9, 66, 12, tc->text_primary);
+        Rectangle button = runtime_button_rect(vs, i);
+        DrawRectangleRec(button, tc->button);
+        DrawRectangleLinesEx(button, 1, tc->panel_border);
+        DrawText(compact ? compact_labels[i] : normal_labels[i], (int)button.x + (compact ? 6 : 9),
+                 (int)button.y + 5, compact ? 10 : 12, tc->text_primary);
     }
     char status[96];
     snprintf(status, sizeof(status), "Game %d/s | Render %d", vs->simulation_hz, vs->target_fps);
-    DrawText(status, 1044, 66, 12, tc->text_secondary);
+    if (compact) DrawText(status, 24, SCREEN_H - 35, 12, tc->text_secondary);
+    else DrawText(status, 1044, 66, 12, tc->text_secondary);
     if (editing) {
         DrawRectangle(520, 360, 360, 120, (Color){15, 21, 31, 250});
         DrawRectangleLines(520, 360, 360, 120, tc->agent);
@@ -221,8 +265,9 @@ static void draw_help_overlay(int screen_w, int screen_h) {
     DrawText("SPACE pause/resume    S single-step    R reset    TAB next policy", x + 24, y + 90, 15, tc->text_secondary);
     DrawText("+/- game rate (1/2/3/5/10/30 steps/sec)    [/] render FPS", x + 24, y + 116, 15, tc->text_secondary);
     DrawText("1-4 views    5 history    M live matchup    F7 exact game rate", x + 24, y + 142, 15, tc->text_secondary);
-    DrawText("D danger    O observation    G grid    L legend    P screenshot    ESC clean exit", x + 24, y + 168, 15, tc->text_secondary);
-    DrawText("Powerups", x + 24, y + 214, 18, tc->agent);
+    DrawText("View 2: click any matchup, then press 1 for full-size inspection", x + 24, y + 166, 14, tc->text_secondary);
+    DrawText("D danger    O observation    G grid    L legend    P screenshot    ESC clean exit", x + 24, y + 190, 15, tc->text_secondary);
+    DrawText("Powerups", x + 24, y + 228, 18, tc->agent);
     DrawCircle(x + 34, y + 254, 10, (Color){244, 83, 83, 255});
     DrawText("Bomb capacity", x + 58, y + 244, 16, tc->text_primary);
     DrawText("Adds one reusable bomb slot. Ammo returns when that bomb explodes.", x + 58, y + 266, 14, tc->text_secondary);
@@ -266,9 +311,12 @@ static void draw_agent_tabs(VizSession* vs, int ox, int oy, int w) {
         Color bg = (i == vs->active_session) ? (Color){60, 60, 80, 255} : (Color){30, 30, 40, 255};
         DrawRectangle(tx, oy, tab_w, 24, bg);
         DrawRectangleLines(tx, oy, tab_w, 24, (Color){100, 100, 120, 255});
-        const char* name = vs->sessions[i].name;
-        int tw = MeasureText(name, 12);
-        DrawText(name, tx + (tab_w - tw) / 2, oy + 6, 12,
+        char matchup[72];
+        snprintf(matchup, sizeof(matchup), "%s vs %s", vs->sessions[i].name,
+                 vs->sessions[i].opponent_name);
+        int font = tab_w < 150 ? 10 : 12;
+        int tw = MeasureText(matchup, font);
+        DrawText(matchup, tx + (tab_w - tw) / 2, oy + 6, font,
                  (i == vs->active_session) ? WHITE : GRAY);
     }
 }
@@ -276,23 +324,23 @@ static void draw_agent_tabs(VizSession* vs, int ox, int oy, int w) {
 static void draw_training_overview(VizSession* vs, int ox, int oy, int w, int h) {
     DrawRectangle(ox, oy, w, h, (Color){20, 20, 30, 255});
     DrawRectangleLines(ox, oy, w, h, (Color){100, 100, 120, 255});
-    DrawText("Training Overview (All Agents)", ox + 8, oy + 4, 14, WHITE);
+    DrawText("Matchup Overview", ox + 8, oy + 4, 14, WHITE);
 
     int y = oy + 26;
     char buf[256];
 
-    snprintf(buf, sizeof(buf), "%-15s %8s %8s %8s %8s %10s",
-             "Agent", "Epochs", "Wins", "Deaths", "WinRate", "AvgReward");
+    snprintf(buf, sizeof(buf), "%-19s %5s %5s %5s %7s",
+             "Blue > Red", "Ep", "Win", "Dead", "Avg R");
     DrawText(buf, ox + 8, y, 12, (Color){180, 180, 200, 255}); y += 16;
 
     for (int i = 0; i < vs->session_count; i++) {
         AgentSession* s = &vs->sessions[i];
-        float win_rate = s->epoch_count > 0 ? (float)s->total_wins / s->epoch_count : 0.0f;
         float avg_r = s->epoch_count > 0 ? s->total_reward / s->epoch_count : 0.0f;
         Color c = (i == vs->active_session) ? WHITE : (Color){160, 160, 170, 255};
-        snprintf(buf, sizeof(buf), "%-15s %8d %8d %8d %7.1f%% %10.3f",
-                 s->name, s->epoch_count, s->total_wins, s->total_deaths,
-                 win_rate * 100.0f, avg_r);
+        char matchup[48];
+        snprintf(matchup, sizeof(matchup), "%s>%s", s->name, s->opponent_name);
+        snprintf(buf, sizeof(buf), "%-19.19s %5d %5d %5d %7.2f",
+                 matchup, s->epoch_count, s->total_wins, s->total_deaths, avg_r);
         DrawText(buf, ox + 8, y, 12, c); y += 16;
     }
 
@@ -342,11 +390,11 @@ static void draw_training_overview(VizSession* vs, int ox, int oy, int w, int h)
 }
 
 static void draw_comparison_view(VizSession* vs, int screen_w, int screen_h) {
-    int overview_w = 400;
-    draw_training_overview(vs, 8, 30, overview_w, screen_h - 40);
+    int overview_w = 330;
+    draw_training_overview(vs, 8, 30, overview_w, screen_h - 112);
 
     int arena_area_w = screen_w - overview_w - 16;
-    int cols = vs->session_count > 2 ? 3 : 2;
+    int cols = vs->session_count <= 1 ? 1 : (vs->session_count <= 4 ? 2 : 3);
     if (cols < 1) cols = 1;
     int rows = (vs->session_count + cols - 1) / cols;
     if (rows < 1) rows = 1;
@@ -365,25 +413,49 @@ static void draw_comparison_view(VizSession* vs, int screen_w, int screen_h) {
         env_observe(&s->env, 0, &obs);
         env_get_debug_snapshot(&s->env, &snap);
 
-        int tile = 16;
+        int tile = layout_calc_tile_size(snap.state.width, snap.state.height,
+                                         mini_w - 16, mini_h - 64);
+        if (tile > 22) tile = 22;
+        if (tile < 4) tile = 4;
         int arena_w = snap.state.width * tile;
         int arena_h = snap.state.height * tile;
         int aox = ax + (mini_w - arena_w) / 2;
-        int aoy = ay + 20;
+        int aoy = ay + 26 + ((mini_h - 62) - arena_h) / 2;
 
         DrawRectangle(ax, ay, mini_w, mini_h, (Color){15, 15, 20, 255});
         DrawRectangleLines(ax, ay, mini_w, mini_h, (Color){80, 80, 100, 255});
-        DrawText(s->name, ax + 8, ay + 4, 12,
+        char title[96];
+        snprintf(title, sizeof(title), "#%d  %s vs %s", i + 1, s->name, s->opponent_name);
+        DrawText(title, ax + 8, ay + 6, 13,
                  (i == vs->active_session) ? WHITE : (Color){160, 160, 170, 255});
 
         renderer_draw_arena(&snap, aox, aoy, tile);
 
-        char info[128];
-        snprintf(info, sizeof(info), "Ep:%d Step:%d R:%.2f %s",
-                 s->epoch_count, s->current_step, s->current_reward,
-                 s->env.state.agents[0].alive ? "ALIVE" : "DEAD");
-        DrawText(info, ax + 4, ay + mini_h - 16, 10, (Color){180, 180, 200, 255});
+        char info[160];
+        const char* status = s->episode_done ? outcome_name(s->outcome) : "LIVE";
+        snprintf(info, sizeof(info), "Seed %llu | Ep %d/%d | Step %d | %s",
+                 (unsigned long long)(vs->base_seed + (uint64_t)s->epoch_count),
+                 s->epoch_count, vs->max_epochs, s->current_step, status);
+        DrawText(info, ax + 6, ay + mini_h - 30, 10,
+                 s->episode_done ? (Color){245, 190, 85, 255} : (Color){115, 225, 160, 255});
+        snprintf(info, sizeof(info), "Reward %.2f | click to inspect, then press 1", s->current_reward);
+        DrawText(info, ax + 6, ay + mini_h - 16, 10, (Color){180, 180, 200, 255});
     }
+}
+
+static int comparison_session_at(const VizSession* vs, int x, int y, int screen_w, int screen_h) {
+    int overview_w = 330;
+    int cols = vs->session_count <= 1 ? 1 : (vs->session_count <= 4 ? 2 : 3);
+    int rows = (vs->session_count + cols - 1) / cols;
+    if (rows < 1) rows = 1;
+    int left = overview_w + 16;
+    if (x < left || y < 30) return -1;
+    int mini_w = (screen_w - overview_w - 16) / cols;
+    int mini_h = (screen_h - 40) / rows;
+    int col = (x - left) / mini_w, row = (y - 30) / mini_h;
+    if (col < 0 || col >= cols || row < 0 || row >= rows) return -1;
+    int index = row * cols + col;
+    return index < vs->session_count ? index : -1;
 }
 
 static void draw_arena_view(VizSession* vs, int screen_w, int screen_h) {
@@ -647,9 +719,12 @@ static void draw_graphs_view(VizSession* vs, int screen_w, int screen_h) {
 
 int main(int argc, char** argv) {
     const char* agent_names[8];
+    const char* matchup_args[8];
     int agent_count = 0;
+    int matchup_count = 0;
     uint64_t seed = 1337;
     int max_epochs = 1;
+    int epochs_explicit = 0;
     int simulation_hz = 1;
     int target_fps = 60;
     int start_paused = 0;
@@ -660,6 +735,7 @@ int main(int argc, char** argv) {
     const char* smoke_red = "random";
     int open_matchup = 0;
     int open_history = 0;
+    ViewMode initial_view = VIEW_ARENA;
     const char* enemy_name = "heuristic";
     int arena_agent_count = 2;
 
@@ -675,6 +751,7 @@ int main(int argc, char** argv) {
             seed = (uint64_t)strtoull(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--epochs") == 0 && i + 1 < argc) {
             max_epochs = atoi(argv[++i]);
+            epochs_explicit = 1;
         } else if (strcmp(argv[i], "--fps") == 0 && i + 1 < argc) {
             simulation_hz = atoi(argv[++i]);
             if (simulation_hz < 1) simulation_hz = 1;
@@ -696,7 +773,19 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[i], "--smoke-red") == 0 && i + 1 < argc) {
             smoke_red = argv[++i];
         } else if (strcmp(argv[i], "--matchup") == 0) {
-            open_matchup = 1;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                if (matchup_count < 8) matchup_args[matchup_count++] = argv[++i];
+            } else {
+                open_matchup = 1;
+            }
+        } else if (strcmp(argv[i], "--view") == 0 && i + 1 < argc) {
+            const char* view = argv[++i];
+            if (strcmp(view, "arena") == 0 || strcmp(view, "1") == 0) initial_view = VIEW_ARENA;
+            else if (strcmp(view, "compare") == 0 || strcmp(view, "2") == 0) initial_view = VIEW_COMPARE;
+            else if (strcmp(view, "graphs") == 0 || strcmp(view, "3") == 0) initial_view = VIEW_GRAPHS;
+            else if (strcmp(view, "debug") == 0 || strcmp(view, "4") == 0) initial_view = VIEW_DEBUG;
+            else if (strcmp(view, "history") == 0 || strcmp(view, "5") == 0) initial_view = VIEW_HISTORY;
+            else { fprintf(stderr, "Unknown view: %s\n", view); return 1; }
         } else if (strcmp(argv[i], "--history") == 0) {
             open_history = 1;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -704,6 +793,9 @@ int main(int argc, char** argv) {
             printf("Options:\n");
             printf("  --agent <type>   Agent: random, scripted, heuristic, greedy, evasive, alpha-beta, mcts\n");
             printf("  --enemy <type>   Opponent policy (default heuristic; use builtin-random explicitly)\n");
+            printf("  --matchup <blue:red>  Add an independent View 2 matchup (repeat up to 8)\n");
+            printf("  --matchup        Open the single-match arena picker (no value)\n");
+            printf("  --view <name>    Initial view: arena, compare, graphs, debug, history\n");
             printf("  --agents <n>     Arena agent count, 1-%d (default 2)\n", MAX_AGENTS);
             printf("  --seed <n>       Random seed (default 1337)\n");
             printf("  --epochs <n>     Match count (default 1, then pauses)\n");
@@ -714,7 +806,6 @@ int main(int argc, char** argv) {
             printf("  --smoke-screenshot <png>  Render, capture, and exit (verification)\n");
             printf("  --smoke-view <matchup|history|arena|compare|graphs>  Surface captured by smoke mode\n");
             printf("  --smoke-blue/--smoke-red <policy>  Verification matchup\n");
-            printf("  --matchup        Open the live policy arena picker\n");
             printf("  --history        Open the latest match replay/history\n");
             printf("  --help           Show this help\n");
             printf("\nControls:\n");
@@ -737,9 +828,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (agent_count == 0) {
-        agent_names[agent_count++] = "mcts";
-    }
+    int use_default_board = agent_count == 0 && matchup_count == 0 && !replay_file;
+    if (use_default_board && !epochs_explicit) max_epochs = 20;
 
     if (smoke_screenshot) SetConfigFlags(FLAG_WINDOW_HIDDEN);
     InitWindow(SCREEN_W, SCREEN_H, "AI Bomber - Visualizer");
@@ -779,13 +869,40 @@ int main(int argc, char** argv) {
             free(replay);
         }
     } else {
-        for (int i = 0; i < agent_count; i++) {
-            AgentType type = agent_parse_type(agent_names[i]);
-            AgentType opponent_type = enemy_name ? agent_parse_type(enemy_name) : AGENT_RANDOM;
-            viz_session_add_agent(&vs, type, agent_names[i], opponent_type,
-                                  enemy_name ? enemy_name : "built-in-random",
-                                  enemy_name != NULL, &cfg);
+        if (matchup_count > 0) {
+            for (int i = 0; i < matchup_count; i++) {
+                MatchupPair pair;
+                if (!parse_matchup_pair(matchup_args[i], &pair)) {
+                    fprintf(stderr, "Invalid matchup '%s' (expected known-policy:known-policy)\n", matchup_args[i]);
+                    continue;
+                }
+                viz_session_add_agent(&vs, pair.blue, agent_type_name(pair.blue), pair.red,
+                                      agent_type_name(pair.red), 1, &cfg);
+            }
+        } else if (agent_count > 0) {
+            for (int i = 0; i < agent_count; i++) {
+                AgentType type = agent_parse_type(agent_names[i]);
+                AgentType opponent_type = enemy_name ? agent_parse_type(enemy_name) : AGENT_RANDOM;
+                viz_session_add_agent(&vs, type, agent_names[i], opponent_type,
+                                      enemy_name ? enemy_name : "built-in-random",
+                                      enemy_name != NULL, &cfg);
+            }
+        } else {
+            int count = (int)(sizeof(default_matchup_board) / sizeof(default_matchup_board[0]));
+            for (int i = 0; i < count; i++) {
+                MatchupPair pair = default_matchup_board[i];
+                viz_session_add_agent(&vs, pair.blue, agent_type_name(pair.blue), pair.red,
+                                      agent_type_name(pair.red), 1, &cfg);
+            }
         }
+        vs.view_mode = initial_view;
+    }
+
+    if (!replay_file && vs.session_count == 0) {
+        fprintf(stderr, "No valid visualizer matchups were configured.\n");
+        viz_session_shutdown(&vs);
+        CloseWindow();
+        return 1;
     }
 
     if (smoke_screenshot) {
@@ -874,12 +991,16 @@ int main(int argc, char** argv) {
                     vs.show_help = 0;
                 }
             }
-            else if (CheckCollisionPointRec(mouse, (Rectangle){575,61,82,22})) apply_simulation_hz(&vs, &playback_clock, next_simulation_hz(vs.simulation_hz, -1));
-            else if (CheckCollisionPointRec(mouse, (Rectangle){665,61,82,22})) apply_simulation_hz(&vs, &playback_clock, next_simulation_hz(vs.simulation_hz, 1));
-            else if (CheckCollisionPointRec(mouse, (Rectangle){755,61,82,22})) apply_render_fps(&vs, next_render_fps(vs.target_fps, -1));
-            else if (CheckCollisionPointRec(mouse, (Rectangle){845,61,82,22})) apply_render_fps(&vs, next_render_fps(vs.target_fps, 1));
-            else if (CheckCollisionPointRec(mouse, (Rectangle){935,61,82,22})) { fps_editing = 1; fps_entry_len = 0; fps_entry[0] = '\0'; }
+            else if (CheckCollisionPointRec(mouse, runtime_button_rect(&vs, 0))) apply_simulation_hz(&vs, &playback_clock, next_simulation_hz(vs.simulation_hz, -1));
+            else if (CheckCollisionPointRec(mouse, runtime_button_rect(&vs, 1))) apply_simulation_hz(&vs, &playback_clock, next_simulation_hz(vs.simulation_hz, 1));
+            else if (CheckCollisionPointRec(mouse, runtime_button_rect(&vs, 2))) apply_render_fps(&vs, next_render_fps(vs.target_fps, -1));
+            else if (CheckCollisionPointRec(mouse, runtime_button_rect(&vs, 3))) apply_render_fps(&vs, next_render_fps(vs.target_fps, 1));
+            else if (CheckCollisionPointRec(mouse, runtime_button_rect(&vs, 4))) { fps_editing = 1; fps_entry_len = 0; fps_entry[0] = '\0'; }
             else if (vs.show_help && CheckCollisionPointRec(mouse, (Rectangle){910,646,126,28})) vs.show_help = 0;
+            else if (vs.view_mode == VIEW_COMPARE) {
+                int selected = comparison_session_at(&vs, (int)mouse.x, (int)mouse.y, SCREEN_W, SCREEN_H);
+                if (selected >= 0) vs.active_session = selected;
+            }
         }
         if (IsKeyPressed(KEY_H)) vs.show_help = !vs.show_help;
         if (IsKeyPressed(KEY_M)) vs.show_matchup = !vs.show_matchup;
@@ -994,7 +1115,7 @@ int main(int argc, char** argv) {
                 ? (smoke_active && smoke_active->current_step >= 3)
                 : (strcmp(smoke_view, "history") != 0 ||
                    (vs.view_mode == VIEW_HISTORY && vs.history_replay && vs.history_replay->frame_count > 0));
-            if (ready && ++smoke_ready_frames >= 3) {
+            if (ready && ++smoke_ready_frames >= 8) {
                 TakeScreenshot(smoke_screenshot);
                 should_exit = 1;
             }

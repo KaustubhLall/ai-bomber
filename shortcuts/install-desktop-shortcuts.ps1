@@ -7,7 +7,7 @@ $shell = New-Object -ComObject WScript.Shell
 $items = @(
     @{ Name='AI Bomber - MCTS'; Args='--agent mcts --enemy heuristic --agents 2 --fps 1 --render-fps 60 --start-paused' },
     @{ Name='AI Bomber - Alpha Beta'; Args='--agent alpha-beta --enemy heuristic --agents 2 --fps 1 --render-fps 60 --start-paused' },
-    @{ Name='AI Bomber - Policy Comparison'; Args='--agent mcts --agent heuristic --agent greedy --agent alpha-beta --agent random --enemy heuristic --fps 1 --render-fps 60' },
+    @{ Name='AI Bomber - Policy Comparison'; Args='--view compare --matchup mcts:heuristic --matchup heuristic:mcts --matchup mcts:greedy --matchup greedy:mcts --matchup mcts:alpha-beta --matchup alpha-beta:mcts --epochs 20 --fps 3 --render-fps 60' },
     @{ Name='AI Bomber - Live Policy Arena'; Args='--matchup --fps 1 --render-fps 60 --start-paused' },
     @{ Name='AI Bomber - Match History'; Args='--history --fps 1 --render-fps 60 --start-paused' }
     @{ Name='AI Bomber - MCTS Causal Win'; Args='--replay "results\mcts-safe-greedy-win.bin" --fps 3 --render-fps 60' }

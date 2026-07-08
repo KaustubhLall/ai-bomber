@@ -12,6 +12,11 @@ The visualizer is built with raylib and provides a portfolio-quality dashboard f
 
 # Replay mode
 ./build/bomber_viz --replay replay.bin
+
+# Independent simultaneous matchups in View 2 (repeat up to eight)
+./build/bomber_viz --view compare \
+  --matchup mcts:heuristic --matchup heuristic:mcts \
+  --matchup mcts:greedy --matchup greedy:mcts --epochs 20
 ```
 
 ## Controls
@@ -26,6 +31,8 @@ The visualizer is built with raylib and provides a portfolio-quality dashboard f
 | F5 / F6 or Render buttons | Change only the window render FPS |
 | F7 or Set Game | Enter exact simulation steps per second (1-60) |
 | M | Open live policy-vs-policy arena picker |
+| 2 | Open the simultaneous matchup board |
+| Click a View 2 game | Select it; press 1 for full-size inspection |
 | 5 | Open persistent match history and replay |
 | H | Toggle help and powerup guide |
 | S | Single step (when paused) |
@@ -35,6 +42,19 @@ Simulation speed is a real-time game clock, independent of rendering. At 1 step/
 the state advances once per wall-clock second whether the window renders at 15,
 60, or 240 FPS. Match history controls are PageUp/PageDown (match), Left/Right
 (frame), Home (restart), and Space (play/pause).
+
+## Simultaneous matchup board
+
+View 2 renders one to eight independent live games in an adaptive grid. Each
+card owns its blue and red policy, replay, reward, seed, epoch, step, and
+outcome. Reversing a pair (for example `mcts:heuristic` and
+`heuristic:mcts`) gives a role-balanced visual comparison on the same seed.
+All cards advance from the same game clock but maintain independent state.
+
+With no explicit `--agent` or `--matchup`, the visualizer creates a six-game
+board for 20 epochs. The Policy Comparison desktop shortcut opens this board
+directly. Legacy repeated `--agent` arguments still work and use the shared
+`--enemy` policy.
 
 ## Dashboard layout
 

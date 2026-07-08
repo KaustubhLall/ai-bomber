@@ -828,7 +828,7 @@ void renderer_draw_view_controls(const VizSession* vs, int ox, int oy, int w, in
     int y = oy + 24;
     DrawText("[SPACE] Pause/Resume", ox + 8, y, 11, WHITE); y += 14;
     DrawText("[TAB] Switch agent", ox + 8, y, 11, WHITE); y += 14;
-    DrawText("[1/2/3] Arena/Graphs/Compare", ox + 8, y, 11, WHITE); y += 14;
+    DrawText("[1/2/3] Arena/Compare/Graphs", ox + 8, y, 11, WHITE); y += 14;
     DrawText("[+/-] Speed", ox + 8, y, 11, WHITE); y += 14;
     DrawText("[S] Step (when paused)", ox + 8, y, 11, WHITE); y += 14;
     DrawText("[A] Toggle auto-advance", ox + 8, y, 11, WHITE); y += 14;
@@ -843,7 +843,7 @@ void renderer_draw_view_controls(const VizSession* vs, int ox, int oy, int w, in
              vs->paused ? "PAUSED" : "RUNNING");
     DrawText(buf, ox + 8, y, 11, vs->paused ? YELLOW : GREEN); y += 14;
 
-    const char* view_names[] = {"Arena", "Graphs", "Comparison"};
+    const char* view_names[] = {"Arena", "Comparison", "Graphs", "Debug", "History"};
     snprintf(buf, sizeof(buf), "View: %s", view_names[vs->view_mode]);
     DrawText(buf, ox + 8, y, 11, (Color){100, 200, 255, 255}); y += 14;
 

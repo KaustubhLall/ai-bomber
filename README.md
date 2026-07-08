@@ -98,8 +98,13 @@ These framework-free reference pipelines provide reproducible policy/value, repl
 ## Run visualizer
 
 ```bash
-# Default: compare random, heuristic, and greedy agents across epochs.
-./build/bomber_viz --seed 1337 --epochs 500
+# Default: six simultaneous role-balanced matchups; press 2 for the board.
+./build/bomber_viz --seed 1337
+
+# Start directly in View 2 with any independent matchup slate (up to eight).
+./build/bomber_viz --view compare \
+  --matchup mcts:heuristic --matchup heuristic:mcts \
+  --matchup mcts:greedy --matchup greedy:mcts --epochs 20
 
 # Specific agents, repeating --agent for each policy.
 ./build/bomber_viz --agent random --agent scripted --agent heuristic --agent greedy
@@ -117,15 +122,17 @@ policy-comparison, live-policy-arena, match-history, and causal-win replay
 shortcuts on the Desktop.
 
 Visualizer matchup configuration mirrors the headless runner: `--agent` selects
-agent 0, `--enemy` selects the opponent policy, `--agents` sets the total arena
-agent count, and `--seed` controls deterministic setup. With three or more agents,
-the selected opponent policy is shared by enemies 1..N. Omitting `--enemy` is
-shown explicitly as `Opponent Policy: built-in-random`.
+agent 0, `--enemy` selects its shared opponent, `--agents` sets the total arena
+agent count, and `--seed` controls deterministic setup. For View 2, repeat
+`--matchup blue:red` to create up to eight independent simultaneous games and
+use `--view compare` to open the board directly. Reversing a pair creates a
+role-balanced comparison. Omitting `--enemy` is shown explicitly as
+`Opponent Policy: built-in-random`.
 
 ### Visualizer views
 
 - **Arena View (1)**: redesigned dashboard with large centered arena, top status bar, right inspector panel (decision trace, agent/enemy stats, active bombs), bottom event timeline, and optional legend
-- **Compare View (2)**: side-by-side mini arenas for all configured agents with a shared training overview panel
+- **Compare View (2)**: adaptive 1-8 game board for independent policy pairs, with live seed/step/outcome/reward and a shared matchup overview; click a game and press **1** to inspect it full-size
 - **Graphs View (3)**: per-epoch reward, running average reward, action distribution, and training overview table for all agents
 - **Debug View (4)**: detailed technical view with raw local observation, danger map, and event log
 - **Match History (5)**: persistent recorded matches with seed, policies, outcome, causal eliminations, state hash, and frame-by-frame replay
@@ -159,7 +166,11 @@ shown explicitly as `Opponent Policy: built-in-random`.
 
 With the default configuration, a destroyed crate has a 30% chance to reveal one of the three powerups.
 
-The default visualizer now runs only MCTS against the heuristic opponent for one match and then pauses. Use the Live Policy Arena shortcut to choose any two built-in policies, the Match History shortcut to inspect recorded games, the Policy Comparison shortcut for five simultaneous policy sessions, `--epochs N` for repeated matches, or `--enemy builtin-random` for the old non-adversarial fallback. Battle matches terminate after 200 steps instead of running indefinitely.
+The default visualizer creates six simultaneous role-balanced matchups for 20
+epochs; press **2** to see the board. Use the Live Policy Arena shortcut for a
+single configurable match, Match History for recorded games, or Policy
+Comparison to open the six-game board immediately. Battle matches terminate
+after 200 steps instead of running indefinitely.
 
 ### Screenshots
 
