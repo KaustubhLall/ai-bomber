@@ -184,6 +184,13 @@ StepResult env_step_joint(BomberEnv* env, const Action* actions, int action_coun
         (void)rules_pickup_powerup(state, a);
 
     tick_bombs(state, &env->rng, cfg->powerup_rate);
+    /* Sudden death closes the arena inward once the clock passes the threshold, forcing a
+       decisive result rather than a stalled timeout draw. */
+    map_apply_sudden_death(state, cfg->sudden_death_start, cfg->shrink_interval);
+    /* Detonations only lay flame; a single post-move pass applies lethal damage so the
+       fire kills across its whole lifetime (canonical area denial), then it ages one tick. */
+    apply_flame_damage(state);
+    decay_flame(state);
 
     danger_compute(&env->danger, state);
     danger_compute_escape(&env->danger, state, 0);

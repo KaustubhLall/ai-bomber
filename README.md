@@ -13,11 +13,14 @@ The project is built around a small fixed-size simulator that can run without a 
 - A raylib visualizer for inspecting reward, danger, bombs, local observations, and agent behavior
 - CTest coverage for core environment rules, determinism, replay, rewards, agents, metrics, and hardened invariants
 - Cloneable joint-action search API, alpha-beta and MCTS planning baselines
-- Fixed-seed tournament matrices plus NumPy AlphaZero-lite and PPO comparison pipelines
+- Fixed-seed tournament matrices, NumPy references, and a native C++/LibTorch full-simulator AlphaZero trainer
 
 ## Current status
 
-The current implementation is a local research sandbox, not a trained neural agent. It includes rule-based baselines and a stable C interface so model training can be added without rewriting the simulator. The most useful next step is to connect the observation/action API to a training process and compare learned policies against the included baselines.
+The current implementation is a local research sandbox with rule-based baselines,
+a verified full-simulator neural checkpoint, and an opt-in native C++/LibTorch
+training path. The stronger native-MCTS baseline remains an explicit open
+boundary rather than a solved strength claim.
 
 ## Build
 
@@ -94,6 +97,45 @@ python tools/plot_results.py results/ppo.json results/ppo.svg
 ```
 
 These framework-free reference pipelines provide reproducible policy/value, replay-target, rollout/advantage, clipped-update, entropy, checkpoint, and fixed-holdout evaluation paths. Their compact shaped-reward arena is intentionally easier than the full C simulator; see [experiment protocol](docs/EXPERIMENTS.md) before making comparative claims.
+
+## Full-simulator AlphaZero self-play
+
+For high-throughput runs, build the opt-in native trainer and keep the full hot
+path in C/C++:
+
+```powershell
+cmake -S . -B build-native-gpu -G "Visual Studio 18 2026" -A x64 `
+  -DAI_BOMBER_BUILD_VIZ=OFF -DAI_BOMBER_BUILD_TESTS=ON `
+  -DAI_BOMBER_BUILD_NATIVE_ALPHAZERO=ON
+cmake --build build-native-gpu --config Release -j 12
+.\tools\run_native_alphazero.ps1 benchmark
+.\tools\run_native_alphazero.ps1 train `
+  --run-dir results\alphazero-native-main --iterations 1000
+```
+
+See the [native build, benchmark, recovery, and long-run guide](docs/NATIVE_ALPHAZERO.md)
+and the [cross-game grokking protocol](docs/SELF_PLAY_GROKKING_PLAYBOOK.md).
+
+The dependency-light NumPy reference remains available:
+
+```powershell
+cmake --build build-codex-vs --config Release --target bomber_training
+python tools/train_alphazero.py `
+  --library build-codex-vs/src/Release/bomber_training.dll `
+  --run-dir results/alphazero-main --iterations 100
+```
+
+This path runs PUCT-guided self-play against the real C environment. It saves
+atomic, auto-resumable checkpoints containing model/optimizer/RNG/replay state,
+keeps periodic and best snapshots, appends durable JSONL metrics, and displays
+progress, throughput, elapsed time, and ETA. See the
+[full training and recovery guide](docs/ALPHAZERO_TRAINING.md).
+
+The selected native iteration-70 checkpoint completed an untouched,
+role-balanced holdout at 128-0-0 against random, 41-87-0 against the native
+heuristic, and 2-14-0 against native MCTS. The full trajectory supports noisy
+ordinary learning, not a grokking claim. See the
+[verified result and MCTS boundary](docs/ALPHAZERO_RESULTS.md).
 
 ## Run visualizer
 
@@ -217,6 +259,11 @@ assets/       optional configs, sprites, and fonts
 - [Visualizer](docs/VISUALIZER.md)
 - [Adding Agents](docs/ADDING_AGENTS.md)
 - [Future Model Integration](docs/FUTURE_MODELS.md)
+- [Full-simulator AlphaZero Training](docs/ALPHAZERO_TRAINING.md)
+- [Native C++/LibTorch AlphaZero](docs/NATIVE_ALPHAZERO.md)
+- [Statistically gated superhuman AlphaZero ladder](docs/SUPERHUMAN_ALPHAZERO.md)
+- [Reusable Self-Play and Grokking Playbook](docs/SELF_PLAY_GROKKING_PLAYBOOK.md)
+- [AlphaZero Verified Results](docs/ALPHAZERO_RESULTS.md)
 
 ## Roadmap
 

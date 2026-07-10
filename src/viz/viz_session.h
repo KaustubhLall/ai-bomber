@@ -87,6 +87,12 @@ typedef struct {
     int matchup_map_preset; /* 0=open, 1=standard, 2=dense */
     int matchup_matches;
     int show_matchup;
+    /* Sudden-death dynamics applied to every live match this session starts (picker
+       "Start Match" and CLI-launched sessions alike), so the Live Arena/Compare views
+       match the training regime by default instead of the sim's neutral disabled default.
+       Set once from CLI flags (or the defaults in viz_session_init); 0 start disables. */
+    int sudden_death_start;
+    int shrink_interval;
 } VizSession;
 
 void viz_session_init(VizSession* vs, int max_epochs, uint64_t base_seed);
@@ -97,6 +103,9 @@ void viz_session_step(VizSession* vs);
 void viz_session_reset_epoch(VizSession* vs, int session_idx);
 void viz_session_reset_all(VizSession* vs);
 void viz_session_switch_agent(VizSession* vs, int idx);
+/* Switch views AND dismiss the matchup picker overlay if it's open — otherwise the modal
+   (drawn on top regardless of view_mode) hides the view change and pressing 1-5 looks
+   like it does nothing. */
 void viz_session_switch_view(VizSession* vs, ViewMode mode);
 
 /* Get the active session's current state for rendering */

@@ -11,7 +11,11 @@ void theme_init(void) {
     /* Text colors */
     g_theme.colors.text_primary = (Color){230, 230, 235, 255};
     g_theme.colors.text_secondary = (Color){160, 165, 175, 255};
-    g_theme.colors.text_dim = (Color){100, 105, 115, 255};
+    /* ~3.0-3.5:1 contrast against background/panel at (100,105,115) fails WCAG AA's 4.5:1 for
+       normal text, yet this color is used for real informational text (event log, "no active
+       bombs", decision trace) at 11-15px — small text needs MORE contrast, not less. Lightened
+       to keep a dimmer feel than text_secondary while staying legible on the dark panels. */
+    g_theme.colors.text_dim = (Color){140, 145, 155, 255};
     
     /* Status colors */
     g_theme.colors.positive = (Color){80, 200, 120, 255};

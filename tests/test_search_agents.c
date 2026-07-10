@@ -1,4 +1,5 @@
 #include "agents/agent.h"
+#include "agents/search_agent.h"
 #include "sim/evaluator.h"
 #include <assert.h>
 #include <stdio.h>
@@ -51,6 +52,9 @@ int main(void) {
     action = agent_act(&agent, &observation, &debug);
     assert(action >= 0 && action < ACTION_COUNT && agent.diagnostics.simulations == 96);
     assert(agent.diagnostics.depth == 12 && agent.diagnostics.nodes > 1);
+    assert(mcts_agent_configure(&agent, 24, 8));
+    action = agent_act(&agent, &observation, &debug);
+    assert(agent.diagnostics.simulations == 24 && agent.diagnostics.depth == 8);
 
     /* Search agents acting as enemy 1 must choose from enemy 1's legal actions. */
     env_observe(&env, 1, &observation);

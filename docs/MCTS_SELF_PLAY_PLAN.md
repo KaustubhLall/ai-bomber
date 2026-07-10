@@ -32,10 +32,11 @@ to search.
 1. Establish fixed random and heuristic baselines, including heuristic versus
    heuristic and heuristic versus random.
 2. Add MCTS as a teacher and evaluation baseline.
-3. Later, train a lightweight policy/value model from generated experience.
+3. Train the lightweight policy/value model from generated full-simulator experience via `tools/train_alphazero.py`.
 4. Maintain a checkpoint league rather than evaluating only the newest policy.
 5. Evaluate every checkpoint against fixed baselines and held-out seeds.
 
-This project does not currently contain neural training. A run is only self-play
-when both sides are explicitly controlled by policies; the built-in random enemy
-fallback is not self-play.
+The project now contains both a compact AlphaZero-lite reference and a
+full-simulator AlphaZero-style trainer. A run is only self-play when both sides
+are explicitly controlled by policies; the built-in random enemy fallback is
+not self-play.

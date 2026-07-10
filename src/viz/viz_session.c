@@ -27,6 +27,11 @@ void viz_session_init(VizSession* vs, int max_epochs, uint64_t base_seed) {
     vs->matchup_seed = base_seed;
     vs->matchup_map_preset = 1;
     vs->matchup_matches = 1;
+    /* Match the training regime by default (config_battle's own default is disabled) so a
+       live demo game plays out the same dynamics the champion was actually trained under —
+       matches main_headless.c's own MCTS self-play example. Overridable via CLI flags. */
+    vs->sudden_death_start = 120;
+    vs->shrink_interval = 4;
     (void)match_history_init(&vs->history, "history");
 }
 
@@ -110,6 +115,7 @@ void viz_session_switch_agent(VizSession* vs, int idx) {
 
 void viz_session_switch_view(VizSession* vs, ViewMode mode) {
     vs->view_mode = mode;
+    vs->show_matchup = 0;
 }
 
 AgentSession* viz_session_active(VizSession* vs) {
@@ -273,6 +279,9 @@ int viz_session_start_match(VizSession* vs, AgentType blue, AgentType red, uint6
     if (preset < 0) preset = 0;
     if (preset > 2) preset = 2;
     config.crate_density = densities[preset];
+    config.sudden_death_start = vs->sudden_death_start;
+    config.shrink_interval = vs->shrink_interval;
+    config_normalize(&config);
     return viz_session_add_agent(vs, blue, agent_type_name(blue), red, agent_type_name(red), 1, &config) >= 0;
 }
 

@@ -44,16 +44,15 @@ int main(void) {
         }
     }
 
-    /* Every classic corner spawn has an L-shaped three-tile safe pocket. */
+    /* Two-player battle spawns in diagonally opposite corners (top-left / bottom-right);
+       each has an L-shaped three-tile safe pocket. (config_survival is a 2-agent game.) */
     int max_x = env.state.width - 2;
     int max_y = env.state.height - 2;
-    int safe_tiles[12][2] = {
+    int safe_tiles[6][2] = {
         {1, 1}, {2, 1}, {1, 2},
-        {max_x, 1}, {max_x - 1, 1}, {max_x, 2},
-        {1, max_y}, {2, max_y}, {1, max_y - 1},
         {max_x, max_y}, {max_x - 1, max_y}, {max_x, max_y - 1}
     };
-    for (int i = 0; i < 12; i++) {
+    for (int i = 0; i < 6; i++) {
         assert(env.state.tiles[safe_tiles[i][1]][safe_tiles[i][0]] == TILE_FLOOR);
     }
 
@@ -61,7 +60,7 @@ int main(void) {
     cfg.crate_density = 100;
     env.config = cfg;
     env_reset(&env, 100);
-    for (int i = 0; i < 12; i++) {
+    for (int i = 0; i < 6; i++) {
         assert(env.state.tiles[safe_tiles[i][1]][safe_tiles[i][0]] == TILE_FLOOR);
     }
 
@@ -80,6 +79,31 @@ int main(void) {
         for (int b = a + 1; b < MAX_AGENTS; b++)
             assert(env.state.agents[a].x != env.state.agents[b].x ||
                    env.state.agents[a].y != env.state.agents[b].y);
+    }
+
+    /* Sudden death closes the arena inward and crushes agents caught on new walls. */
+    {
+        BomberConfig scfg;
+        config_battle(&scfg);
+        scfg.seed = 5;
+        scfg.crate_density = 0;
+        scfg.sudden_death_start = 10;
+        scfg.shrink_interval = 1;
+        BomberEnv senv;
+        env_init(&senv, &scfg);
+        senv.state.agents[0].x = 1; senv.state.agents[0].y = 2; senv.state.agents[0].alive = 1;
+        senv.state.tiles[2][1] = TILE_FLOOR; /* border-adjacent interior tile, border-distance 1 */
+        /* Before the threshold nothing closes. */
+        senv.state.step = 5;
+        map_apply_sudden_death(&senv.state, scfg.sudden_death_start, scfg.shrink_interval);
+        assert(senv.state.tiles[2][1] == TILE_FLOOR);
+        assert(senv.state.agents[0].alive == 1);
+        /* At the threshold, ring 1 (border-distance 1) walls in and crushes the agent. */
+        senv.state.step = 10;
+        map_apply_sudden_death(&senv.state, scfg.sudden_death_start, scfg.shrink_interval);
+        assert(senv.state.tiles[2][1] == TILE_SOLID_WALL);
+        assert(senv.state.agents[0].alive == 0);
+        assert(senv.state.death_owner[0] == -1);
     }
 
     printf("test_map: ALL PASSED\n");

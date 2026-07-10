@@ -80,6 +80,7 @@ int main(void) {
     env.state.bombs[0].owner_id = 0; env.state.bombs[0].timer = 1;
     env.state.bombs[0].range = 2; env.state.bombs[0].active = 1;
     explode_bomb(&env.state, 0, &env.rng, 0.0f);
+    apply_flame_damage(&env.state); /* detonation lays flame; the flame pass applies the kill */
     assert(env.state.agents[0].eliminations == 1);
 
     /* Agent dies in blast */
@@ -93,12 +94,38 @@ int main(void) {
     env.state.bombs[0].range = 2; env.state.bombs[0].active = 1;
 
     explode_bomb(&env.state, 0, &env.rng, cfg.powerup_rate);
+    apply_flame_damage(&env.state);
     assert(env.state.agents[0].alive == 0);
     assert(env.state.death_owner[0] == 0);
     Metrics metrics;
     metrics_init(&metrics);
     metrics_record_elimination_causes(&metrics, &env.state);
     assert(metrics.self_kills == 1 && metrics.opponent_kills == 0);
+
+    /* Persistent flame: fire lingers for flame_duration ticks and kills an agent who
+       enters a still-burning tile later (canonical area denial), then decays to nothing. */
+    {
+        BomberConfig fcfg;
+        config_survival(&fcfg);
+        fcfg.seed = 7;
+        fcfg.crate_density = 0;
+        fcfg.flame_duration = 3;
+        BomberEnv fenv;
+        env_init(&fenv, &fcfg);
+        fenv.state.bombs[0].x = 5; fenv.state.bombs[0].y = 5;
+        fenv.state.bombs[0].owner_id = 0; fenv.state.bombs[0].timer = 1;
+        fenv.state.bombs[0].range = 2; fenv.state.bombs[0].active = 1;
+        explode_bomb(&fenv.state, 0, &fenv.rng, 0.0f);
+        assert(fenv.state.flame_ttl[5][5] == 3);       /* laid for the full duration */
+        /* An agent that steps onto the lingering flame afterward still dies. */
+        fenv.state.agents[1].x = 5; fenv.state.agents[1].y = 5; fenv.state.agents[1].alive = 1;
+        apply_flame_damage(&fenv.state);
+        assert(fenv.state.agents[1].alive == 0);
+        assert(fenv.state.death_owner[1] == 0);
+        decay_flame(&fenv.state); assert(fenv.state.flame_ttl[5][5] == 2);
+        decay_flame(&fenv.state); assert(fenv.state.flame_ttl[5][5] == 1);
+        decay_flame(&fenv.state); assert(fenv.state.flame_ttl[5][5] == 0);
+    }
 
     printf("test_blast: ALL PASSED\n");
     return 0;

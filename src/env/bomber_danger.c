@@ -44,6 +44,18 @@ void danger_compute(DangerMap* dm, const BomberState* state) {
             dm->safe_now[by][bx] = 0;
         }
     }
+
+    /* Persistent flame currently burning is lethal right now. This also revives the
+       previously-dead current_blast channel (fed to observation channel 8). */
+    for (int y = 0; y < state->height; y++) {
+        for (int x = 0; x < state->width; x++) {
+            if (state->flame_ttl[y][x] > 0) {
+                dm->current_blast[y][x] = 1;
+                dm->safe_now[y][x] = 0;
+                if (dm->time_to_blast[y][x] < 0) dm->time_to_blast[y][x] = 0;
+            }
+        }
+    }
 }
 
 void danger_compute_escape(DangerMap* dm, const BomberState* state, int agent_id) {

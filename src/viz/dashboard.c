@@ -139,9 +139,15 @@ void dashboard_draw(DashboardState* ds, const DebugSnapshot* snap, const Observa
     renderer_draw_action_dist(ds->action_counts, ds->total_actions,
                               right_ox, 150, right_w, 130);
     renderer_draw_bomb_timeline(snap, right_ox, 290, right_w);
-    renderer_draw_decision_trace(snap->decision_text, right_ox, 420, right_w, 60);
-    renderer_draw_event_log((const char**)ds->events, ds->event_count,
-                            right_ox, 490, right_w, 130);
+    renderer_draw_decision_trace(snap->decision_text[0] ? snap->decision_text
+                                                          : "No decision trace emitted by this policy.",
+                                 right_ox, 420, right_w, 60);
+    /* ds->events is char[MAX_EVENTS][MAX_EVENT_LEN] (a 2D array); renderer_draw_event_log wants
+       const char**. A raw (const char**) cast here would reinterpret the first row's BYTES as
+       pointer values and crash on the first dereference — build the pointer array instead. */
+    const char* event_ptrs[MAX_EVENTS];
+    for (int i = 0; i < ds->event_count; i++) event_ptrs[i] = ds->events[i];
+    renderer_draw_event_log(event_ptrs, ds->event_count, right_ox, 490, right_w, 130);
     renderer_draw_controls(right_ox, 630, right_w, 120, paused, speed_mult);
 
     /* Central arena */

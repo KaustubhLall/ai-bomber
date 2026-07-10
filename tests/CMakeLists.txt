@@ -44,6 +44,10 @@ add_executable(test_replay test_replay.c)
 target_link_libraries(test_replay PRIVATE bomber_core)
 add_test(NAME test_replay COMMAND test_replay)
 
+add_executable(test_replay_flame test_replay_flame.c)
+target_link_libraries(test_replay_flame PRIVATE bomber_core)
+add_test(NAME test_replay_flame COMMAND test_replay_flame)
+
 add_executable(test_agents test_agents.c)
 target_link_libraries(test_agents PRIVATE bomber_core)
 add_test(NAME test_agents COMMAND test_agents)
@@ -69,6 +73,13 @@ find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
   add_test(NAME test_learning COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_learning.py)
   set_tests_properties(test_learning PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  add_test(NAME test_alphazero COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_alphazero.py)
+  set_tests_properties(test_alphazero PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    ENVIRONMENT "AI_BOMBER_TRAINING_LIB=$<TARGET_FILE:bomber_training>")
+  add_test(NAME test_native_run_analysis
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_native_run_analysis.py)
+  set_tests_properties(test_native_run_analysis PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
 
 add_executable(test_playback_clock test_playback_clock.c)
@@ -77,3 +88,52 @@ add_test(NAME test_playback_clock COMMAND test_playback_clock)
 add_executable(test_match_history test_match_history.c)
 target_link_libraries(test_match_history PRIVATE bomber_core)
 add_test(NAME test_match_history COMMAND test_match_history)
+
+add_executable(test_training_api test_training_api.c)
+target_link_libraries(test_training_api PRIVATE bomber_training)
+if(WIN32)
+  add_custom_command(TARGET test_training_api POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:bomber_training> $<TARGET_FILE_DIR:test_training_api>)
+endif()
+add_test(NAME test_training_api COMMAND test_training_api)
+
+if(TARGET bomber_alphazero_native)
+  add_test(NAME test_native_alphazero_smoke
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-smoke
+      --fresh --iterations 1 --games 2 --simulations 2
+      --train-steps 1 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 1 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress)
+  set_tests_properties(test_native_alphazero_smoke PROPERTIES TIMEOUT 60)
+  add_test(NAME test_native_alphazero_resume
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-smoke
+      --iterations 2 --games 2 --simulations 2
+      --train-steps 1 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 1 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress)
+  set_tests_properties(test_native_alphazero_resume PROPERTIES
+    DEPENDS test_native_alphazero_smoke TIMEOUT 60)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME test_native_alphazero_gate
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_alphazero_gate.py
+        ${CMAKE_BINARY_DIR}/native-alphazero-smoke)
+    set_tests_properties(test_native_alphazero_gate PROPERTIES
+      DEPENDS test_native_alphazero_resume TIMEOUT 20)
+  endif()
+endif()

@@ -1,6 +1,7 @@
 #include "viz/renderer.h"
 #include "viz/theme.h"
 #include "env/bomber_map.h"
+#include "env/bomber_blast.h"
 #include "core/math_util.h"
 #include <stdio.h>
 #include <string.h>
@@ -138,6 +139,15 @@ void renderer_draw_arena(const DebugSnapshot* snap, int ox, int oy, int tile_siz
     const BomberState* state = &snap->state;
     const DangerMap* dm = &snap->danger;
     const ThemeColors* tc = theme_colors();
+    /* Sudden death converts wall tiles in-place (same TILE_SOLID_WALL as pre-placed maze
+       walls), so without this the closing arena was visually indistinguishable from normal
+       walls — "the arena doesn't shrink" was as much a rendering gap as a config gap. No new
+       state needed: replicate map_apply_sudden_death's own ring formula (bomber_map.c) purely
+       from config + current step to know which interior ring is currently closed. */
+    int sd_start = snap->config.sudden_death_start;
+    int sd_interval = snap->config.shrink_interval > 0 ? snap->config.shrink_interval : 4;
+    int sd_active = sd_start > 0 && state->step >= sd_start;
+    int sd_rings = sd_active ? (state->step - sd_start) / sd_interval + 1 : 0;
     /* Floor first: a quiet checkerboard gives the arena shape without noise. */
     for (int y = 0; y < state->height; y++) {
         for (int x = 0; x < state->width; x++) {
@@ -159,9 +169,22 @@ void renderer_draw_arena(const DebugSnapshot* snap, int ox, int oy, int tile_siz
                 case TILE_POWERUP_SPEED: tile_c = (Color){80, 180, 255, 255}; break;
                 default:                 tile_c = BLACK; break;
             }
-            if (state->tiles[y][x] == TILE_CRATE || state->tiles[y][x] == TILE_SOLID_WALL)
-                draw_block_sprite(state->tiles[y][x], px, py, tile_size, tile_c);
-            else if (state->tiles[y][x] >= TILE_POWERUP_BOMB)
+            if (state->tiles[y][x] == TILE_CRATE || state->tiles[y][x] == TILE_SOLID_WALL) {
+                int in_shrink_zone = sd_active && state->tiles[y][x] == TILE_SOLID_WALL &&
+                    x >= 1 && y >= 1 && x <= state->width - 2 && y <= state->height - 2;
+                if (in_shrink_zone) {
+                    int bd = x; if (y < bd) bd = y;
+                    if (state->width - 1 - x < bd) bd = state->width - 1 - x;
+                    if (state->height - 1 - y < bd) bd = state->height - 1 - y;
+                    in_shrink_zone = bd <= sd_rings;
+                }
+                if (in_shrink_zone) {
+                    draw_block_sprite(state->tiles[y][x], px, py, tile_size, (Color){140, 40, 40, 255});
+                    DrawRectangleLines(px, py, tile_size, tile_size, (Color){255, 90, 60, 200});
+                } else {
+                    draw_block_sprite(state->tiles[y][x], px, py, tile_size, tile_c);
+                }
+            } else if (state->tiles[y][x] >= TILE_POWERUP_BOMB)
                 draw_powerup_sprite(state->tiles[y][x], px, py, tile_size);
 
             if (s_show_grid) DrawRectangleLines(px, py, tile_size, tile_size, tc->grid);
@@ -176,6 +199,47 @@ void renderer_draw_arena(const DebugSnapshot* snap, int ox, int oy, int tile_siz
             /* Draw safe tile overlay */
             if (s_show_danger && dm->reachable_safe[y][x] && tblast < 0) {
                 DrawCircle(px + tile_size / 2, py + tile_size / 2, 2.0f, tc->safe_reachable);
+            }
+        }
+    }
+
+    /* Blast-range preview: faint outline of every tile an active bomb will hit, so a
+       viewer can see the danger the agents are reacting to (and why a move was fatal). */
+    for (int i = 0; i < MAX_BOMBS; i++) {
+        if (!state->bombs[i].active) continue;
+        BlastResult preview;
+        compute_blast_tiles(state, state->bombs[i].x, state->bombs[i].y,
+                            state->bombs[i].range, &preview);
+        int soon = state->bombs[i].timer <= 1;
+        Color pv = soon ? (Color){255, 120, 40, 70} : (Color){255, 180, 60, 40};
+        for (int t = 0; t < preview.count; t++) {
+            int px = ox + preview.tiles[t].x * tile_size;
+            int py = oy + preview.tiles[t].y * tile_size;
+            DrawRectangle(px, py, tile_size, tile_size, pv);
+            DrawRectangleLines(px, py, tile_size, tile_size, (Color){pv.r, pv.g, pv.b, 90});
+        }
+    }
+
+    /* Persistent flame: lethal fire that lingers `flame_duration` ticks and fades as its
+       time-to-live decays. This is the canonical area-denial the sim now models; without
+       this pass the visualizer showed nothing where bombs had just exploded. */
+    {
+        int maxttl = state->flame_duration > 0 ? state->flame_duration : 1;
+        for (int y = 0; y < state->height; y++) {
+            for (int x = 0; x < state->width; x++) {
+                int ttl = state->flame_ttl[y][x];
+                if (ttl <= 0) continue;
+                int px = ox + x * tile_size;
+                int py = oy + y * tile_size;
+                float f = (float)ttl / (float)maxttl;               /* 1 = fresh, →0 = fading */
+                unsigned char a_out = (unsigned char)(110 + 120 * f);
+                unsigned char a_in  = (unsigned char)(120 + 130 * f);
+                DrawRectangle(px, py, tile_size, tile_size, (Color){255, 120, 24, a_out});
+                int in = tile_size / 5;
+                DrawRectangle(px + in, py + in, tile_size - 2 * in, tile_size - 2 * in,
+                              (Color){255, 196, 70, a_in});
+                DrawRectangle(px + tile_size / 2 - tile_size / 8, py + tile_size / 2 - tile_size / 8,
+                              tile_size / 4, tile_size / 4, (Color){255, 246, 190, a_in});
             }
         }
     }
@@ -206,15 +270,23 @@ void renderer_draw_arena(const DebugSnapshot* snap, int ox, int oy, int tile_siz
         DrawText(timer_str, px - tw / 2, py - 6, 12, WHITE);
     }
 
-    /* Draw agents */
+    /* Draw agents: alive as full sprites, dead as a faded marker at the fall spot so the
+       viewer can see who died where (and, with the flame/blast overlays, why). */
     for (int a = 0; a < state->agent_count; a++) {
-        if (!state->agents[a].alive) continue;
         int px = ox + state->agents[a].x * tile_size;
         int py = oy + state->agents[a].y * tile_size;
         Color body = a == 0 ? tc->agent : tc->enemy;
-        draw_agent_sprite(a, px, py, tile_size, body);
+        if (state->agents[a].alive) {
+            draw_agent_sprite(a, px, py, tile_size, body);
+        } else {
+            int cx = px + tile_size / 2, cy = py + tile_size / 2;
+            int r = tile_size / 3;
+            DrawCircle(cx, cy, r, (Color){body.r, body.g, body.b, 70});
+            DrawCircleLines(cx, cy, r, (Color){body.r, body.g, body.b, 150});
+            DrawLine(cx - r/2, cy - r/2, cx + r/2, cy + r/2, (Color){235, 235, 245, 150});
+            DrawLine(cx + r/2, cy - r/2, cx - r/2, cy + r/2, (Color){235, 235, 245, 150});
+        }
     }
-
 }
 
 void renderer_draw_observation_overlay(const DebugSnapshot* snap, int ox, int oy, int tile_size) {
@@ -434,7 +506,7 @@ void renderer_draw_status_panel(const DebugSnapshot* snap, int ox, int oy, int w
     int y = oy + 24;
     char buf[256];
 
-    snprintf(buf, sizeof(buf), "Step: %d/%d", state->step, 500);
+    snprintf(buf, sizeof(buf), "Step: %d/%d", state->step, snap->config.max_steps);
     DrawText(buf, ox + 8, y, 12, WHITE); y += 16;
 
     snprintf(buf, sizeof(buf), "Reward: %.3f", snap->cumulative_reward);
@@ -676,6 +748,12 @@ void renderer_draw_mini_arena(const DebugSnapshot* snap, int ox, int oy, int cel
             int px = ox + x * cell_size;
             int py = oy + y * cell_size;
             DrawRectangle(px, py, cell_size, cell_size, tile_color(state->tiles[y][x]));
+            if (state->flame_ttl[y][x] > 0) {
+                int maxttl = state->flame_duration > 0 ? state->flame_duration : 1;
+                float f = (float)state->flame_ttl[y][x] / (float)maxttl;
+                DrawRectangle(px, py, cell_size, cell_size,
+                              (Color){255, 150, 40, (unsigned char)(120 + 120 * f)});
+            }
         }
     }
 
@@ -684,7 +762,8 @@ void renderer_draw_mini_arena(const DebugSnapshot* snap, int ox, int oy, int cel
         if (!state->bombs[i].active) continue;
         int px = ox + state->bombs[i].x * cell_size + cell_size / 2;
         int py = oy + state->bombs[i].y * cell_size + cell_size / 2;
-        DrawCircle(px, py, cell_size / 2, (Color){200, 50, 50, 255});
+        DrawCircle(px, py, cell_size / 2, (Color){20, 20, 28, 255});
+        DrawCircleLines(px, py, cell_size / 2, (Color){255, 181, 48, 255});
     }
 
     /* Agents */
@@ -873,7 +952,11 @@ void renderer_draw_legend(int ox, int oy, int w, int h) {
     DrawCircle(x + 6, y + 6, 6, tc->agent);
     DrawText("Agent", x + 16, y, tf->small, tc->text_secondary); y += item_h;
 
+    /* tc->solid_wall (20,25,35) is the identical RGB triple as this panel's own background
+       fill (renderer_draw_legend fills with (20,25,35,220) below), so a flat, borderless
+       swatch here reads as a blank gap next to the label. An outline makes it visible. */
     DrawRectangle(x, y, 12, 12, tc->solid_wall);
+    DrawRectangleLines(x, y, 12, 12, (Color){90, 100, 115, 255});
     DrawText("Solid Wall", x + 16, y, tf->small, tc->text_secondary); y += item_h;
 
     DrawRectangle(x, y, 12, 12, tc->destructible_wall);
@@ -893,6 +976,10 @@ void renderer_draw_legend(int ox, int oy, int w, int h) {
     DrawCircleLines(x + 6, y + 6, 7, (Color){255, 181, 48, 255});
     DrawText("Bomb", x + 16, y, tf->small, tc->text_secondary); y += item_h;
 
+    DrawRectangle(x, y, 12, 12, (Color){255, 150, 40, 230});
+    DrawRectangle(x + 3, y + 3, 6, 6, (Color){255, 210, 110, 255});
+    DrawText("Flame (lethal)", x + 16, y, tf->small, tc->text_secondary); y += item_h;
+
     DrawRectangle(x, y, 12, 12, tc->danger_now);
     DrawText("Danger Now", x + 16, y, tf->small, tc->text_secondary); y += item_h;
 
@@ -901,5 +988,9 @@ void renderer_draw_legend(int ox, int oy, int w, int h) {
 
     DrawRectangle(x, y, 12, 12, tc->observation_border);
     DrawRectangle(x + 2, y + 2, 8, 8, tc->observation_fill);
-    DrawText("Observation", x + 16, y, tf->small, tc->text_secondary);
+    DrawText("Observation", x + 16, y, tf->small, tc->text_secondary); y += item_h;
+
+    DrawRectangle(x, y, 12, 12, (Color){140, 40, 40, 255});
+    DrawRectangleLines(x, y, 12, 12, (Color){255, 90, 60, 200});
+    DrawText("Closing Arena (sudden death)", x + 16, y, tf->small, tc->text_secondary);
 }

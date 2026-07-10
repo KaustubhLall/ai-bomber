@@ -635,3 +635,13 @@ static void init_common(Agent* agent, const char* name, AgentActFn act, int budg
 
 void alphabeta_agent_init(Agent* agent) { init_common(agent, "alpha-beta", alphabeta_act, 0, 2); }
 void mcts_agent_init(Agent* agent) { init_common(agent, "mcts", mcts_act, 96, 12); }
+
+int mcts_agent_configure(Agent* agent, int simulations, int rollout_depth) {
+    if (!agent || agent->type != AGENT_MCTS || !agent->impl ||
+        simulations <= 0 || rollout_depth <= 0 || rollout_depth > UCT_MAX_DEPTH)
+        return 0;
+    SearchImpl* impl = (SearchImpl*)agent->impl;
+    impl->budget = simulations;
+    impl->depth = rollout_depth;
+    return 1;
+}

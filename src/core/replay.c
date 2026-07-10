@@ -5,7 +5,11 @@
 #include <stdlib.h>
 
 #define REPLAY_MAGIC UINT32_C(0x4252504C)
-#define REPLAY_VERSION UINT32_C(3)
+/* v4: BomberState now carries persistent flame (flame_ttl/flame_owner) + sudden-death
+   walls, so a v4 frame renders flames/closing arena correctly. The Replay struct embeds
+   BomberState, so its size changed; older v3 files are binary-incompatible and are cleanly
+   rejected by the version check on load (regenerate replays with the current binary). */
+#define REPLAY_VERSION UINT32_C(4)
 
 void replay_init(Replay* replay, const BomberConfig* config, uint64_t seed) {
     memset(replay, 0, sizeof(Replay));

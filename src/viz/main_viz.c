@@ -23,6 +23,11 @@
 
 #define SCREEN_W 1400
 #define SCREEN_H 860
+/* Help overlay footprint, shared by draw_help_overlay and the close-button click hitbox
+   (previously a hardcoded literal in the click handler drifted 20px from the drawn button —
+   both now derive from these same constants). */
+#define HELP_OVERLAY_W 900
+#define HELP_OVERLAY_H 760
 
 static const char* action_name(Action action) {
     static const char* names[] = {"UP", "DOWN", "LEFT", "RIGHT", "BOMB", "WAIT"};
@@ -122,6 +127,32 @@ static void draw_matchup_overlay(const VizSession* vs) {
     DrawText("M closes | History: key 5", x + 170, y + 545, 14, tc->text_dim);
 }
 
+/* History-view playback transport (Prev/Play-Pause/Next + a click/drag seek bar) and
+   clickable match-list rows, shared between draw_history_view and the mouse-click handler
+   below so hit-testing can never drift from what's drawn (same reasoning as
+   runtime_button_rect - a rect defined in two places eventually disagrees). Must be defined
+   before draw_history_view, which calls them. */
+static Rectangle history_playback_button_rect(int index) {
+    static const float widths[] = {36.0f, 76.0f, 36.0f};
+    float x = 390.0f;
+    for (int i = 0; i < index; i++) x += widths[i] + 4.0f;
+    return (Rectangle){x, 684.0f, widths[index], 22.0f};
+}
+
+static Rectangle history_seek_bar_rect(void) {
+    Rectangle last = history_playback_button_rect(2);
+    float x = last.x + last.width + 18.0f;
+    return (Rectangle){x, 690.0f, 1066.0f - x, 10.0f};
+}
+
+/* Row rect for match-history entry `entry_index` (index into vs->history.entries[]), matching
+   draw_history_view's own newest-first list loop exactly (display order = count-1-entry_index,
+   72 + display*23). */
+static Rectangle history_list_row_rect(int entry_index, int history_count) {
+    int display_index = history_count - 1 - entry_index;
+    return (Rectangle){24.0f, 72.0f + display_index * 23.0f, 340.0f, 20.0f};
+}
+
 static void draw_history_view(VizSession* vs, int screen_w, int screen_h) {
     const ThemeColors* tc = theme_colors();
     ClearBackground(tc->background);
@@ -148,8 +179,17 @@ static void draw_history_view(VizSession* vs, int screen_w, int screen_h) {
     }
     ReplayFrame* frame = &vs->history_replay->frames[vs->history_frame];
     DebugSnapshot snap; memset(&snap, 0, sizeof(snap)); snap.state = frame->state;
+    /* Unlike env_get_debug_snapshot (used by every other view), this hand-built snapshot never
+       set .config, so it silently read all-zero sudden_death_start/shrink_interval/max_steps —
+       breaking the closing-arena tint and the status panel's step counter specifically in
+       replay/history playback, the one view most used for after-the-fact analysis. */
+    snap.config = vs->history_replay->config;
     danger_compute(&snap.danger, &snap.state); danger_compute_escape(&snap.danger, &snap.state, 0);
     int tile = layout_calc_tile_size(snap.state.width, snap.state.height, 680, 590);
+    /* renderer_set_arena_options is module-static state read by renderer_draw_arena; every
+       call site must sync it or D/G toggles silently only affect whichever view last set it
+       (previously only draw_arena_view did, so D/G appeared broken in History/Compare). */
+    renderer_set_arena_options(vs->show_danger, vs->show_grid);
     renderer_draw_arena(&snap, 390, 105, tile);
     char info[256];
     if (entry) snprintf(info, sizeof(info), "#%d  %s vs %s  seed %llu  map %dx%d/%d%%", entry->id,
@@ -158,6 +198,25 @@ static void draw_history_view(VizSession* vs, int screen_w, int screen_h) {
     else snprintf(info, sizeof(info), "Loaded replay  %s vs %s  seed %llu", vs->history_replay->agent_name,
                   vs->history_replay->opponent_name, (unsigned long long)vs->history_replay->seed);
     DrawText(info, 390, 70, 18, tc->text_primary);
+
+    /* Playback transport: Prev/Play-Pause/Next buttons + a click/drag seek bar. Mouse-only;
+       the click/drag handling lives in main()'s mouse block using the same rect helpers. */
+    for (int i = 0; i < 3; i++) {
+        Rectangle button = history_playback_button_rect(i);
+        DrawRectangleRec(button, tc->button);
+        DrawRectangleLinesEx(button, 1, tc->panel_border);
+        const char* label = i == 0 ? "<" : i == 1 ? (vs->history_playing ? "Pause" : "Play") : ">";
+        int label_w = MeasureText(label, 12);
+        DrawText(label, (int)(button.x + button.width / 2 - label_w / 2), (int)button.y + 5, 12, tc->text_primary);
+    }
+    Rectangle seek = history_seek_bar_rect();
+    DrawRectangleRec(seek, (Color){40, 46, 58, 255});
+    DrawRectangleLinesEx(seek, 1, tc->panel_border);
+    if (vs->history_replay->frame_count > 1) {
+        float progress = (float)vs->history_frame / (float)(vs->history_replay->frame_count - 1);
+        DrawRectangle((int)seek.x, (int)seek.y, (int)(seek.width * progress), (int)seek.height, tc->agent);
+    }
+
     snprintf(info, sizeof(info), "Frame %d/%d | Step %d | %s | hash %llu", vs->history_frame + 1,
              vs->history_replay->frame_count, frame->step,
              outcome_name(entry ? entry->outcome : frame->terminal),
@@ -180,9 +239,10 @@ static void draw_history_view(VizSession* vs, int screen_w, int screen_h) {
     }
     snprintf(info, sizeof(info), "Owned kills %d | self %d | opponent self %d | opponent kills %d",
              owned, self_kills, opponent_self, opponent_kills);
-    DrawText(info, 390, 748, 15, tc->text_secondary);
-    DrawText("PageUp/PageDown match | Left/Right frame | Home restart | Space play/pause | M new match",
-             390, 790, 13, tc->text_dim);
+    DrawText(info, 390, 775, 15, tc->text_secondary);
+    DrawText("Click list/seek bar to jump | PageUp/PageDown: match, or 10 frames if none loaded | "
+             "Left/Right frame | Home restart | Space play/pause | M new match",
+             390, 800, 13, tc->text_dim);
     (void)screen_w; (void)screen_h;
 }
 
@@ -223,6 +283,12 @@ static void apply_simulation_hz(VizSession* vs, PlaybackClock* clock, int hz) {
 static Rectangle runtime_button_rect(const VizSession* vs, int index) {
     if (vs->view_mode == VIEW_COMPARE)
         return (Rectangle){20.0f + index * 61.0f, SCREEN_H - 68.0f, 57.0f, 22.0f};
+    /* History has its own bottom info line ("Frame N/M | Step ..." at y=720) and a title
+       line at y=70 that can run wide (agent/opponent/seed text) - the default top-right
+       position would collide with either depending on replay metadata length, so History
+       gets a dedicated row below the bottom info line instead. */
+    if (vs->view_mode == VIEW_HISTORY)
+        return (Rectangle){390.0f + index * 90.0f, 745.0f, 82.0f, 22.0f};
     return (Rectangle){575.0f + index * 90.0f, 61.0f, 82.0f, 22.0f};
 }
 
@@ -230,19 +296,25 @@ static void draw_runtime_controls(const VizSession* vs, int editing, const char*
     const ThemeColors* tc = theme_colors();
     const char* normal_labels[] = {"Game -", "Game +", "Render -", "Render +", "Set Game"};
     const char* compact_labels[] = {"Game-", "Game+", "FPS-", "FPS+", "Set Hz"};
+    const char* history_labels[] = {"Speed -", "Speed +", "Render -", "Render +", "Set Speed"};
     int compact = vs->view_mode == VIEW_COMPARE;
+    int history = vs->view_mode == VIEW_HISTORY;
     if (compact) DrawRectangle(16, SCREEN_H - 74, 310, 66, (Color){18, 24, 34, 245});
+    else if (history) DrawRectangle(385, 742, 465, 28, (Color){18, 24, 34, 245});
     else DrawRectangle(570, 58, 465, 28, (Color){18, 24, 34, 245});
     for (int i = 0; i < 5; i++) {
         Rectangle button = runtime_button_rect(vs, i);
         DrawRectangleRec(button, tc->button);
         DrawRectangleLinesEx(button, 1, tc->panel_border);
-        DrawText(compact ? compact_labels[i] : normal_labels[i], (int)button.x + (compact ? 6 : 9),
+        const char* label = compact ? compact_labels[i] : history ? history_labels[i] : normal_labels[i];
+        DrawText(label, (int)button.x + (compact ? 6 : 9),
                  (int)button.y + 5, compact ? 10 : 12, tc->text_primary);
     }
     char status[96];
-    snprintf(status, sizeof(status), "Game %d/s | Render %d", vs->simulation_hz, vs->target_fps);
+    const char* play_state = history ? (vs->history_playing ? " | Playing" : " | Paused") : "";
+    snprintf(status, sizeof(status), "Game %d/s | Render %d%s", vs->simulation_hz, vs->target_fps, play_state);
     if (compact) DrawText(status, 24, SCREEN_H - 35, 12, tc->text_secondary);
+    else if (history) DrawText(status, 859, 750, 12, tc->text_secondary);
     else DrawText(status, 1044, 66, 12, tc->text_secondary);
     if (editing) {
         DrawRectangle(520, 360, 360, 120, (Color){15, 21, 31, 250});
@@ -254,30 +326,85 @@ static void draw_runtime_controls(const VizSession* vs, int editing, const char*
     }
 }
 
+/* One "KEY  description" row with the key drawn as a small highlighted badge so it's
+   scannable at a glance instead of run together in a long comma-separated sentence
+   (the previous layout's main readability complaint). */
+static void draw_help_key_row(int x, int y, int key_w, const char* key, const char* desc) {
+    const ThemeColors* tc = theme_colors();
+    DrawRectangle(x, y - 2, key_w, 22, (Color){45, 60, 85, 255});
+    DrawRectangleLines(x, y - 2, key_w, 22, (Color){90, 130, 180, 255});
+    int tw = MeasureText(key, 14);
+    DrawText(key, x + (key_w - tw) / 2, y + 2, 14, (Color){170, 210, 255, 255});
+    DrawText(desc, x + key_w + 12, y + 2, 15, tc->text_primary);
+}
+
 static void draw_help_overlay(int screen_w, int screen_h) {
     const ThemeColors* tc = theme_colors();
-    int w = 760, h = 520, x = (screen_w - w) / 2, y = (screen_h - h) / 2;
+    int w = HELP_OVERLAY_W, h = HELP_OVERLAY_H, x = (screen_w - w) / 2, y = (screen_h - h) / 2;
     DrawRectangle(x - 4, y - 4, w + 8, h + 8, (Color){0, 0, 0, 190});
-    DrawRectangle(x, y, w, h, (Color){20, 27, 38, 250});
+    DrawRectangle(x, y, w, h, (Color){18, 24, 34, 252});
     DrawRectangleLines(x, y, w, h, tc->panel_border);
-    DrawText("Help & Powerups", x + 24, y + 20, 24, tc->text_primary);
-    DrawText("Controls", x + 24, y + 62, 18, tc->agent);
-    DrawText("SPACE pause/resume    S single-step    R reset    TAB next policy", x + 24, y + 90, 15, tc->text_secondary);
-    DrawText("+/- game rate (1/2/3/5/10/30 steps/sec)    [/] render FPS", x + 24, y + 116, 15, tc->text_secondary);
-    DrawText("1-4 views    5 history    M live matchup    F7 exact game rate", x + 24, y + 142, 15, tc->text_secondary);
-    DrawText("View 2: click any matchup, then press 1 for full-size inspection", x + 24, y + 166, 14, tc->text_secondary);
-    DrawText("D danger    O observation    G grid    L legend    P screenshot    ESC clean exit", x + 24, y + 190, 15, tc->text_secondary);
-    DrawText("Powerups", x + 24, y + 228, 18, tc->agent);
-    DrawCircle(x + 34, y + 254, 10, (Color){244, 83, 83, 255});
-    DrawText("Bomb capacity", x + 58, y + 244, 16, tc->text_primary);
-    DrawText("Adds one reusable bomb slot. Ammo returns when that bomb explodes.", x + 58, y + 266, 14, tc->text_secondary);
-    DrawCircle(x + 34, y + 320, 10, (Color){255, 184, 62, 255});
-    DrawText("Blast range", x + 58, y + 310, 16, tc->text_primary);
-    DrawText("Extends future bomb flames by one tile in each open direction.", x + 58, y + 332, 14, tc->text_secondary);
-    DrawCircle(x + 34, y + 386, 10, (Color){78, 190, 255, 255});
-    DrawText("Speed level", x + 58, y + 376, 16, tc->text_primary);
-    DrawText("Currently tracked in state/observations, but does not yet change grid movement.", x + 58, y + 398, 14, tc->warning);
-    DrawText("Powerups have a 30% default chance to replace a destroyed crate.", x + 24, y + 452, 14, tc->text_secondary);
+    DrawText("Help & Powerups", x + 28, y + 22, 26, tc->text_primary);
+    DrawText("Press H or click Close to dismiss", x + 28, y + 54, 13, tc->text_secondary);
+
+    int col1 = x + 28, col2 = x + 28 + (w - 56) / 2;
+    int kw = 58; /* key badge width */
+
+    DrawText("Playback", col1, y + 90, 17, tc->agent);
+    draw_help_key_row(col1, y + 118, kw, "SPACE", "Pause / resume");
+    draw_help_key_row(col1, y + 146, kw, "S", "Step once (while paused)");
+    draw_help_key_row(col1, y + 174, kw, "R", "Reset all sessions");
+    draw_help_key_row(col1, y + 202, kw, "TAB", "Switch active agent/session");
+
+    DrawText("Speed", col1, y + 240, 17, tc->agent);
+    draw_help_key_row(col1, y + 268, kw, "+/-", "Game-rate preset (1/2/3/5/10/30 steps/s)");
+    draw_help_key_row(col1, y + 296, kw, "[ ]", "Render FPS down / up");
+    draw_help_key_row(col1, y + 324, kw, "F7", "Type an exact game rate");
+
+    DrawText("Views", col2, y + 90, 17, tc->agent);
+    draw_help_key_row(col2, y + 118, kw, "1", "Arena  (single live match)");
+    draw_help_key_row(col2, y + 146, kw, "2", "Compare  (multigrid of matchups)");
+    draw_help_key_row(col2, y + 174, kw, "3", "Graphs  (reward / action history)");
+    draw_help_key_row(col2, y + 202, kw, "4", "Debug  (search, danger, obs, bombs)");
+    draw_help_key_row(col2, y + 230, kw, "5", "History  (replay viewer)");
+    draw_help_key_row(col2, y + 258, kw, "M", "Live policy arena picker");
+    DrawText("In Compare: click any matchup, then press 1 to inspect it full-size.",
+             col2, y + 288, 13, tc->text_secondary);
+
+    DrawText("Display toggles", col1, y + 362, 17, tc->agent);
+    draw_help_key_row(col1, y + 390, kw, "D", "Danger overlay");
+    draw_help_key_row(col1, y + 418, kw, "O", "Observation window");
+    draw_help_key_row(col1, y + 446, kw, "G", "Grid lines");
+    draw_help_key_row(col1, y + 474, kw, "L", "Legend");
+
+    DrawText("Other", col2, y + 362, 17, tc->agent);
+    draw_help_key_row(col2, y + 390, kw, "A", "Toggle auto-advance epoch");
+    draw_help_key_row(col2, y + 418, kw, "P", "Save screenshot");
+    draw_help_key_row(col2, y + 446, kw, "N", "New epoch for active agent");
+    draw_help_key_row(col2, y + 474, kw, "ESC", "Quit (or cancel a text entry)");
+
+    int py = y + 520;
+    DrawRectangleLines(x + 24, py, w - 48, 1, tc->panel_border);
+    py += 12;
+    DrawText("Powerups", x + 28, py, 18, tc->agent);
+    py += 30;
+    DrawCircle(x + 38, py + 8, 9, (Color){244, 83, 83, 255});
+    DrawText("Bomb capacity", x + 58, py, 15, tc->text_primary);
+    DrawText("Adds one reusable bomb slot. Ammo returns when that bomb explodes.",
+             x + 58, py + 18, 13, tc->text_secondary);
+    py += 46;
+    DrawCircle(x + 38, py + 8, 9, (Color){255, 184, 62, 255});
+    DrawText("Blast range", x + 58, py, 15, tc->text_primary);
+    DrawText("Extends future bomb flames by one tile in each open direction.",
+             x + 58, py + 18, 13, tc->text_secondary);
+    py += 46;
+    DrawCircle(x + 38, py + 8, 9, (Color){78, 190, 255, 255});
+    DrawText("Speed level", x + 58, py, 15, tc->text_primary);
+    DrawText("Tracked in state/observations, but does not yet change grid movement speed.",
+             x + 58, py + 18, 13, tc->warning);
+    py += 46;
+    DrawText("Powerups have a 30% default chance to replace a destroyed crate.",
+             x + 28, py, 13, tc->text_secondary);
     DrawRectangle(x + w - 150, y + h - 44, 126, 28, tc->button);
     DrawRectangleLines(x + w - 150, y + h - 44, 126, 28, tc->panel_border);
     DrawText("Close help (H)", x + w - 139, y + h - 37, 14, tc->text_primary);
@@ -429,6 +556,7 @@ static void draw_comparison_view(VizSession* vs, int screen_w, int screen_h) {
         DrawText(title, ax + 8, ay + 6, 13,
                  (i == vs->active_session) ? WHITE : (Color){160, 160, 170, 255});
 
+        renderer_set_arena_options(vs->show_danger, vs->show_grid);
         renderer_draw_arena(&snap, aox, aoy, tile);
 
         char info[160];
@@ -536,7 +664,9 @@ static void draw_arena_view(VizSession* vs, int screen_w, int screen_h) {
     DrawText(decision_buf, rx, ry, tf->body, tc->text_secondary); ry += tf->body + ts->gap_y;
 
     if (snap.decision_text[0] != '\0') {
-        DrawText("Reason: No decision trace emitted by this policy.", rx, ry, tf->small, tc->text_dim); ry += tf->small + ts->gap_y;
+        char trace_buf[300];
+        snprintf(trace_buf, sizeof(trace_buf), "Trace: %s", snap.decision_text);
+        DrawText(trace_buf, rx, ry, tf->small, tc->text_secondary); ry += tf->small + ts->gap_y;
     } else {
         DrawText("No decision trace emitted by this policy.", rx, ry, tf->small, tc->text_dim); ry += tf->small + ts->gap_y;
     }
@@ -717,6 +847,23 @@ static void draw_graphs_view(VizSession* vs, int screen_w, int screen_h) {
     draw_training_overview(vs, 16 + panel_w, 40 + panel_h, panel_w, panel_h);
 }
 
+/* Debug Inspector: status/danger/local-obs/bomb-timeline/decision-trace/event-log/reward-graph
+   all in one dense panel via dashboard_draw (previously implemented but never wired to any
+   view, which is why key 4 used to render identically to Graphs — see draw_graphs_view). */
+static void draw_debug_view(VizSession* vs, int screen_w, int screen_h) {
+    AgentSession* s = viz_session_active(vs);
+    if (!s) return;
+
+    Observation obs;
+    DebugSnapshot snap;
+    env_observe(&s->env, 0, &obs);
+    env_get_debug_snapshot(&s->env, &snap);
+
+    DrawText("Debug Inspector", 8, 4, 20, WHITE);
+    renderer_set_arena_options(vs->show_danger, vs->show_grid);
+    dashboard_draw(&s->dashboard, &snap, &obs, screen_w, screen_h, vs->paused, vs->simulation_hz);
+}
+
 int main(int argc, char** argv) {
     const char* agent_names[8];
     const char* matchup_args[8];
@@ -733,11 +880,15 @@ int main(int argc, char** argv) {
     const char* smoke_view = "matchup";
     const char* smoke_blue = "mcts";
     const char* smoke_red = "random";
+    int smoke_frame = -1; /* -1 = auto-pick the most action-packed replay frame */
     int open_matchup = 0;
     int open_history = 0;
     ViewMode initial_view = VIEW_ARENA;
     const char* enemy_name = "heuristic";
     int arena_agent_count = 2;
+    int sudden_death_start = -1; /* -1 = leave the VizSession default (120, matches training) */
+    int shrink_interval = -1;
+    int flame_duration = -1;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--agent") == 0 && i + 1 < argc) {
@@ -768,6 +919,8 @@ int main(int argc, char** argv) {
             smoke_screenshot = argv[++i];
         } else if (strcmp(argv[i], "--smoke-view") == 0 && i + 1 < argc) {
             smoke_view = argv[++i];
+        } else if (strcmp(argv[i], "--smoke-frame") == 0 && i + 1 < argc) {
+            smoke_frame = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--smoke-blue") == 0 && i + 1 < argc) {
             smoke_blue = argv[++i];
         } else if (strcmp(argv[i], "--smoke-red") == 0 && i + 1 < argc) {
@@ -788,6 +941,14 @@ int main(int argc, char** argv) {
             else { fprintf(stderr, "Unknown view: %s\n", view); return 1; }
         } else if (strcmp(argv[i], "--history") == 0) {
             open_history = 1;
+        } else if (strcmp(argv[i], "--sudden-death-start") == 0 && i + 1 < argc) {
+            sudden_death_start = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--shrink-interval") == 0 && i + 1 < argc) {
+            shrink_interval = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--flame-duration") == 0 && i + 1 < argc) {
+            flame_duration = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--no-sudden-death") == 0) {
+            sudden_death_start = 0;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: bomber_viz [options]\n");
             printf("Options:\n");
@@ -804,9 +965,14 @@ int main(int argc, char** argv) {
             printf("  --start-paused   Open paused for inspection\n");
             printf("  --replay <file>  Load replay file instead of live mode\n");
             printf("  --smoke-screenshot <png>  Render, capture, and exit (verification)\n");
-            printf("  --smoke-view <matchup|history|arena|compare|graphs>  Surface captured by smoke mode\n");
+            printf("  --smoke-view <matchup|history|arena|compare|graphs|debug>  Surface captured by smoke mode\n");
             printf("  --smoke-blue/--smoke-red <policy>  Verification matchup\n");
             printf("  --history        Open the latest match replay/history\n");
+            printf("  --sudden-death-start N  Step live matches start closing inward (default 120,\n");
+            printf("                          matches training dynamics; 0 disables)\n");
+            printf("  --shrink-interval N     Steps between inward wall rings (default 4)\n");
+            printf("  --flame-duration N      Ticks a blast tile stays lethal (default 2)\n");
+            printf("  --no-sudden-death       Shorthand for --sudden-death-start 0\n");
             printf("  --help           Show this help\n");
             printf("\nControls:\n");
             printf("  [SPACE]   Pause/Resume\n");
@@ -843,6 +1009,12 @@ int main(int argc, char** argv) {
     config_battle(&cfg);
     cfg.seed = (int)seed;
     cfg.agent_count = arena_agent_count;
+    /* Match the training regime by default (sudden death + persistent flame) so live/CLI-
+       launched sessions play the same dynamics the champion was trained under; see
+       viz_session_init for the matching default applied to picker-launched matches. */
+    cfg.sudden_death_start = sudden_death_start >= 0 ? sudden_death_start : 120;
+    cfg.shrink_interval = shrink_interval >= 0 ? shrink_interval : 4;
+    if (flame_duration >= 0) cfg.flame_duration = flame_duration;
     config_normalize(&cfg);
 
     /* Keep the multi-session dashboards and replay buffers off the Windows
@@ -853,6 +1025,8 @@ int main(int argc, char** argv) {
     vs.target_fps = target_fps;
     vs.simulation_hz = simulation_hz;
     vs.paused = start_paused;
+    if (sudden_death_start >= 0) vs.sudden_death_start = sudden_death_start;
+    if (shrink_interval >= 0) vs.shrink_interval = shrink_interval;
 
     if (replay_file) {
         Replay* replay = (Replay*)calloc(1, sizeof(Replay));
@@ -910,7 +1084,26 @@ int main(int argc, char** argv) {
         if (replay_file && vs.history_replay && vs.history_replay->frame_count > 0) {
             vs.show_matchup = 0;
             vs.view_mode = VIEW_HISTORY;
-            vs.history_frame = vs.history_replay->frame_count - 1;
+            int best = vs.history_replay->frame_count - 1;
+            if (smoke_frame >= 0) {
+                best = smoke_frame < vs.history_replay->frame_count ? smoke_frame
+                                                                    : vs.history_replay->frame_count - 1;
+            } else {
+                /* Auto-pick the most action-packed frame: most active flame + bombs, and
+                   prefer both agents alive so the shot is dynamic rather than terminal. */
+                int best_score = -1;
+                for (int fi = 0; fi < vs.history_replay->frame_count; fi++) {
+                    const BomberState* st = &vs.history_replay->frames[fi].state;
+                    int score = 0;
+                    for (int yy = 0; yy < st->height; yy++)
+                        for (int xx = 0; xx < st->width; xx++)
+                            if (st->flame_ttl[yy][xx] > 0) score += 3;
+                    for (int b = 0; b < MAX_BOMBS; b++) if (st->bombs[b].active) score += 2;
+                    if (st->agents[0].alive && st->agents[1].alive) score += 1;
+                    if (score > best_score) { best_score = score; best = fi; }
+                }
+            }
+            vs.history_frame = best;
             vs.history_playing = 0;
             vs.paused = 1;
         } else if (strcmp(smoke_view, "history") == 0) {
@@ -918,10 +1111,12 @@ int main(int argc, char** argv) {
             apply_simulation_hz(&vs, &(PlaybackClock){0}, 60);
         } else if (strcmp(smoke_view, "arena") == 0 ||
                    strcmp(smoke_view, "compare") == 0 ||
-                   strcmp(smoke_view, "graphs") == 0) {
+                   strcmp(smoke_view, "graphs") == 0 ||
+                   strcmp(smoke_view, "debug") == 0) {
             vs.show_matchup = 0;
             vs.view_mode = strcmp(smoke_view, "arena") == 0 ? VIEW_ARENA :
-                           strcmp(smoke_view, "compare") == 0 ? VIEW_COMPARE : VIEW_GRAPHS;
+                           strcmp(smoke_view, "compare") == 0 ? VIEW_COMPARE :
+                           strcmp(smoke_view, "graphs") == 0 ? VIEW_GRAPHS : VIEW_DEBUG;
             vs.paused = 0;
             vs.simulation_hz = 60;
         } else {
@@ -945,6 +1140,7 @@ int main(int argc, char** argv) {
     int fps_editing = 0;
     char fps_entry[8] = {0};
     int fps_entry_len = 0;
+    int seek_dragging = 0;
     while (!should_exit && !WindowShouldClose()) {
         if (fps_editing) {
             int ch;
@@ -996,36 +1192,113 @@ int main(int argc, char** argv) {
             else if (CheckCollisionPointRec(mouse, runtime_button_rect(&vs, 2))) apply_render_fps(&vs, next_render_fps(vs.target_fps, -1));
             else if (CheckCollisionPointRec(mouse, runtime_button_rect(&vs, 3))) apply_render_fps(&vs, next_render_fps(vs.target_fps, 1));
             else if (CheckCollisionPointRec(mouse, runtime_button_rect(&vs, 4))) { fps_editing = 1; fps_entry_len = 0; fps_entry[0] = '\0'; }
-            else if (vs.show_help && CheckCollisionPointRec(mouse, (Rectangle){910,646,126,28})) vs.show_help = 0;
+            /* Must match draw_help_overlay's own close-button rect exactly — a stale hardcoded
+               literal here was previously 20px left of the real button (drifted when the
+               overlay was last resized), so the rightmost ~20px of the visible button didn't
+               respond to clicks. Both now derive from the same HELP_OVERLAY_W/H constants. */
+            else if (vs.show_help && CheckCollisionPointRec(mouse,
+                     (Rectangle){(float)((SCREEN_W - HELP_OVERLAY_W) / 2 + HELP_OVERLAY_W - 150),
+                                 (float)((SCREEN_H - HELP_OVERLAY_H) / 2 + HELP_OVERLAY_H - 44), 126, 28}))
+                vs.show_help = 0;
             else if (vs.view_mode == VIEW_COMPARE) {
                 int selected = comparison_session_at(&vs, (int)mouse.x, (int)mouse.y, SCREEN_W, SCREEN_H);
                 if (selected >= 0) vs.active_session = selected;
             }
+            else if (vs.view_mode == VIEW_HISTORY && vs.history_replay && vs.history_replay->frame_count > 0 &&
+                     CheckCollisionPointRec(mouse, history_playback_button_rect(0)))
+                viz_session_history_step(&vs, -1);
+            else if (vs.view_mode == VIEW_HISTORY && vs.history_replay && vs.history_replay->frame_count > 0 &&
+                     CheckCollisionPointRec(mouse, history_playback_button_rect(1)))
+                vs.history_playing = !vs.history_playing;
+            else if (vs.view_mode == VIEW_HISTORY && vs.history_replay && vs.history_replay->frame_count > 0 &&
+                     CheckCollisionPointRec(mouse, history_playback_button_rect(2)))
+                viz_session_history_step(&vs, 1);
+            else if (vs.view_mode == VIEW_HISTORY && vs.history_replay && vs.history_replay->frame_count > 0 &&
+                     CheckCollisionPointRec(mouse, history_seek_bar_rect())) {
+                seek_dragging = 1;
+                Rectangle seek = history_seek_bar_rect();
+                float fraction = (mouse.x - seek.x) / seek.width;
+                if (fraction < 0.0f) fraction = 0.0f;
+                if (fraction > 1.0f) fraction = 1.0f;
+                vs.history_frame = (int)(fraction * (vs.history_replay->frame_count - 1) + 0.5f);
+            }
+            else if (vs.view_mode == VIEW_HISTORY && vs.history.count > 0) {
+                int shown = vs.history.count < 12 ? vs.history.count : 12;
+                for (int display_index = 0; display_index < shown; display_index++) {
+                    int entry_index = vs.history.count - 1 - display_index;
+                    if (CheckCollisionPointRec(mouse, history_list_row_rect(entry_index, vs.history.count))) {
+                        (void)viz_session_load_history(&vs, entry_index);
+                        break;
+                    }
+                }
+            }
         }
+        /* Seek-bar drag: IsMouseButtonPressed only fires the single frame the button goes
+           down, so scrubbing (holding + moving) needs its own per-frame check driven by
+           IsMouseButtonDown, independent of the press handler above. */
+        if (seek_dragging) {
+            if (IsMouseButtonDown(MOUSE_LEFT_BUTTON) && vs.history_replay && vs.history_replay->frame_count > 0) {
+                Vector2 mouse = GetMousePosition();
+                Rectangle seek = history_seek_bar_rect();
+                float fraction = (mouse.x - seek.x) / seek.width;
+                if (fraction < 0.0f) fraction = 0.0f;
+                if (fraction > 1.0f) fraction = 1.0f;
+                vs.history_frame = (int)(fraction * (vs.history_replay->frame_count - 1) + 0.5f);
+            } else {
+                seek_dragging = 0;
+            }
+        }
+        /* Everything below is gated on !fps_editing: the F7 rate-entry modal only intercepted
+           digits/backspace/enter/escape above, so every other shortcut — critically the SAME
+           physical '1'-'5' keys used for view-switching — used to fire simultaneously with
+           typing a rate, making the screen jump around mid-entry (and, combined with the
+           overlay-masking fix above, was part of why view-switch keys looked broken). A modal
+           text entry should exclusively capture keyboard input until it's closed. */
+        if (!fps_editing) {
         if (IsKeyPressed(KEY_H)) vs.show_help = !vs.show_help;
         if (IsKeyPressed(KEY_M)) vs.show_matchup = !vs.show_matchup;
         if (IsKeyPressed(KEY_TAB) && vs.session_count > 0) {
             vs.active_session = (vs.active_session + 1) % vs.session_count;
         }
-        if (IsKeyPressed(KEY_ONE)) vs.view_mode = VIEW_ARENA;
-        if (IsKeyPressed(KEY_TWO)) vs.view_mode = VIEW_COMPARE;
-        if (IsKeyPressed(KEY_THREE)) vs.view_mode = VIEW_GRAPHS;
-        if (IsKeyPressed(KEY_FOUR)) vs.view_mode = VIEW_DEBUG;
+        /* Switching views also dismisses the matchup picker AND help overlays — both draw on
+           top of every view regardless of view_mode (help defaults to shown at startup and
+           covers roughly half the window), so a raw vs.view_mode change while either is open
+           is invisible and looks exactly like the key "doesn't work". */
+        if (IsKeyPressed(KEY_ONE)) { viz_session_switch_view(&vs, VIEW_ARENA); vs.show_help = 0; }
+        if (IsKeyPressed(KEY_TWO)) { viz_session_switch_view(&vs, VIEW_COMPARE); vs.show_help = 0; }
+        if (IsKeyPressed(KEY_THREE)) { viz_session_switch_view(&vs, VIEW_GRAPHS); vs.show_help = 0; }
+        if (IsKeyPressed(KEY_FOUR)) { viz_session_switch_view(&vs, VIEW_DEBUG); vs.show_help = 0; }
         if (IsKeyPressed(KEY_FIVE)) {
             int selected = vs.history.selected >= 0 ? vs.history.selected : vs.history.count - 1;
             if (selected >= 0) (void)viz_session_load_history(&vs, selected);
-            else vs.view_mode = VIEW_HISTORY;
+            else viz_session_switch_view(&vs, VIEW_HISTORY);
+            vs.show_matchup = 0;
+            vs.show_help = 0;
         }
         if (vs.view_mode == VIEW_HISTORY) {
-            if (IsKeyPressed(KEY_PAGE_UP) && vs.history.count > 0) {
-                int selected = vs.history.selected < 0 ? vs.history.count - 1 : vs.history.selected - 1;
-                if (selected < 0) selected = 0;
-                (void)viz_session_load_history(&vs, selected);
+            /* PageUp/PageDown switch between recorded MATCHES when a live multi-match
+               session history exists. A replay opened directly (--replay FILE, which is how
+               every launcher script and every generated .bin opens) has exactly one match and
+               history.count is explicitly 0 - PageUp/PageDown had nothing to switch between
+               and silently did nothing. Fall back to a 10-frame jump within the loaded replay
+               in that case, so the keys always do something reasonable. */
+            if (IsKeyPressed(KEY_PAGE_UP)) {
+                if (vs.history.count > 0) {
+                    int selected = vs.history.selected < 0 ? vs.history.count - 1 : vs.history.selected - 1;
+                    if (selected < 0) selected = 0;
+                    (void)viz_session_load_history(&vs, selected);
+                } else if (vs.history_replay) {
+                    viz_session_history_step(&vs, -10);
+                }
             }
-            if (IsKeyPressed(KEY_PAGE_DOWN) && vs.history.count > 0) {
-                int selected = vs.history.selected < 0 ? vs.history.count - 1 : vs.history.selected + 1;
-                if (selected >= vs.history.count) selected = vs.history.count - 1;
-                (void)viz_session_load_history(&vs, selected);
+            if (IsKeyPressed(KEY_PAGE_DOWN)) {
+                if (vs.history.count > 0) {
+                    int selected = vs.history.selected < 0 ? vs.history.count - 1 : vs.history.selected + 1;
+                    if (selected >= vs.history.count) selected = vs.history.count - 1;
+                    (void)viz_session_load_history(&vs, selected);
+                } else if (vs.history_replay) {
+                    viz_session_history_step(&vs, 10);
+                }
             }
             if (IsKeyPressed(KEY_LEFT)) viz_session_history_step(&vs, -1);
             if (IsKeyPressed(KEY_RIGHT)) viz_session_history_step(&vs, 1);
@@ -1035,12 +1308,7 @@ int main(int argc, char** argv) {
         if (IsKeyPressed(KEY_O)) vs.show_observation_window = !vs.show_observation_window;
         if (IsKeyPressed(KEY_D)) vs.show_danger = !vs.show_danger;
         if (IsKeyPressed(KEY_G)) vs.show_grid = !vs.show_grid;
-        static int screenshot_toast_frames = 0;
-        if (IsKeyPressed(KEY_P)) {
-            ensure_screenshot_dir();
-            TakeScreenshot("screenshots/ai-bomber-arena.png");
-            screenshot_toast_frames = 150;
-        }
+        if (IsKeyPressed(KEY_A)) vs.auto_advance_epoch = !vs.auto_advance_epoch;
         if (IsKeyPressed(KEY_N)) {
             AgentSession* s = viz_session_active(&vs);
             if (s && s->epoch_count < vs.max_epochs) {
@@ -1050,6 +1318,13 @@ int main(int argc, char** argv) {
                 /* record_epoch is static, so we use the step mechanism */
             }
         }
+        }
+        static int screenshot_toast_frames = 0;
+        if (!fps_editing && IsKeyPressed(KEY_P)) {
+            ensure_screenshot_dir();
+            TakeScreenshot("screenshots/ai-bomber-arena.png");
+            screenshot_toast_frames = 150;
+        }
 
         int simulation_steps = 0;
         if (vs.step_once) {
@@ -1057,8 +1332,14 @@ int main(int argc, char** argv) {
             vs.step_once = 0;
             playback_clock_reset(&playback_clock);
         } else {
+            /* History view has its own play/pause flag (history_playing, toggled by SPACE)
+               separate from the live-arena vs.paused - which replay loading (--replay FILE)
+               hardcodes to 1 and nothing ever resets. Gating the clock on vs.paused while in
+               History meant SPACE flipped history_playing but the clock still emitted zero
+               steps every frame, so playback silently never advanced regardless. */
+            int clock_paused = vs.view_mode == VIEW_HISTORY ? !vs.history_playing : vs.paused;
             simulation_steps = playback_clock_advance(&playback_clock, GetFrameTime(),
-                                                      vs.simulation_hz, vs.paused);
+                                                      vs.simulation_hz, clock_paused);
         }
         for (int step = 0; step < simulation_steps; step++) {
             if (vs.view_mode == VIEW_HISTORY && vs.history_playing) viz_session_history_step(&vs, 1);
@@ -1092,12 +1373,12 @@ int main(int argc, char** argv) {
             case VIEW_ARENA:       draw_arena_view(&vs, SCREEN_W, SCREEN_H); break;
             case VIEW_COMPARE:     draw_comparison_view(&vs, SCREEN_W, SCREEN_H); break;
             case VIEW_GRAPHS:      draw_graphs_view(&vs, SCREEN_W, SCREEN_H); break;
-            case VIEW_DEBUG:       draw_graphs_view(&vs, SCREEN_W, SCREEN_H); break;
+            case VIEW_DEBUG:       draw_debug_view(&vs, SCREEN_W, SCREEN_H); break;
             case VIEW_HISTORY:     draw_history_view(&vs, SCREEN_W, SCREEN_H); break;
         }
         if (vs.show_help) draw_help_overlay(SCREEN_W, SCREEN_H);
         if (vs.show_matchup) draw_matchup_overlay(&vs);
-        if (vs.view_mode != VIEW_HISTORY) draw_runtime_controls(&vs, fps_editing, fps_entry);
+        draw_runtime_controls(&vs, fps_editing, fps_entry);
 
         if (screenshot_toast_frames > 0) {
             DrawRectangle(SCREEN_W - 180, SCREEN_H - 48, 160, 30, (Color){18, 28, 38, 235});

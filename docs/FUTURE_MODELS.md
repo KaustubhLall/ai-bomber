@@ -6,18 +6,19 @@ The simulator is designed to support future ML/AI experiments without requiring 
 
 ## C ABI for Python integration
 
-The environment exposes a clean C ABI suitable for `ctypes` or `cffi`:
+The opaque `bomber_training` shared library exposes the current training ABI
+without requiring Python to mirror internal C structs:
 
 ```python
 import ctypes
 
-lib = ctypes.CDLL("./build/libbomber_core.a")  # or shared lib
-# env_init, env_reset, env_step, env_observe can be called directly
+lib = ctypes.CDLL("./build/src/libbomber_training.so")
+# bomber_training_create/clone/encode/legal_actions/step_joint/outcome
 ```
 
-To enable Python integration, build a shared library:
+Build the bridge directly:
 ```bash
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON
+cmake --build build --target bomber_training
 ```
 
 ## Planned experiment types
