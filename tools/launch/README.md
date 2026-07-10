@@ -25,6 +25,7 @@ cmake --build build --config Release --target bomber_viz bomber_headless
 | [`tournament.ps1`](tournament.ps1) | Headless round-robin standings among agents. `-Agents "mcts,heuristic,greedy,alpha-beta"`, `-Episodes N`. |
 | [`champion-eval.ps1`](champion-eval.ps1) | Native evaluate ladder on the champion (W-D-L + Wilson LCB vs random/heuristic/MCTS). `-Mcts`, `-Games N`. |
 | [`v6-league-resume.ps1`](v6-league-resume.ps1) | Resume the **v6-league** retrain (reward fix + opponent league; see `docs/experiment-memory/07-grokking-campaign.md` Part 2) under the auto-restart watchdog. `-Iterations N` to extend the target. |
+| [`v6-league-gate-eval.ps1`](v6-league-gate-eval.ps1) | The eval-time (noise-off, greedy) win-cause + WAIT% check vs MCTS that actually decides whether v6-league is working — see KL-96 child issue "iter-100 eval-time gate". `-Checkpoint path`, `-MctsGames N`. |
 | [`watchdog-train.ps1`](watchdog-train.ps1) | Generic auto-restarting wrapper for `train` mode — relaunches on any crash (always resuming, never `--fresh`) until the trainer exits 0 or `-MaxRestarts` is hit. Takes the full trainer arg list as one `-TrainerArgs` array. |
 
 ## Notes
