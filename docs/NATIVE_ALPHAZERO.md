@@ -231,10 +231,14 @@ conclusion are recorded in [AlphaZero full-simulator results](ALPHAZERO_RESULTS.
 The continuing statistically gated campaign and its predeclared strength
 criterion are specified in [Superhuman AlphaZero ladder](SUPERHUMAN_ALPHAZERO.md).
 
-As of 2026-07-09, the v5 frozen iteration-210 checkpoint in
-`results/alphazero-native-superhuman-v5/frozen-best210-selection-mcts512.pt`
-has completed that ladder: two independent final holdouts cleared the
-MCTS-512/depth-16 lower-bound gate, with full native GPU CTest (25/25) and
-dependency-free C-only CTest (22/22) passing afterward. This supports an
-agent-ladder superhuman claim versus the shipped random, heuristic, and native
-MCTS-512 agents, not a claim of superiority to all human Bomberman players.
+**RETRACTED 2026-07-11:** this section previously claimed the v5 frozen
+iteration-210 checkpoint cleared that ladder as an agent-ladder superhuman
+result. An overnight audit found 95-97% of its wins (including the reported
+A3/B3 holdout wins) were arena-crush deaths, not bomb-kills — the W-D-L/Wilson
+gate above has no win-cause classification, so it could not see the
+difference. Full diagnosis, root cause, and the new evidence bar any future
+claim must clear: [Superhuman AlphaZero ladder](SUPERHUMAN_ALPHAZERO.md)
+(retraction banner) and Linear KL-100 (the honest-claim ledger). Do not cite
+the v5/iteration-210 result as evidence of combat skill; treat it only as a
+historical record of how a statistically careful-looking protocol still
+missed a structural exploit.

@@ -15,6 +15,11 @@ struct TrainConfig {
     std::filesystem::path run_dir{"results/alphazero-native"};
     std::filesystem::path checkpoint{"latest.pt"};
     std::filesystem::path evaluation_output{};
+    /* KL-108 Brick 2: if set (evaluate mode with --eval-mcts), write one immutable JSON line
+       per completed MCTS-baseline match (seed, seat, outcome, cause, steps, WAIT) to this
+       path - the per-match rows a paired/seat-delta causal comparison needs, that the
+       aggregate Evaluation summary alone can't provide. CLI --per-match-output. */
+    std::filesystem::path per_match_output{};
     /* If set (evaluate mode), write a v4 replay of one representative checkpoint game that
        bomber_viz --replay can play back. Opponent = heuristic, or MCTS with --eval-mcts;
        set replay_incumbent to instead record checkpoint-vs-checkpoint. */

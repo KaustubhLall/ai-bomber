@@ -214,3 +214,73 @@ worse than an honest gap:
 
 Revisit this list explicitly if/when telemetry gaps actually block a decision -
 don't build it speculatively ahead of that.
+
+## Mid-session: user gave full overnight autonomy
+
+Partway through Brick 1, the user's message stream included (mid-turn, via a
+system-reminder wrapper, but genuine content per the harness's own framing of that
+message type): *"do the rest autonomously using the best judgement and the advisor
+model, do not consult me for this for now again, and document everything you assume
+explicitly for review later tomorrow morning as a whole. run the experminent and
+monitor autonomously, your 10 hours starts now."* This file exists specifically
+because of that instruction.
+
+**Advisor tool status:** retried immediately per this instruction (it had already
+failed once earlier in the session). Errored again, same "unavailable, do not retry"
+response. Not attempted a third time. Every judgment call from this point forward is
+mine alone, weighed against the very detailed brick plan already given and the
+honesty/rigor standards established over the whole session — not checked against a
+fresh external read.
+
+## Brick 2 (KL-108/KL-98): correct iter-130 causal evaluation — in progress
+
+**Sequencing decision:** the matched-control training run (`control03-from102`) needs
+~28 iterations (~3.5-4 hours wall clock) regardless of what else happens, so it was
+launched first, immediately, rather than after building the rest of Brick 2's
+evaluation tooling — every minute of delay here is a minute added to when there's a
+real answer. Built the per-match-export and SD-off evaluation infrastructure *while*
+that background run trains (GPU is held by the training process alone throughout,
+consistent with the KL-101 Part D one-trainer lock).
+
+**Control setup:** `control03-bootstrap.ps1` (run once) forks from the exact same
+v6-league iteration-102 checkpoint crush01 forked from, via the new KL-101
+`--fork-from` mechanism, changing nothing (`arena-crush-win-value` stays 0.3 — this is
+"what would have happened if the lever had never been touched," the matched control
+the earlier crush01-130-vs-parent-100 "0.4→0.6" read never actually had).
+`control03-resume.ps1` (watchdog-wrapped, ordinary resume) continues it to iteration
+130+ from there.
+
+- **Hit and fixed a real issue on first launch:** the parent checkpoint
+  (`v6-league/latest.pt`, iteration 102) predates KL-101's own semantic-manifest fix —
+  it was saved before that commit — so it correctly has no manifest to inherit from
+  and failed closed exactly as designed ("predates the semantic manifest... cannot be
+  verified"). This is the fail-closed behavior working correctly, not a bug: fixed by
+  passing `--legacy-accept-unverified-semantics` plus an EXPLICIT
+  `--arena-crush-win-value 0.3` (not left to the struct default, even though they're
+  numerically identical — being loud and auditable about the value actually used
+  matters more here than saving one flag).
+- Bootstrap relaunched after the fix; watch for its completion notification before
+  trusting `results/alphazero-native-superhuman-control03-from102` exists.
+
+**Evaluation infrastructure built while the control trains:**
+- Per-match-row JSONL export (`--per-match-output PATH`, new `evaluate_baseline()`
+  parameter) — one immutable line per completed MCTS-baseline match: seed, learner
+  seat, outcome, cause, steps, WAIT. Written as each match finishes, not buffered, so
+  a killed process still leaves a valid partial record. This is what a paired/seat-
+  delta comparison needs that the aggregate `Evaluation` summary alone can't provide.
+- `v6-league-gate-eval.ps1` extended with `-SuddenDeathOff` (passes
+  `--sudden-death-start 0` explicitly — zero new C++ needed, the field already existed
+  and doubles as a deliberate, logged semantic fork via the Part A mechanism) and
+  `-PerMatchOutput`.
+- `tools/analyze_paired_gate_eval.py` — paired comparison between two per-match JSONL
+  files on identical seeds (both evaluations use the same `--mcts-eval-seed-base`, so
+  seed sets match by construction): McNemar-style bomb-win breakdown (both-win /
+  only-treatment / only-control / neither), net paired delta, per-seat delta as a
+  sanity check against seat-specific artifacts.
+
+**Not yet done (next, once control03 reaches 130):** run the 4-configuration matrix
+(crush01-130 × {SD-on, SD-off}, control03-130 × {SD-on, SD-off}) at N=32 each on the
+standing MCTS-eval seed block, run the paired comparison, apply the predeclared
+stop/intervention thresholds (bomb wins <~10% of MCTS games, greedy WAIT >~60%, or
+crush still causing most decisive outcomes → stop this lineage, try a reserve lever),
+update KL-98/KL-108/KL-100 with whatever the honest answer turns out to be.

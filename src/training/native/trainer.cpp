@@ -1924,12 +1924,16 @@ struct Trainer::Impl {
     Evaluation evaluate_baseline(AgentType type, int games_count, int simulations,
                                  uint64_t seed_base,
                                  const std::filesystem::path& replay_out = {},
-                                 const std::string& candidate_label = {}) {
+                                 const std::string& candidate_label = {},
+                                 const std::filesystem::path& per_match_output = {}) {
         struct Match {
             BomberEnv env{};
             Agent opponent{};
             int learner_seat{};
             bool done{};
+            uint64_t seed{};
+            int wait_steps{};
+            int total_steps{};
         };
         const BomberConfig base = game_config(config);
         const int total_matches = games_count * 2;
@@ -1939,6 +1943,7 @@ struct Trainer::Impl {
             const uint64_t seed = seed_base + static_cast<uint64_t>(seed_index);
             Match& match = matches[index];
             match.learner_seat = index % 2;
+            match.seed = seed;
             env_init(&match.env, &base);
             env_reset(&match.env, seed);
             agent_init(&match.opponent, type);
@@ -1947,6 +1952,16 @@ struct Trainer::Impl {
                     &match.opponent, config.baseline_mcts_simulations,
                     config.baseline_mcts_depth))
                 throw std::runtime_error("invalid native MCTS baseline configuration");
+        }
+        /* KL-108 Brick 2: immutable per-match rows - one JSON line per completed match,
+           written as each match finishes (not buffered/reordered) so a killed process still
+           leaves a valid partial record. Aggregate Evaluation stats alone can't answer
+           per-seed/per-seat questions or be re-sliced later without rerunning the eval. */
+        std::unique_ptr<std::ofstream> per_match_log;
+        if (!per_match_output.empty()) {
+            if (!per_match_output.parent_path().empty())
+                std::filesystem::create_directories(per_match_output.parent_path());
+            per_match_log = std::make_unique<std::ofstream>(per_match_output, std::ios::trunc);
         }
         /* Optional: record match 0 (both seats' joint actions + full flame/arena state
            each step) into a v4 replay bomber_viz can play back. Match 0 uses seed_base. */
@@ -1996,7 +2011,11 @@ struct Trainer::Impl {
                 actions[match.learner_seat] = static_cast<Action>(learner_action);
                 actions[opponent_seat] = static_cast<Action>(opponent_action);
                 result.learner_total_steps++;
-                if (learner_action == static_cast<int>(ACTION_WAIT)) result.learner_wait_steps++;
+                match.total_steps++;
+                if (learner_action == static_cast<int>(ACTION_WAIT)) {
+                    result.learner_wait_steps++;
+                    match.wait_steps++;
+                }
                 const StepResult step_result = env_step_joint(&match.env, actions, 2);
                 match.done = step_result.done != 0;
                 if (recorder && indices[active_index] == 0) {
@@ -2015,23 +2034,42 @@ struct Trainer::Impl {
                     result.wins_by_seat[match.learner_seat] += match_outcome > 0;
                     result.losses_by_seat[match.learner_seat] += match_outcome < 0;
                     result.draws_by_seat[match.learner_seat] += match_outcome == 0;
-                    /* Classify HOW the match was decided, not just who won. */
+                    /* Classify HOW the match was decided, not just who won. cause_name feeds
+                       both the aggregate counters below and the per-match JSONL row - one
+                       classification, not duplicated logic that could silently drift apart. */
                     const bool learner_alive = match.env.state.agents[match.learner_seat].alive != 0;
                     const bool opp_alive = match.env.state.agents[opponent_seat].alive != 0;
+                    const char* cause_name;
                     if (match_outcome > 0) {
                         const int died_owner = match.env.state.death_owner[opponent_seat];
-                        if (died_owner == opponent_seat) result.win_by_selfkill++;
-                        else if (died_owner == match.learner_seat) result.win_by_bomb++;
-                        else result.win_by_crush++;
+                        if (died_owner == opponent_seat) { result.win_by_selfkill++; cause_name = "opponent_selfkill"; }
+                        else if (died_owner == match.learner_seat) { result.win_by_bomb++; cause_name = "bomb"; }
+                        else { result.win_by_crush++; cause_name = "arena_crush"; }
                     } else if (match_outcome < 0) {
                         const int died_owner = match.env.state.death_owner[match.learner_seat];
-                        if (died_owner == match.learner_seat) result.loss_by_selfkill++;
-                        else if (died_owner == opponent_seat) result.loss_by_bomb++;
-                        else result.loss_by_crush++;
+                        if (died_owner == match.learner_seat) { result.loss_by_selfkill++; cause_name = "selfkill"; }
+                        else if (died_owner == opponent_seat) { result.loss_by_bomb++; cause_name = "bomb"; }
+                        else { result.loss_by_crush++; cause_name = "arena_crush"; }
                     } else if (!learner_alive && !opp_alive) {
                         result.draw_mutual_death++;
+                        cause_name = "mutual_death";
                     } else {
                         result.draw_timeout_alive++;
+                        cause_name = "timeout_both_alive";
+                    }
+                    if (per_match_log) {
+                        *per_match_log << "{\"seed\":" << match.seed
+                            << ",\"learner_seat\":" << match.learner_seat
+                            << ",\"outcome\":\""
+                            << (match_outcome > 0 ? "win" : match_outcome < 0 ? "loss" : "draw")
+                            << "\",\"cause\":\"" << cause_name << "\",\"steps\":"
+                            << match.env.state.step << ",\"learner_wait_steps\":"
+                            << match.wait_steps << ",\"learner_total_steps\":"
+                            << match.total_steps << ",\"learner_wait_fraction\":"
+                            << (match.total_steps > 0
+                                    ? static_cast<double>(match.wait_steps) / match.total_steps
+                                    : 0.0)
+                            << "}\n";
                     }
                     total_steps += match.env.state.step;
                     ++completed;
@@ -2655,7 +2693,8 @@ struct Trainer::Impl {
         if (config.evaluate_mcts) {
             mcts_result = evaluate_baseline(AGENT_MCTS, config.mcts_evaluation_games,
                                             config.evaluation_simulations,
-                                            config.mcts_evaluation_seed_base);
+                                            config.mcts_evaluation_seed_base,
+                                            {}, {}, config.per_match_output);
             std::cout << "mcts: " << mcts_result->wins << "W " << mcts_result->draws << "D "
                       << mcts_result->losses << "L score=" << mcts_result->score << '\n';
             print_behavior_report("mcts", *mcts_result);
@@ -2780,6 +2819,7 @@ TrainConfig parse_train_config(int argc, char** argv, int first) {
     config.run_dir = parse_string(argc, argv, first, "--run-dir", config.run_dir.string());
     config.checkpoint = parse_string(argc, argv, first, "--checkpoint", config.checkpoint.string());
     config.evaluation_output = parse_string(argc, argv, first, "--output", "");
+    config.per_match_output = parse_string(argc, argv, first, "--per-match-output", "");
     config.replay_output = parse_string(argc, argv, first, "--replay-out", "");
     config.replay_incumbent = parse_string(argc, argv, first, "--replay-incumbent", "");
     config.incumbent_eval_games = parse_number(argc, argv, first, "--incumbent-eval-games",
@@ -2882,6 +2922,10 @@ void print_native_help() {
         "  --run-dir PATH            Checkpoint/result directory\n"
         "  --checkpoint FILE         Checkpoint to load (default latest.pt)\n"
         "  --output PATH             Write evaluation results as JSON\n"
+        "  --per-match-output PATH   (evaluate --eval-mcts) Write one immutable JSON line per\n"
+        "                            completed MCTS-baseline match: seed, seat, outcome, cause,\n"
+        "                            steps, WAIT - the per-match rows a paired/seat-delta causal\n"
+        "                            comparison needs (KL-108)\n"
         "  --draw-value X            Set both per-seat draw values (timeout+mutual death) to X\n"
         "                            in [-1,0]; the aggression dial (default -0.5/-0.2)\n"
         "  --arena-crush-win-value X Value of a win by sudden-death arena crush (default 0.3)\n"
