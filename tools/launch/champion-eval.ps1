@@ -1,3 +1,12 @@
+# RETRACTED 2026-07-11: this script evaluates the v5 iter-210 checkpoint, whose
+# "agent-ladder superhuman" claim was retracted (95-97% of its wins were arena-crush
+# deaths, not bomb-kills - see docs/SUPERHUMAN_ALPHAZERO.md and Linear KL-100). Kept
+# for historical inspection of that checkpoint only - do NOT read a strong score from
+# this script as current evidence of anything. The active work is v6-league/crush01/
+# control03-from102 (see docs/experiment-memory/07-grokking-campaign.md Part 2 and
+# 10-autonomous-brick-execution.md); v6-league-gate-eval.ps1 is the current equivalent
+# for those checkpoints.
+#
 # Run the native evaluate ladder on the champion (v5 iter-210): W-D-L vs random, heuristic,
 # and (optional) MCTS, with Wilson lower bounds. Console — run with -NoExit to keep it open.
 #
@@ -15,6 +24,7 @@ param(
 . "$PSScriptRoot\_env.ps1"
 Use-Torch
 $ckpt = Resolve-Champion
+Write-Host "RETRACTED CHECKPOINT (v5 iter-210) - see docs/SUPERHUMAN_ALPHAZERO.md and KL-100. Historical inspection only." -ForegroundColor Yellow
 Write-Host "Loading champion checkpoint ($ckpt, ~870MB — first load can take ~20-30s)..."
 Write-Host "This window will show a live progress bar per phase; it is NOT hung while that bar is moving."
 if ($Mcts) {

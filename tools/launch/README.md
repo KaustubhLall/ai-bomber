@@ -21,9 +21,9 @@ cmake --build build --config Release --target bomber_viz bomber_headless
 | [`mcts.ps1`](mcts.ps1) | MCTS vs heuristic demo match. |
 | [`alpha-beta.ps1`](alpha-beta.ps1) | Alpha-beta vs heuristic demo match. |
 | [`mcts-selfplay.ps1`](mcts-selfplay.ps1) | Generate (if missing) + watch an MCTS self-play game with **sudden-death + persistent flame**. `-Regen` forces a fresh game; `-Seed N`. |
-| [`champion-replay.ps1`](champion-replay.ps1) | Generate (if missing) + watch the **trained champion (v5 iter-210)** play. `-Opponent heuristic\|mcts`, `-Seed N`, `-Regen`. |
+| [`champion-replay.ps1`](champion-replay.ps1) | ⚠️ **RETRACTED result (v5 iter-210) — historical only, see Notes.** Generate (if missing) + watch it play. `-Opponent heuristic\|mcts`, `-Seed N`, `-Regen`. |
 | [`tournament.ps1`](tournament.ps1) | Headless round-robin standings among agents. `-Agents "mcts,heuristic,greedy,alpha-beta"`, `-Episodes N`. |
-| [`champion-eval.ps1`](champion-eval.ps1) | Native evaluate ladder on the champion (W-D-L + Wilson LCB vs random/heuristic/MCTS). `-Mcts`, `-Games N`. |
+| [`champion-eval.ps1`](champion-eval.ps1) | ⚠️ **RETRACTED result (v5 iter-210) — historical only, see Notes.** Native evaluate ladder (W-D-L + Wilson LCB vs random/heuristic/MCTS). `-Mcts`, `-Games N`. |
 | [`v6-league-resume.ps1`](v6-league-resume.ps1) | Resume the **v6-league** retrain (reward fix + opponent league; see `docs/experiment-memory/07-grokking-campaign.md` Part 2) under the auto-restart watchdog. `-Iterations N` to extend the target. **Stopped 2026-07-10 at iteration 102** — its KL-97 iter-100 gate check failed (vs MCTS: 24-6-34, bomb-kill 3.1% of games); GPU handed to `v6-league-crush01-resume.ps1` for the KL-98 lever-1 test. Checkpoint is intact and untouched if you want to inspect it or branch a different lever from the same point. |
 | [`v6-league-crush01-resume.ps1`](v6-league-crush01-resume.ps1) | KL-98 reserve lever 1: identical to v6-league except `--arena-crush-win-value 0.1` (was 0.3), branched from v6-league's iteration-102 checkpoint. `-Iterations N`. |
 | [`v6-league-gate-eval.ps1`](v6-league-gate-eval.ps1) | The eval-time (noise-off, greedy) win-cause + WAIT% check vs MCTS that actually decides whether a run is working — see KL-97/KL-98/KL-108. `-RunDir path`, `-Checkpoint filename`, `-MctsGames N`, `-SuddenDeathOff` (KL-108 discriminating control), `-PerMatchOutput path` (immutable per-match JSONL rows). |
@@ -33,6 +33,15 @@ cmake --build build --config Release --target bomber_viz bomber_headless
 
 ## Notes
 
+- **`champion-eval.ps1` / `champion-replay.ps1` point at a retracted result.** v5's
+  iter-210 checkpoint was reported as clearing an "agent-ladder superhuman" gate;
+  overnight audit found 95-97% of its wins were arena-crush deaths, not bomb-kills
+  (full diagnosis: `docs/SUPERHUMAN_ALPHAZERO.md`, Linear KL-100). Not renamed —
+  that would break any existing desktop shortcuts pointing at these filenames, which
+  can't be found/fixed from inside the repo — but both scripts now print a loud
+  retraction warning at startup and are documented here as historical-only. Current
+  work evaluates via `v6-league-gate-eval.ps1` against `v6-league`/`crush01`/
+  `control03-from102`, not `$ChampionRunDir`.
 - The champion launchers need the **native LibTorch trainer** (`build-native-gpu`, Release) and
   the LibTorch runtime (`.venv-gpu/…/torch/lib`); `_env.ps1` puts it on `PATH`. The scripted/viz
   launchers do **not** need torch.

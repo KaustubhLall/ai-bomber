@@ -23,6 +23,13 @@ function Get-Headless { Get-BomberExe -Name "bomber_headless" }
 # Native LibTorch trainer (owns the neural net) — used by the champion launchers.
 $NativeExe       = Join-Path $Root "build-native-gpu\src\Release\bomber_alphazero_native.exe"
 $TorchLib        = Join-Path $Root ".venv-gpu\Lib\site-packages\torch\lib"
+# RETRACTED 2026-07-11 - kept for historical inspection only. v5's "agent-ladder
+# superhuman" claim was retracted: 95-97% of its wins were arena-crush deaths, not
+# bomb-kills (docs/SUPERHUMAN_ALPHAZERO.md, Linear KL-100). Not renamed (would break
+# any existing desktop shortcuts pointing at champion-eval.ps1/champion-replay.ps1,
+# which dot-source this file) - the retraction is instead surfaced loudly at the point
+# those two scripts actually run. Active work uses v6-league-gate-eval.ps1 and its own
+# -RunDir against v6-league/crush01/control03-from102, not this variable.
 $ChampionRunDir  = Join-Path $Root "results\alphazero-native-superhuman-v5"
 # Immutable frozen champion (iter-210); falls back to best.pt if the frozen copy is absent.
 $ChampionCkpt    = "frozen-best210-selection-mcts512.pt"
