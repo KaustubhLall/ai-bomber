@@ -477,3 +477,89 @@ will show whether control03's underlying combat skill differs from crush01's now
 that the crush confound is removed - expecting a similarly dismal near-all-draws
 result given the identical bomb-kill rates, but not assuming it before the number is
 in hand.
+
+### Config 4/4 — control03-130, SD-off, N=32 (64 games)
+
+vs MCTS-256: **3W-56D-5L, score=0.5**, WAIT=58.2%, 87.5% timeout draws. Wins: 3
+bomb-kills (100%). Losses: 4 self-kill, 1 bomb-kill (the one game where MCTS itself
+landed a real kill against control03).
+
+### Paired comparison (tools/analyze_paired_gate_eval.py, identical seeds both sides)
+
+SD-on: net bomb-win delta = **0** (2 vs 2 - and not even the same seeds). SD-off: net
+delta = **-2** (crush01 minus control03) - the *unmodified* control landed 2 more
+paired bomb-wins. Neither comparison favors the lever.
+
+### Verdict: lever 1 FAILED, all three predeclared thresholds triggered for BOTH configs
+
+bomb-kill 3.1%/3.1% (floor ~10%), WAIT 64.1%/65.7% (ceiling ~60%), crush-win share
+93.5%/95.6% of wins. crush01's SD-on score improvement over the iter-100 baseline
+(0.4→0.6) is a crush-mechanic artifact - losses converting to crush-wins and draws,
+not new kills - confirmed by SD-off collapsing to 96.9% draws, matching the
+near-total-draw pattern found in the original investigation at iteration 50.
+**Retained as an honest negative result per KL-100's standard, not reframed.**
+
+## Root-cause diagnostic: first real use of KL-107 tracing
+
+Ran `tools/analyze_neural_trace.py` against the SD-on trace files captured during
+configs 1 and 3 (8156 and 8079 rows respectively - full per-step traces, not
+samples). Across ~13 games inspected per config: **the final chosen action agrees
+with the raw network policy's own argmax 70-95% of the time (mostly 80-90%),
+consistently in both crush01 and control03.**
+
+This is the load-bearing new finding of the night. If MCTS search were the primary
+source of passivity - an aggressive raw policy getting "corrected" toward WAIT by the
+search's own value backups - chosen action would frequently *diverge* from the raw
+policy's own preference. It mostly doesn't, in either config. **The raw policy itself
+is already passive before search touches it, regardless of which reward lever was
+applied.** Neither lever 1 (reward reshaping) nor the not-yet-tried lever 2
+(sudden-death timing) touches the policy's own training signal or the self-play data
+distribution that shaped it - both operate on the environment/reward side. This
+directly informs Brick 4/KL-105's eventual "same-state diagnosis" (raw policy vs
+PUCT vs robust-search vs held-out-opponent-action) - this session's read already
+points at policy/data, not search, being the primary lever to pull there.
+
+Entropy (0.77-1.18 out of a max ~1.79 for 6 actions) and value trajectories (many
+games start confident ±0.5-0.9, decay toward 0/negative as the game runs long and a
+draw becomes likely) both look like a value head that's tracking the game
+sensibly, not a broken/collapsed one - reinforcing that the issue is specifically
+about what the POLICY has learned to prefer doing, not a value-estimation failure.
+
+**Caveat, stated plainly:** this is a qualitative read of ~13 games' trace summaries
+per config, not a rigorous statistical test - a real, useful diagnostic signal, not
+proof. Worth a more systematic pass (all 64 games, not a manual sample) if/when this
+becomes load-bearing for a bigger decision.
+
+## Decision: lever 2 launched with calibrated (lowered) expectations
+
+`--sudden-death-start` 120→160, forked from **control03's** iteration-130 checkpoint
+(the stronger unmodified baseline, not crush01 - one variable at a time, no reason to
+carry lever 1's reward change into lever 2). `tools/launch/lever2-sdstart160-
+bootstrap.ps1` / `-resume.ps1` created, following the exact same fork+watchdog-resume
+pattern as control03. Bootstrap launched.
+
+**Explicitly logging low confidence, not hiding it:** given the policy-not-search
+finding above, lever 2 is plausibly going to fail for the same underlying reason
+lever 1 did, since it doesn't touch the policy's training signal either. Running it
+anyway because it's next in the predeclared order, costs nothing new to verify
+honestly (zero new C++ code, same fork/watchdog infrastructure already built and
+tested), and a wrong prediction here is exactly the kind of thing worth being wrong
+about on the record rather than skipping based on an untested hunch. If it also
+fails, the better-reasoned next candidate is lever 3 (opponent diversity in the
+league - MCTS or frozen-self, not just heuristic) implemented with a *weak* MCTS
+config specifically to avoid tanking training throughput, or escalating straight to
+KL-105's curriculum work, which already depends on the KL-107 trace tooling this
+finding came from.
+
+## Session time budget note
+
+Current wall-clock is ~09:45 AM PDT; the "your 10 hours starts now" autonomy grant
+landed roughly 7.5-8 hours before this point (estimated from Linear issue
+timestamps around the KL-101-109 creation cluster, ~01:15-02:00 AM PDT - no exact
+marker exists in this conversation, so treat this as an estimate, not a precise
+figure). This is why lever 2 was launched rather than immediately implementing lever
+3 (which needs new C++ code - a league opponent-type CLI flag - that deserves
+un-rushed implementation, not something to write under time pressure late in an
+autonomous window). Shifting to final consolidation now: verifying everything is
+committed, and making sure this file gives a complete, ordered picture for morning
+review rather than starting further new work threads.
