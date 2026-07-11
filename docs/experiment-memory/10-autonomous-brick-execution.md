@@ -13,6 +13,52 @@ narrative spine — what got worked in what order, every assumption/judgment cal
 without asking, and why — for a single morning read rather than reconstructing intent
 from scattered commits.
 
+## Read this first — executive summary
+
+**Fixed:** the actual experiment-integrity bugs KL-101 was written to fix, all
+verified with real regression tests (35/35 native CTest, 22/22 dependency-free) —
+checkpoints now carry a semantic manifest so reward/mechanics values can't silently
+default instead of inheriting from the checkpoint; the LR schedule horizon no longer
+silently re-derives on `--iterations` extension; a real "fake initial promotion" bug
+is fixed and regression-guarded; two OS-level locks now make the exact GPU-contention
+crash from earlier this session structurally impossible; an explicit `--fork-from`
+mechanism with full provenance replaces ad-hoc checkpoint copying.
+
+**Found (the actual research result):** ran the full matched-control causal
+comparison KL-108 exists for. **Lever 1 (reward reshaping, `arena-crush-win-value`
+0.3→0.1) failed** — a checkpoint trained with the lever and a matched checkpoint
+trained without it are statistically indistinguishable on real combat skill (both
+land a bomb-kill in exactly 3.1% of games against held-out MCTS-256; a
+sudden-death-off control shows both collapse to 87-97% draws with the crush mechanic
+removed). The apparent score improvement crush01 showed earlier was a crush-mechanic
+artifact, not new combat skill — exactly the failure mode this whole harness exists
+to catch, and it caught it on the *new* lever this time, not just the old v5 claim.
+**New root-cause evidence:** first real use of the KL-107 neural-trace capture shows
+the network's own raw policy (before any search) already agrees with the final
+chosen action 74-93% of the time — passivity is coming from the trained policy
+itself, not from search overriding an aggressive one. This points at self-play data
+diversity / curriculum (KL-105) as a more promising lever than further reward or
+timing tweaks.
+
+**Running:** lever 2 (`sudden-death-start` 120→160), launched with explicitly
+calibrated low confidence given the finding above — it doesn't touch the policy
+training signal either, so it's plausibly going to fail the same way. Running it
+anyway since it's cheap, next in the predeclared order, and a wrong prediction
+logged honestly is better than a skipped step. Check `tasklist` /
+`results/alphazero-native-superhuman-lever2-sdstart160/metrics.jsonl` for where it
+landed.
+
+**Recommended next, if lever 2 also fails (or if you'd rather skip straight there):**
+lever 3 — add a *weak* MCTS or a frozen-self checkpoint to the self-play league
+(currently heuristic-only) — needs a small new CLI flag (league opponent type),
+deliberately not implemented tonight to avoid rushing new C++ under time pressure
+late in the session. Or skip the remaining reserve levers and go straight to KL-105's
+curriculum/self-play-diversity work, which the trace evidence now points at directly.
+
+**Not done:** Bricks 5 (duel-v2 fidelity/ABI bump) and 6 (throughput) not started.
+Brick 3 (traces) has its capture mechanism verified but no viewer UI. Brick 7 (docs)
+is ~60% done. Full detail below, in chronological order.
+
 ## Standing constraints (from the user, carried through the whole session)
 
 - Preserve experimental integrity. Do not disturb an active training iteration. Never
@@ -123,7 +169,7 @@ seed, inherited lineage, resolved semantics.
 
 ### Brick 1, Part D — process/logging safety
 
-Commit (pending push, this section written pre-commit). Two mechanisms:
+Commit `d87dcf4`. Two mechanisms:
 
 1. **OS-level exclusive locks** (`ProcessLock`, Windows `CreateFileW` with zero share
    mode / POSIX `flock`) — held for the trainer's entire lifetime, auto-released on any
