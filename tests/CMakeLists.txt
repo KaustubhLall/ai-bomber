@@ -136,4 +136,85 @@ if(TARGET bomber_alphazero_native)
     set_tests_properties(test_native_alphazero_gate PROPERTIES
       DEPENDS test_native_alphazero_resume TIMEOUT 20)
   endif()
+
+  # KL-101 regression: a checkpoint trained at a non-default arena-crush-win-value must not
+  # silently evaluate at the trainer's struct default when the flag isn't repeated - semantics
+  # are inherited from the checkpoint's manifest, not from CLI defaults.
+  add_test(NAME test_native_alphazero_semantic_fresh
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke
+      --fresh --iterations 1 --games 2 --simulations 2
+      --train-steps 1 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 1 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress
+      --arena-crush-win-value 0.15)
+  set_tests_properties(test_native_alphazero_semantic_fresh PROPERTIES TIMEOUT 60)
+  add_test(NAME test_native_alphazero_semantic_evaluate
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> evaluate
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke
+      --checkpoint latest.pt
+      --channels 16 --blocks 1 --max-steps 8 --replay-capacity 128
+      --eval-games 1 --eval-simulations 2
+      --output ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke/eval-result.json
+      --no-progress)
+  set_tests_properties(test_native_alphazero_semantic_evaluate PROPERTIES
+    DEPENDS test_native_alphazero_semantic_fresh TIMEOUT 60)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME test_native_alphazero_semantic_check
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_alphazero_semantic_check.py
+        ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke)
+    set_tests_properties(test_native_alphazero_semantic_check PROPERTIES
+      DEPENDS test_native_alphazero_semantic_evaluate TIMEOUT 20)
+  endif()
+
+  # KL-101 regression: extending --iterations on a resume must not silently re-derive a new
+  # LR schedule horizon against the same accumulated global_updates (the bug that produced the
+  # observed jump from ~1e-5 to 1.596e-4 mid-run). The horizon is pinned on first resolution
+  # and inherited from the checkpoint on every later resume unless explicitly overridden.
+  add_test(NAME test_native_alphazero_schedule_fresh
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-schedule-smoke
+      --fresh --iterations 2 --games 2 --simulations 2
+      --train-steps 4 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 100 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress)
+  set_tests_properties(test_native_alphazero_schedule_fresh PROPERTIES TIMEOUT 60)
+  add_test(NAME test_native_alphazero_schedule_extend
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-schedule-smoke
+      --iterations 5 --games 2 --simulations 2
+      --train-steps 4 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 100 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress)
+  set_tests_properties(test_native_alphazero_schedule_extend PROPERTIES
+    DEPENDS test_native_alphazero_schedule_fresh TIMEOUT 60)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME test_native_alphazero_schedule_check
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_alphazero_schedule_check.py
+        ${CMAKE_BINARY_DIR}/native-alphazero-schedule-smoke)
+    set_tests_properties(test_native_alphazero_schedule_check PROPERTIES
+      DEPENDS test_native_alphazero_schedule_extend TIMEOUT 20)
+  endif()
 endif()

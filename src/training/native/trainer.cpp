@@ -26,6 +26,7 @@ extern "C" {
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <numbers>
 #include <optional>
@@ -738,6 +739,153 @@ std::string runtime_config_signature(const TrainConfig& config) {
     return output.str();
 }
 
+/* KL-101: fields that change what a checkpoint's WEIGHTS or SEARCH mean - reward shaping,
+   league composition, mechanics timing, the resolved LR schedule horizon, and
+   exploration/search settings that shape self-play's data distribution - as opposed to (a)
+   pure shape/ABI fields (width/height/channels/... - still hard-gated by config_signature()
+   above; untouched by this) or (b) pure search-BUDGET fields that legitimately differ
+   between training and evaluation by design (simulations, eval-games, batch-size...).
+   {internal_key, CLI flag} so load_checkpoint() can both serialize/parse these by name and
+   tell whether a field was explicitly requested on this process's own command line. */
+const std::vector<std::pair<std::string, std::string>>& semantic_field_flags() {
+    static const std::vector<std::pair<std::string, std::string>> fields = {
+        {"flame_duration", "--flame-duration"},
+        {"sudden_death_start", "--sudden-death-start"},
+        {"shrink_interval", "--shrink-interval"},
+        {"timeout_draw_value", "--timeout-draw-value"},
+        {"mutual_death_value", "--mutual-death-value"},
+        {"arena_crush_win_value", "--arena-crush-win-value"},
+        {"selfkill_win_value", "--selfkill-win-value"},
+        {"league_heuristic_fraction", "--league-heuristic-fraction"},
+        {"c_puct", "--c-puct"},
+        {"dirichlet_alpha", "--dirichlet-alpha"},
+        {"dirichlet_fraction", "--dirichlet-fraction"},
+        {"temperature", "--temperature"},
+        {"temperature_steps", "--temperature-steps"},
+        {"learning_rate", "--learning-rate"},
+        {"min_learning_rate", "--min-learning-rate"},
+        {"learning_rate_schedule_start_update", "--lr-schedule-start-update"},
+        {"learning_rate_schedule_updates", "--lr-schedule-updates"},
+        {"seed", "--seed"},
+    };
+    return fields;
+}
+
+std::string semantic_manifest_string(const TrainConfig& config) {
+    std::ostringstream output;
+    output << "flame_duration=" << config.flame_duration
+           << ";sudden_death_start=" << config.sudden_death_start
+           << ";shrink_interval=" << config.shrink_interval
+           << ";timeout_draw_value=" << config.timeout_draw_value
+           << ";mutual_death_value=" << config.mutual_death_value
+           << ";arena_crush_win_value=" << config.arena_crush_win_value
+           << ";selfkill_win_value=" << config.selfkill_win_value
+           << ";league_heuristic_fraction=" << config.league_heuristic_fraction
+           << ";c_puct=" << config.c_puct
+           << ";dirichlet_alpha=" << config.dirichlet_alpha
+           << ";dirichlet_fraction=" << config.dirichlet_fraction
+           << ";temperature=" << config.temperature
+           << ";temperature_steps=" << config.temperature_steps
+           << ";learning_rate=" << config.learning_rate
+           << ";min_learning_rate=" << config.min_learning_rate
+           << ";learning_rate_schedule_start_update="
+           << config.learning_rate_schedule_start_update
+           << ";learning_rate_schedule_updates=" << config.learning_rate_schedule_updates
+           << ";seed=" << config.seed;
+    return output.str();
+}
+
+std::map<std::string, std::string> parse_key_value(const std::string& raw) {
+    std::map<std::string, std::string> result;
+    std::istringstream stream(raw);
+    std::string pair;
+    while (std::getline(stream, pair, ';')) {
+        const auto separator = pair.find('=');
+        if (separator == std::string::npos) continue;
+        result[pair.substr(0, separator)] = pair.substr(separator + 1);
+    }
+    return result;
+}
+
+/* Reconcile config's semantic fields against a checkpoint's stored manifest: a field left at
+   its CLI default is OVERWRITTEN with the checkpoint's stored value (inheritance - this is
+   what makes resume/evaluate load semantics from the checkpoint rather than the trainer's
+   struct defaults). A field the CLI explicitly requested is left as the CLI's value, and any
+   difference from the checkpoint is returned as a human-readable fork line rather than passed
+   through silently. Returns the fork lines (empty = pure inheritance, no explicit overrides
+   diverged). */
+std::vector<std::string> apply_semantic_manifest(TrainConfig& config,
+                                                  const std::string& stored_manifest) {
+    const auto stored = parse_key_value(stored_manifest);
+    std::vector<std::string> forks;
+    auto reconcile_int = [&](const char* key, int TrainConfig::* field) {
+        const auto it = stored.find(key);
+        if (it == stored.end()) return;
+        const int stored_value = std::stoi(it->second);
+        if (config.explicit_semantic_flags.count(key)) {
+            if (config.*field != stored_value) {
+                std::ostringstream fork;
+                fork << key << ": checkpoint=" << stored_value
+                     << " -> explicit CLI=" << (config.*field);
+                forks.push_back(fork.str());
+            }
+        } else {
+            config.*field = stored_value;
+        }
+    };
+    auto reconcile_int64 = [&](const char* key, int64_t TrainConfig::* field) {
+        const auto it = stored.find(key);
+        if (it == stored.end()) return;
+        const int64_t stored_value = std::stoll(it->second);
+        if (config.explicit_semantic_flags.count(key)) {
+            if (config.*field != stored_value) {
+                std::ostringstream fork;
+                fork << key << ": checkpoint=" << stored_value
+                     << " -> explicit CLI=" << (config.*field);
+                forks.push_back(fork.str());
+            }
+        } else {
+            config.*field = stored_value;
+        }
+    };
+    auto reconcile_double = [&](const char* key, double TrainConfig::* field) {
+        const auto it = stored.find(key);
+        if (it == stored.end()) return;
+        const double stored_value = std::stod(it->second);
+        if (config.explicit_semantic_flags.count(key)) {
+            if (std::abs(config.*field - stored_value) > 1e-9) {
+                std::ostringstream fork;
+                fork << key << ": checkpoint=" << stored_value
+                     << " -> explicit CLI=" << (config.*field);
+                forks.push_back(fork.str());
+            }
+        } else {
+            config.*field = stored_value;
+        }
+    };
+    reconcile_int("flame_duration", &TrainConfig::flame_duration);
+    reconcile_int("sudden_death_start", &TrainConfig::sudden_death_start);
+    reconcile_int("shrink_interval", &TrainConfig::shrink_interval);
+    reconcile_double("timeout_draw_value", &TrainConfig::timeout_draw_value);
+    reconcile_double("mutual_death_value", &TrainConfig::mutual_death_value);
+    reconcile_double("arena_crush_win_value", &TrainConfig::arena_crush_win_value);
+    reconcile_double("selfkill_win_value", &TrainConfig::selfkill_win_value);
+    reconcile_double("league_heuristic_fraction", &TrainConfig::league_heuristic_fraction);
+    reconcile_double("c_puct", &TrainConfig::c_puct);
+    reconcile_double("dirichlet_alpha", &TrainConfig::dirichlet_alpha);
+    reconcile_double("dirichlet_fraction", &TrainConfig::dirichlet_fraction);
+    reconcile_double("temperature", &TrainConfig::temperature);
+    reconcile_int("temperature_steps", &TrainConfig::temperature_steps);
+    reconcile_double("learning_rate", &TrainConfig::learning_rate);
+    reconcile_double("min_learning_rate", &TrainConfig::min_learning_rate);
+    reconcile_int64("learning_rate_schedule_start_update",
+                    &TrainConfig::learning_rate_schedule_start_update);
+    reconcile_int64("learning_rate_schedule_updates",
+                    &TrainConfig::learning_rate_schedule_updates);
+    reconcile_int("seed", &TrainConfig::seed);
+    return forks;
+}
+
 std::string json_escape(std::string_view value) {
     std::string result;
     for (const char character : value) {
@@ -858,6 +1006,17 @@ struct Trainer::Impl {
             std::cout << "Loaded " << requested_checkpoint_path.string()
                       << " at iteration " << iteration
                       << " with " << replay.size() << " replay samples\n";
+        }
+        /* KL-101: pin the LR schedule horizon to a concrete number the first time it's ever
+           needed (fresh run, or resuming a pre-manifest checkpoint that still carries the 0
+           "derive" sentinel), rather than leaving it at 0. Once resolved here, the semantic
+           manifest above keeps it stable across every future resume even if --iterations is
+           later extended - fixing the bug where extending a run's target silently re-derived
+           a NEW (larger) horizon against the same already-accumulated global_updates,
+           producing a sudden upward learning-rate jump mid-training. */
+        if (config.learning_rate_schedule_updates <= 0) {
+            config.learning_rate_schedule_updates = std::max<int64_t>(
+                static_cast<int64_t>(config.iterations) * config.train_steps, 1);
         }
         if (!config.evaluation_only) {
             write_config();
@@ -1689,6 +1848,7 @@ struct Trainer::Impl {
         archive.write("rng_state", string_tensor(rng_state.str()));
         archive.write("config_signature", string_tensor(config_signature(config)));
         archive.write("runtime_config", string_tensor(runtime_config_signature(config)));
+        archive.write("semantic_manifest", string_tensor(semantic_manifest_string(config)));
         archive.save_to(temporary);
         durable_flush(temporary);
         atomic_replace(temporary, destination);
@@ -1707,6 +1867,44 @@ struct Trainer::Impl {
             std::cout << "Runtime configuration differs from the checkpoint "
                          "(expected for evaluation overrides); training resumes "
                          "record transitions in config-history.jsonl\n";
+        /* KL-101: load semantics (reward shaping, league, mechanics timing, resolved LR
+           schedule horizon, search settings) from the checkpoint's manifest by default,
+           rather than trusting whatever this process's CLI defaults happen to be. This is
+           what makes a checkpoint trained at arena-crush-win-value 0.1 impossible to
+           silently evaluate at the trainer's struct default of 0.3. */
+        torch::Tensor stored_manifest;
+        if (archive.try_read("semantic_manifest", stored_manifest)) {
+            const auto forks = apply_semantic_manifest(config, tensor_string(stored_manifest));
+            if (!forks.empty()) {
+                std::cout << "SEMANTIC FORK - explicit CLI overrides diverge from this "
+                             "checkpoint's trained semantics (all other unlisted fields "
+                             "were inherited from the checkpoint):\n";
+                for (const auto& fork : forks) std::cout << "  " << fork << '\n';
+                std::ofstream fork_log(config.run_dir / "semantic-fork-log.jsonl",
+                                       std::ios::app);
+                fork_log << "{\"checkpoint\":\"" << json_escape(source.string())
+                         << "\",\"forks\":[";
+                for (size_t index = 0; index < forks.size(); ++index)
+                    fork_log << (index ? "," : "") << '"' << json_escape(forks[index]) << '"';
+                fork_log << "]}\n";
+            }
+        } else if (config.legacy_accept_unverified_semantics) {
+            std::cout << "UNVERIFIED SEMANTICS - " << source.string() << " predates the "
+                         "semantic manifest (KL-101). Its trained arena-crush-win-value, "
+                         "selfkill-win-value, league-heuristic-fraction, and other reward/"
+                         "mechanics fields cannot be verified from the checkpoint. Proceeding "
+                         "ONLY because --legacy-accept-unverified-semantics was passed; this "
+                         "process's CLI values/defaults are being used UNVERIFIED:\n  "
+                         << semantic_manifest_string(config) << '\n';
+        } else {
+            throw std::runtime_error(
+                source.string() + " predates the semantic manifest (KL-101) - its trained "
+                "reward/mechanics/schedule semantics cannot be verified from the checkpoint "
+                "file, so loading it would silently risk evaluating or resuming under the "
+                "wrong values (this is exactly the bug that produced an invalid crush01 "
+                "gate read). Pass --legacy-accept-unverified-semantics to proceed anyway "
+                "with this process's CLI values/defaults, understood as unverified.");
+        }
         model->load(archive);
         torch::serialize::InputArchive optimizer_archive;
         archive.read("optimizer", optimizer_archive);
@@ -1993,6 +2191,12 @@ struct Trainer::Impl {
     void evaluate_only() {
         if (!std::filesystem::exists(requested_checkpoint_path))
             throw std::runtime_error("checkpoint not found: " + requested_checkpoint_path.string());
+        /* KL-101: print the RESOLVED semantic config actually in effect for this evaluation
+           (after load_checkpoint()'s inheritance in the constructor above ran) - so a strong
+           W-D-L score is never read without also seeing whether the reward/mechanics
+           semantics used to compute it were the checkpoint's own trained values or a
+           deliberate, logged fork. */
+        std::cout << "resolved semantics: " << semantic_manifest_string(config) << '\n';
         auto random = evaluate_baseline(AGENT_RANDOM, config.evaluation_games,
                                         config.evaluation_simulations,
                                         config.evaluation_seed_base);
@@ -2089,7 +2293,22 @@ struct Trainer::Impl {
                    << "  \"checkpoint_iteration\": " << iteration << ",\n"
                    << "  \"seed_base\": " << config.evaluation_seed_base << ",\n"
                    << "  \"seeds_per_opponent\": " << config.evaluation_games << ",\n"
-                   << "  \"search_simulations\": " << config.evaluation_simulations << ",\n";
+                   << "  \"search_simulations\": " << config.evaluation_simulations << ",\n"
+                   /* KL-101: the resolved semantics actually used for this evaluation's
+                      search backup (post checkpoint-inheritance) - the regression-tested
+                      field that proves a 0.1-trained checkpoint cannot silently evaluate at
+                      the trainer's struct default of 0.3. */
+                   << "  \"resolved_semantics\": {\"flame_duration\": " << config.flame_duration
+                   << ", \"sudden_death_start\": " << config.sudden_death_start
+                   << ", \"shrink_interval\": " << config.shrink_interval
+                   << ", \"timeout_draw_value\": " << config.timeout_draw_value
+                   << ", \"mutual_death_value\": " << config.mutual_death_value
+                   << ", \"arena_crush_win_value\": " << config.arena_crush_win_value
+                   << ", \"selfkill_win_value\": " << config.selfkill_win_value
+                   << ", \"league_heuristic_fraction\": " << config.league_heuristic_fraction
+                   << ", \"c_puct\": " << config.c_puct
+                   << ", \"learning_rate_schedule_updates\": "
+                   << config.learning_rate_schedule_updates << "},\n";
             if (config.evaluate_mcts)
                 output << "  \"baseline_mcts_simulations\": "
                        << config.baseline_mcts_simulations << ",\n"
@@ -2193,6 +2412,10 @@ TrainConfig parse_train_config(int argc, char** argv, int first) {
     config.fresh = has_flag(argc, argv, first, "--fresh");
     config.progress = !has_flag(argc, argv, first, "--no-progress");
     config.evaluate_mcts = has_flag(argc, argv, first, "--eval-mcts");
+    config.legacy_accept_unverified_semantics =
+        has_flag(argc, argv, first, "--legacy-accept-unverified-semantics");
+    for (const auto& [key, flag] : semantic_field_flags())
+        if (has_flag(argc, argv, first, flag)) config.explicit_semantic_flags.insert(key);
     validate_config(config);
     return config;
 }
@@ -2223,6 +2446,12 @@ void print_native_help() {
         "                            played vs the heuristic agent instead of a network mirror;\n"
         "                            mirrors structurally suppress clean kills (both seats share\n"
         "                            dodge skill) - a non-mirror opponent creates reachable ones\n"
+        "  --legacy-accept-unverified-semantics\n"
+        "                            Required to resume/evaluate a checkpoint saved before the\n"
+        "                            semantic manifest (KL-101) - its trained reward/mechanics/\n"
+        "                            schedule values cannot be verified from the checkpoint, so\n"
+        "                            this loudly opts in to using this process's CLI values as\n"
+        "                            unverified rather than failing closed\n"
         "  --replay-out FILE         (evaluate) Write a v4 replay of one checkpoint game for\n"
         "                            bomber_viz --replay (vs heuristic, or MCTS with --eval-mcts)\n"
         "  --replay-incumbent FILE   (evaluate) Record/evaluate checkpoint-vs-checkpoint; with\n"

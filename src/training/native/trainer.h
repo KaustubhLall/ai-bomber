@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <set>
 #include <string>
 
 namespace bomber::az {
@@ -110,6 +111,22 @@ struct TrainConfig {
     bool progress{true};
     bool evaluate_mcts{false};
     bool evaluation_only{false};
+    /* A checkpoint saved before the semantic-manifest fix (KL-101) has no verified record of
+       what reward/mechanics/schedule values it was actually trained under - the flat
+       runtime_config signature never included arena_crush_win_value, selfkill_win_value, or
+       league_heuristic_fraction at all, so those fields cannot be reconstructed from the
+       checkpoint file itself. Loading such a checkpoint for resume/evaluate fails clearly
+       unless this is set, in which case the CLI-provided values are used as-is with a loud,
+       unmissable "UNVERIFIED SEMANTICS" warning - never silently. CLI
+       --legacy-accept-unverified-semantics. */
+    bool legacy_accept_unverified_semantics{false};
+    /* Populated by parse_train_config() from which semantic CLI flags were literally present
+       in argv (as opposed to left at their struct default). Read by load_checkpoint() to
+       decide, per semantic field: inherit the checkpoint's stored value (flag absent - the
+       common resume/evaluate case) or keep the CLI's value and log an explicit semantic-fork
+       diff (flag present - a deliberate override). Not part of any signature/manifest itself;
+       parse-time metadata threaded through because Impl only sees the resolved TrainConfig. */
+    std::set<std::string> explicit_semantic_flags{};
 };
 
 TrainConfig parse_train_config(int argc, char** argv, int first_argument);
