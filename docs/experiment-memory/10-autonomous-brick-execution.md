@@ -395,3 +395,62 @@ without disrupting it - read-only tasklist/metrics.jsonl checks only). Settling 
 into a lower-activity monitoring posture now rather than continuing to manufacture
 more parallel work threads - the Monitor (task b3n749li0) will notify at the next
 5-iteration milestone or on completion.
+
+## Brick 2: the real eval matrix — results as they land
+
+control03 finished training on its own (the trainer's loop naturally exited at
+`iteration == config.iterations == 130`, exit code 0, watchdog saw a clean exit and
+did not restart it — no force-stop needed at all, the cleanest possible outcome).
+Rebuilt Release with the GPU finally free, full CTest 35/35, manually verified
+`--trace-output` end-to-end against the real control03-130 checkpoint (464 correctly
+structured rows across 2 real games, exit code 0) - confirming the earlier Debug-mode
+segfault really was unrelated to this code, as diagnosed. Committed (`6a3be36`).
+
+**Important correction caught before running the matrix:** crush01's checkpoints
+(including `iteration_000130.pt`) were saved by the pre-KL-101 binary — it was
+stopped before that fix even existed — so they have no semantic manifest and hit the
+same fail-closed check the control03 bootstrap did. Extended
+`v6-league-gate-eval.ps1` with `-LegacyArenaCrushWinValue` (forces
+`--legacy-accept-unverified-semantics` + an explicit `--arena-crush-win-value`, not
+left to a guess) rather than discovering this the hard way mid-matrix.
+
+### Config 1/4 — crush01-130, SD-on, N=32 (64 games), correct 0.1 semantics
+
+vs MCTS-256: **31W-17D-16L, score=0.6**, WAIT=64.1%. Win-cause: bomb-kill=2 (6.5% of
+wins), arena-crush=29 (93.5%). Loss-cause: self-kill=2, arena-crush=14 (87.5% of
+losses - MCTS is winning the same way). Draws: mutual-death=17.
+
+Compare to the KL-97 iteration-100 baseline (24W-6D-34L, score=0.4, bomb-kill=2/64=
+3.1%, WAIT=75.0%): score up (0.4→0.6), WAIT down a little (75.0%→64.1%) - but
+**bomb-kill is unchanged in absolute terms: 2/64 = 3.1% both times.** The apparent
+improvement is losses converting to draws and crush-wins, not new kills.
+
+**All three predeclared intervention thresholds triggered:** bomb-kill (3.1%) well
+below the ~10% floor; WAIT (64.1%) above the ~60% ceiling; arena-crush still causes
+the large majority of decisive outcomes on both sides.
+
+### Config 2/4 — crush01-130, SD-off (the discriminating control), N=32
+
+vs MCTS-256: **1W-62D-1L, score=0.5, 96.9% timeout draws.** Without the crush
+mechanic to convert stalemates into decisions, crush01-130 essentially cannot force
+*or avoid* a decisive outcome against a held-out strong opponent at all. The two
+decisive games were both bomb-kills (the only cause type possible with no crush), but
+there were only two of them out of 64.
+
+**This is the same near-all-draws pattern the original investigation found at
+iteration 50** (SD-off-vs-MCTS: 91.7% draws then). The gap has not meaningfully
+closed between iteration 50 and iteration 130 on this specific diagnostic - if
+anything it looks slightly wider (96.9% vs 91.7%), though a two-point comparison
+across different checkpoints/times isn't strong evidence of a trend by itself.
+
+**Reading config 1+2 together:** the SD-on score improvement (0.4→0.6) is now
+understood to be almost entirely a crush-mechanic artifact, not increased combat
+competence - exactly the failure mode this whole harness was rebuilt to catch. Lever
+1 (reward reshaping alone) has **not** produced defensible combat skill, 130
+iterations in.
+
+Configs 3/4 (control03, the matched no-lever comparison) in progress - the honest
+conclusion isn't final until that side of the comparison is in, since without it
+there's no way to know whether crush01's numbers are worse than, the same as, or
+(unlikely given the above, but not yet ruled out) better than what 28 iterations of
+completely unmodified training would have produced anyway.
