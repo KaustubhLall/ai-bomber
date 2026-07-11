@@ -16,16 +16,23 @@
 #
 # Usage:
 #   .\tools\launch\v6-league-gate-eval.ps1                    # checkpoint=latest.pt, N=32
-#   .\tools\launch\v6-league-gate-eval.ps1 -Checkpoint results\alphazero-native-superhuman-v6-league\iteration_000100.pt
+#   .\tools\launch\v6-league-gate-eval.ps1 -Checkpoint iteration_000100.pt
 #   .\tools\launch\v6-league-gate-eval.ps1 -MctsGames 64      # tighter Wilson LCB
+#
+# -Checkpoint is resolved by the native trainer relative to --run-dir (same
+# convention as Resolve-Champion in _env.ps1, which returns a bare filename,
+# not a joined path) - passing a path that already includes the run-dir
+# prefix doubles it and fails with "checkpoint not found". This script
+# strips any leading path so either form works.
 param(
-    [string]$Checkpoint = "results/alphazero-native-superhuman-v6-league/latest.pt",
+    [string]$Checkpoint = "latest.pt",
     [int]$MctsGames = 32,
     [int]$MctsSims = 256,
     [string]$Output = "results/alphazero-native-superhuman-v6-league/gate-eval.json"
 )
 . "$PSScriptRoot\_env.ps1"
 Use-Torch
+$Checkpoint = Split-Path -Leaf $Checkpoint
 
 Write-Host "Gate eval: $Checkpoint vs MCTS-$MctsSims, N=$MctsGames games, noise OFF, greedy action selection."
 $evalArgs = @(
