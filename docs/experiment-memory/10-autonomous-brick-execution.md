@@ -454,3 +454,26 @@ conclusion isn't final until that side of the comparison is in, since without it
 there's no way to know whether crush01's numbers are worse than, the same as, or
 (unlikely given the above, but not yet ruled out) better than what 28 iterations of
 completely unmodified training would have produced anyway.
+
+### Config 3/4 — control03-130, SD-on, N=32 (64 games), matched control (0.3, unmodified)
+
+vs MCTS-256: **45W-7D-12L, score=0.8**, WAIT=65.7%. Win-cause: bomb-kill=2 (4.4% of
+wins), arena-crush=43 (95.6%). Loss-cause: self-kill=5, arena-crush=7. Draws:
+mutual-death=7.
+
+**Striking comparison to config 1 (crush01-130, same eval protocol, same seeds):**
+score 0.8 vs 0.6 - control03 (no lever) scores *higher*. But **bomb-kill is
+identical: 2/64 = 3.1% for both.** WAIT is within noise of each other (65.7% vs
+64.1%). Control03 simply produced more crush-wins (43 vs 29) and fewer losses (12 vs
+16) - not more real kills.
+
+**Reading so far:** the reward lever (crush01) has not improved real combat skill
+relative to doing nothing (control03) - both are equally unable to force a bomb-kill
+against MCTS, at the same 3.1% rate. If anything, by the SD-on score alone the
+*unmodified* continuation looks better, though that's plausibly just how it happens
+to navigate the crush mechanic rather than a meaningful difference, since the actual
+combat-skill number (bomb-kill%) that matters is tied. Config 4 (control03 SD-off)
+will show whether control03's underlying combat skill differs from crush01's now
+that the crush confound is removed - expecting a similarly dismal near-all-draws
+result given the identical bomb-kill rates, but not assuming it before the number is
+in hand.
