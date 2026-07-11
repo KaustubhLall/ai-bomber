@@ -609,3 +609,33 @@ un-rushed implementation, not something to write under time pressure late in an
 autonomous window). Shifting to final consolidation now: verifying everything is
 committed, and making sure this file gives a complete, ordered picture for morning
 review rather than starting further new work threads.
+
+## Lever 2 running — final status for this session
+
+`fork-manifest.json` verified before launch (parent = control03's iteration_000130.pt
+by hash, `resolved_semantics` correctly shows `sudden_death_start=160` and
+`arena_crush_win_value=0.3`, LR schedule horizon correctly inherited at 13184 rather
+than re-derived). One near-miss caught and resolved during verification: briefly
+suspected a discrepancy in the fork's `inherited_champion_lineage`
+(`best_iteration=10`) against a recollection of control03 showing `best_iteration=130`
+at that point - re-checked against control03's own `metrics.jsonl` directly (a second,
+independent source) rather than trusting the recollection, and it confirmed
+`best_iteration=10` was correct all along. The earlier "130" figure was a memory
+error on my part, not a bug - logged here as an example of catching and correcting
+my own mistake with fresh evidence rather than compounding it.
+
+`lever2-sdstart160-resume.ps1` launched under the watchdog, confirmed running
+(iteration 131 already complete), persistent monitor armed (task `bdz74kh8u`,
+targeting iteration 160, ~30 iterations / ~3.75-4.2h out).
+
+**This is very likely near the end of what this session completes autonomously** -
+current wall-clock is ~10:00 AM PDT, an estimated 8+ hours into the "~10 hours"
+window. If the user returns before lever 2 reaches 160: the run is safe to leave
+mid-flight (watchdog auto-restarts on any crash, checkpoints every iteration) or safe
+to stop at any completed iteration (same atomic-checkpoint guarantee relied on all
+night). The **executive summary at the top of this file** has everything needed to
+either continue the plan (launch the KL-98 lever-2 gate check once it reaches 160,
+following the exact same 4-eval-config + paired-comparison pattern as lever 1) or
+redirect based on what's found. All work is committed and pushed;
+`git log --oneline` on this branch is the complete, ordered record of tonight
+if this file's narrative form isn't wanted.
