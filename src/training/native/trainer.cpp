@@ -525,6 +525,13 @@ struct SearchConstraint {
 
 struct SearchResult {
     std::array<int, kJointActions> visits{};
+    /* KL-107: root priors (the network policy head's raw output, evaluated once when the
+       root is first expanded, BEFORE any simulation refines it) and per-seat value sums -
+       read-only copies of what the root Node already computed, added here purely so a
+       caller can capture them; nothing about the search itself changes by adding this. */
+    std::array<float, kJointActions> priors{};
+    std::array<float, kJointActions> value_sum0{};
+    std::array<float, kJointActions> value_sum1{};
 };
 
 struct LeafJob {
@@ -609,8 +616,12 @@ public:
         }
 
         std::vector<SearchResult> results(roots.size());
-        for (size_t index = 0; index < roots.size(); ++index)
+        for (size_t index = 0; index < roots.size(); ++index) {
             results[index].visits = roots[index]->visits;
+            results[index].priors = roots[index]->priors;
+            results[index].value_sum0 = roots[index]->value_sum0;
+            results[index].value_sum1 = roots[index]->value_sum1;
+        }
         return results;
     }
 
@@ -821,6 +832,33 @@ int marginal_action(const std::array<int, kJointActions>& visits, int seat) {
     }
     return static_cast<int>(std::distance(
         marginal.begin(), std::max_element(marginal.begin(), marginal.end())));
+}
+
+/* KL-107: marginalize a joint-action array (visits or priors, whichever numeric type) down
+   to one seat's per-action distribution - same accumulation pattern as marginal_action()
+   above, generalized to return the full array (for tracing) instead of just the argmax. */
+template <typename JointArray>
+std::array<double, kActions> marginal_distribution(const JointArray& joint, int seat) {
+    std::array<double, kActions> marginal{};
+    for (int action = 0; action < kActions; ++action) {
+        for (int opponent_action = 0; opponent_action < kActions; ++opponent_action) {
+            marginal[action] += seat == 0 ? joint[action * kActions + opponent_action] :
+                                            joint[opponent_action * kActions + action];
+        }
+    }
+    return marginal;
+}
+
+double distribution_entropy(const std::array<double, kActions>& distribution) {
+    const double total = std::accumulate(distribution.begin(), distribution.end(), 0.0);
+    if (total <= 0.0) return 0.0;
+    double entropy = 0.0;
+    for (const double value : distribution) {
+        if (value <= 0.0) continue;
+        const double probability = value / total;
+        entropy -= probability * std::log(probability);
+    }
+    return entropy;
 }
 
 void atomic_replace(const std::filesystem::path& temporary,
@@ -1925,7 +1963,8 @@ struct Trainer::Impl {
                                  uint64_t seed_base,
                                  const std::filesystem::path& replay_out = {},
                                  const std::string& candidate_label = {},
-                                 const std::filesystem::path& per_match_output = {}) {
+                                 const std::filesystem::path& per_match_output = {},
+                                 const std::filesystem::path& trace_output = {}) {
         struct Match {
             BomberEnv env{};
             Agent opponent{};
@@ -1963,6 +2002,26 @@ struct Trainer::Impl {
                 std::filesystem::create_directories(per_match_output.parent_path());
             per_match_log = std::make_unique<std::ofstream>(per_match_output, std::ios::trunc);
         }
+        /* KL-107: per-LEARNER-STEP neural decision trace, one JSON line per step across all
+           matches. Stamped with checkpoint/executable hashes (reusing KL-101 Part C's
+           sha256_file/current_executable_path - the same provenance question, "what exactly
+           produced this," applies here too) so a trace file is self-describing without a
+           separate manifest lookup. Trace-off (trace_output empty, the default) means this
+           whole block never executes and nothing about the search or chosen actions changes -
+           every value read here (priors, visits, value sums) was already computed by the
+           search regardless of whether anyone is watching. */
+        std::unique_ptr<std::ofstream> trace_log;
+        if (!trace_output.empty()) {
+            if (!trace_output.parent_path().empty())
+                std::filesystem::create_directories(trace_output.parent_path());
+            trace_log = std::make_unique<std::ofstream>(trace_output, std::ios::trunc);
+            *trace_log << "{\"trace_format_version\":1,\"checkpoint_sha256\":\""
+                       << sha256_file(requested_checkpoint_path)
+                       << "\",\"executable_sha256\":\""
+                       << sha256_file(current_executable_path())
+                       << "\",\"git_commit\":\"" << AI_BOMBER_GIT_SHA
+                       << "\",\"opponent_type\":\"" << agent_type_name(type) << "\"}\n";
+        }
         /* Optional: record match 0 (both seats' joint actions + full flame/arena state
            each step) into a v4 replay bomber_viz can play back. Match 0 uses seed_base. */
         std::unique_ptr<Replay> recorder;
@@ -1998,8 +2057,46 @@ struct Trainer::Impl {
             auto searches = search.search(active, constraints, false, simulations);
             for (size_t active_index = 0; active_index < active.size(); ++active_index) {
                 Match& match = matches[indices[active_index]];
+                const auto& search_result = searches[active_index];
                 const int learner_action = marginal_action(
-                    searches[active_index].visits, match.learner_seat);
+                    search_result.visits, match.learner_seat);
+                if (trace_log) {
+                    /* Raw policy = root priors (network policy head, evaluated once before
+                       any simulation) marginalized to this seat. MCTS policy = root visits
+                       (simulation-refined) marginalized the same way. Search value estimate =
+                       this seat's accumulated backup sum / total visits at the root, summed
+                       over joint actions - the search's own belief about the position, not a
+                       separate raw-network value head read (that would need capturing the
+                       root's leaf evaluation before any backup, a deeper structural change
+                       deliberately deferred - see docs/experiment-memory/10-...md). */
+                    const auto raw_policy = marginal_distribution(search_result.priors, match.learner_seat);
+                    const auto mcts_policy = marginal_distribution(search_result.visits, match.learner_seat);
+                    const auto& value_sum = match.learner_seat == 0 ? search_result.value_sum0
+                                                                     : search_result.value_sum1;
+                    const int root_visits = std::accumulate(
+                        search_result.visits.begin(), search_result.visits.end(), 0);
+                    double value_estimate = 0.0;
+                    for (size_t joint = 0; joint < kJointActions; ++joint) value_estimate += value_sum[joint];
+                    value_estimate = root_visits > 0 ? value_estimate / root_visits : 0.0;
+                    *trace_log << "{\"seed\":" << match.seed
+                        << ",\"learner_seat\":" << match.learner_seat
+                        << ",\"step\":" << match.env.state.step
+                        << ",\"chosen_action\":" << learner_action
+                        << ",\"raw_policy\":[";
+                    for (int action = 0; action < kActions; ++action)
+                        *trace_log << (action ? "," : "") << raw_policy[action];
+                    *trace_log << "],\"raw_policy_entropy\":" << distribution_entropy(raw_policy)
+                        << ",\"mcts_policy\":[";
+                    for (int action = 0; action < kActions; ++action)
+                        *trace_log << (action ? "," : "") << mcts_policy[action];
+                    *trace_log << "],\"root_visits\":" << root_visits
+                        << ",\"search_value_estimate\":" << value_estimate
+                        << ",\"running_wait_fraction\":"
+                        << (match.total_steps > 0
+                                ? static_cast<double>(match.wait_steps) / match.total_steps
+                                : 0.0)
+                        << "}\n";
+                }
                 Observation observation;
                 DebugSnapshot snapshot;
                 const int opponent_seat = 1 - match.learner_seat;
@@ -2694,7 +2791,8 @@ struct Trainer::Impl {
             mcts_result = evaluate_baseline(AGENT_MCTS, config.mcts_evaluation_games,
                                             config.evaluation_simulations,
                                             config.mcts_evaluation_seed_base,
-                                            {}, {}, config.per_match_output);
+                                            {}, {}, config.per_match_output,
+                                            config.trace_output);
             std::cout << "mcts: " << mcts_result->wins << "W " << mcts_result->draws << "D "
                       << mcts_result->losses << "L score=" << mcts_result->score << '\n';
             print_behavior_report("mcts", *mcts_result);
@@ -2820,6 +2918,7 @@ TrainConfig parse_train_config(int argc, char** argv, int first) {
     config.checkpoint = parse_string(argc, argv, first, "--checkpoint", config.checkpoint.string());
     config.evaluation_output = parse_string(argc, argv, first, "--output", "");
     config.per_match_output = parse_string(argc, argv, first, "--per-match-output", "");
+    config.trace_output = parse_string(argc, argv, first, "--trace-output", "");
     config.replay_output = parse_string(argc, argv, first, "--replay-out", "");
     config.replay_incumbent = parse_string(argc, argv, first, "--replay-incumbent", "");
     config.incumbent_eval_games = parse_number(argc, argv, first, "--incumbent-eval-games",
@@ -2926,6 +3025,11 @@ void print_native_help() {
         "                            completed MCTS-baseline match: seed, seat, outcome, cause,\n"
         "                            steps, WAIT - the per-match rows a paired/seat-delta causal\n"
         "                            comparison needs (KL-108)\n"
+        "  --trace-output PATH       (evaluate --eval-mcts) Write one immutable JSON line per\n"
+        "                            LEARNER STEP: raw network policy + entropy, MCTS-refined\n"
+        "                            policy, search value estimate, root visits, chosen action -\n"
+        "                            the neural decision trace for diagnosing whether a tactical\n"
+        "                            error came from the policy, value, or search (KL-107)\n"
         "  --draw-value X            Set both per-seat draw values (timeout+mutual death) to X\n"
         "                            in [-1,0]; the aggression dial (default -0.5/-0.2)\n"
         "  --arena-crush-win-value X Value of a win by sudden-death arena crush (default 0.3)\n"

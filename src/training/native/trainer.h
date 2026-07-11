@@ -20,6 +20,14 @@ struct TrainConfig {
        path - the per-match rows a paired/seat-delta causal comparison needs, that the
        aggregate Evaluation summary alone can't provide. CLI --per-match-output. */
     std::filesystem::path per_match_output{};
+    /* KL-107: if set (evaluate mode with --eval-mcts), write one immutable JSON line per
+       LEARNER STEP (not per match) across all MCTS-baseline matches: raw network policy
+       (root priors, marginalized per seat) + entropy, MCTS-refined policy (root visits,
+       marginalized), search-derived value estimate, root visit count, chosen action, running
+       WAIT fraction. Trace-off (this unset, the default) makes zero code-path changes -
+       everything the tracer reads was already computed by the search regardless. CLI
+       --trace-output. */
+    std::filesystem::path trace_output{};
     /* If set (evaluate mode), write a v4 replay of one representative checkpoint game that
        bomber_viz --replay can play back. Opponent = heuristic, or MCTS with --eval-mcts;
        set replay_incumbent to instead record checkpoint-vs-checkpoint. */
