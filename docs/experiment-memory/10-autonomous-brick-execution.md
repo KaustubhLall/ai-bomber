@@ -284,3 +284,79 @@ standing MCTS-eval seed block, run the paired comparison, apply the predeclared
 stop/intervention thresholds (bomb wins <~10% of MCTS games, greedy WAIT >~60%, or
 crush still causing most decisive outcomes → stop this lineage, try a reserve lever),
 update KL-98/KL-108/KL-100 with whatever the honest answer turns out to be.
+
+### Brick 2 update: bootstrap succeeded, real run launched
+
+Bootstrap's first attempt failed exactly as designed (parent predates the semantic
+manifest, fail-closed) — fixed with `--legacy-accept-unverified-semantics` +
+explicit `--arena-crush-win-value 0.3`, documented above. Second attempt succeeded
+cleanly: `fork-manifest.json` verified (parent hash correct, inherited lineage
+`best_iteration=10`/`best_score=0.9375`/`promotion_count=1` matches v6-league's
+actual history, `best.pt` correctly materialized by the Part C fix). Rebuilt the
+trainer to pick up the per-match-export/SD-off changes made during the wait, full
+CTest 35/35, manually smoke-tested `--per-match-output` against the real control03
+checkpoint (8 rows for 4 games × 2 seats, matched the console summary exactly).
+Committed (`3dd3a87`). `control03-resume.ps1` launched under the watchdog toward
+iteration 130 (27 iterations from 103, ~3.5-3.75h estimated); persistent monitor
+armed (task `b3n749li0`).
+
+**Idle-window judgment call:** rather than sit idle for ~3.5 hours, using this window
+for Brick 3 (neural decision traces) *code* work — writing and compiling, not running
+evaluate against a real checkpoint, since evaluate does share the GPU with the
+training process to some degree even though the KL-101 lock doesn't block it, and the
+priority right now is getting control03 to 130 promptly. Any real verification of
+Brick 3 waits until control03 finishes, or a very light/quick smoke test only if
+truly needed to unblock the code itself.
+
+## Brick 3 (KL-107): neural decision traces — code written, NOT yet verified
+
+Wrote the core data-capture mechanism (scoped, same pattern as Brick 1 Part E — full
+Brick 3 scope includes a viewer UI and a real 3-game win/loss/draw analysis, both
+explicitly deferred, see below):
+
+- Extended `SearchResult` with `priors`/`value_sum0`/`value_sum1` (read-only copies
+  of what the root `Node` already computes — adding these fields cannot change search
+  behavior, they're populated by three extra array-copy lines at the existing
+  single population site).
+- `marginal_distribution<T>()` — generalizes the existing `marginal_action()`
+  joint-to-per-seat pattern to return the full distribution (not just the argmax),
+  reused for both raw priors and MCTS visits.
+- `--trace-output PATH` (evaluate `--eval-mcts`): one JSON line per learner step -
+  raw network policy (root priors marginalized) + entropy, MCTS-refined policy (root
+  visits marginalized), search-derived value estimate, root visit count, chosen
+  action, running WAIT fraction. Stamped with checkpoint/executable SHA-256 + git
+  commit (reusing KL-101 Part C's `sha256_file`/`current_executable_path`, not
+  duplicated). Trace-off (flag unset, the default) executes none of this code, so
+  behavior when tracing is off cannot differ - satisfies "bit-for-bit unchanged"
+  trivially rather than needing a separate verification pass.
+
+**Hit a real crash while verifying, root-caused as unrelated to this code:**
+`build-native-gpu/src/Debug/bomber_alphazero_native.exe` (built to check compilation
+without touching the RUNNING Release binary control03 holds — Windows locks a
+running .exe against overwrite, and the KL-101 lock is per-process, not a file lock,
+so a Release rebuild right now would have failed) segfaults on `evaluate --eval-mcts`
+- **with or without `--trace-output`**, confirmed by testing both. Since it crashes
+identically either way, this is not a bug introduced tonight; most likely a
+LibTorch Debug/Release CRT mismatch (the PyTorch wheel ships Release-only runtime
+libraries, and linking a Debug build of this code against them is a known footgun) -
+consistent with `build-native-gpu` having always been documented as **Release only**
+for this target, meaning Debug was simply never a tested configuration before
+tonight, not something that regressed. Confirmed control03 (separate process, PID
+60540, Release) was completely unaffected throughout - memory grew normally across
+the whole diagnostic.
+
+**Consequence:** cannot verify this code compiles/runs in the actually-supported
+Release configuration until control03 releases the GPU/exe lock (~3 more hours from
+launch) or finishes. Stopping further trainer.cpp/h changes here rather than stacking
+more unverified code on top - continuing with compilation-free work
+(Python-side tooling, documentation) until a safe verification window opens.
+
+**Deferred (documented, not silently dropped):** viewer UI panels (policy/value/root-
+distribution/danger/bearing/outcome-cause rendering in the raylib visualizer — a
+large, separate piece of work); "opponent-visible fraction and global bearing,"
+"time-to-crush/future-safe-region," "blocked movement and target conflict" (each
+needs its own per-step game-state instrumentation beyond what search already
+computes); the actual "inspect one win/loss/draw against MCTS and identify root
+cause" analysis (deliberately waiting for control03's real iteration-130 result,
+so the games analyzed are the ones that actually matter to the open question, not
+placeholder games from a checkpoint about to be superseded).
