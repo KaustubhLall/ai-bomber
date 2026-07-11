@@ -1,5 +1,35 @@
 # Superhuman AlphaZero ladder
 
+## ⚠️ RETRACTED 2026-07-10 — the v5/iter-210 claim below does not hold
+
+The "Frozen candidate" and "Final proof status" sections below report W-D-L
+and Wilson lower bounds only — **no win-cause classification**. An overnight
+audit (Linear KL-96, "Update 2026-07-10") found that 95-97% of this
+checkpoint's wins, including the A3/B3 holdout wins reported here, were
+**arena-crush deaths** (`death_owner == -1`, the closing-arena wall killing
+the loser), not bomb-kills. A sudden-death-OFF control against the same
+checkpoint collapsed to near-all-draws, meaning there was almost no
+demonstrated combat skill independent of the crush mechanic. Retroactive
+win-cause classification across earlier checkpoints showed bomb-kill%
+collapsing specifically at iteration 210, the promoted checkpoint — not a
+gradual drift.
+
+Root cause: `terminal_training_value` paid the same full +1.0 reward for an
+arena-crush win as for a real bomb-kill, and self-play is a mirror match
+(both seats = the same network), which structurally can't produce many clean
+kills between two agents of identical dodge skill. The network learned the
+only reliably decisive line available to it — survive to the crush window —
+and the W-D-L-only gate in this document had no way to see the difference.
+
+This is retained as a historical record of what was measured and exactly how
+the gap slipped through a statistically careful-looking protocol. It is
+**not** a valid superhuman claim. The fix (reward reshaping so only a
+demonstrated bomb-kill pays full value, plus an opponent league) and the new
+claim bar (win-cause classified, eval-time/noise-off only, SD-off control
+required) are tracked in Linear KL-96 → KL-100 ("honest claim ledger"). Any
+future superhuman claim for this project must clear KL-100's checklist before
+being written up as fact.
+
 ## Claim boundary
 
 This continuation targets **agent-ladder superhuman performance**: a frozen
