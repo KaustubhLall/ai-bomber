@@ -368,11 +368,12 @@ collapse) — the binding constraint is the dynamics/matchup, not just the value
   collected for the network-controlled seat only; dirichlet exploration kept ON (root_noise
   `true`, unlike the deterministic `evaluate_baseline` pattern it otherwise mirrors — the one
   bug that would have silently produced degenerate training data). Real opponent moves via
-  `agent_act`; the search's internal lookahead models the opponent seat's hypothetical future
-  moves as heuristic-like via `SearchConstraint`, not as another copy of the network. Rationale:
-  heuristic doesn't self-destruct (0 self-kills observed), so a league win against it is an
-  earned kill for the corrected reward to reinforce — a non-mirror opponent creates the
-  reachable kills that pure self-play structurally can't.
+  `agent_act`, but the neural PUCT lookahead does **not** recursively invoke that held-out
+  opponent policy; its opponent-response assumption remains an explicit diagnostic gap rather
+  than a verified heuristic model. The league still supplies observed trajectories against a
+  non-mirror opponent. Because the heuristic did not self-destruct in the measured block, a
+  league win against it can supply an earned-kill target that mirror play rarely reaches, but
+  this does not by itself prove that the search models the matchup correctly.
 
 **Two parallel, matched-hyperparameter runs launched to isolate which lever matters:**
 `alphazero-native-superhuman-v6` (pure mirror, reward fix only) and `-v6-league`
@@ -389,10 +390,10 @@ trusting it unattended: bomb-kill 50% of wins vs mirror's ~1% — clean pass.
 RTX 5080 killed both processes with no in-app error trace (abrupt external termination) after
 ~10 minutes. v6-pure's checkpoint was intact (safely parked at iter 11); v6-league's was
 truncated mid-write (206MB vs the expected ~868MB) and discarded. A solo v6-pure run had
-earlier coexisted fine with a lightweight `evaluate`-only process for an extended period, so
-the likely trigger is specifically *two simultaneous self-play+optimize loops* (heavier/more
-concurrent GPU work than one train + one evaluate), not GPU sharing in general. **Recovery:
-serialize — league gets the GPU first** (the diagnostics point to it as the load-bearing
+earlier coexisted with a lightweight `evaluate` process. **Superseded safety interpretation
+(2026-07-11 closeout):** absence of a crash did not make that overlap safe or make timing
+evidence valid. The current rule and OS lock serialize every native train/evaluate process,
+not only two trainers. **Recovery: serialize — league gets the GPU first** (the diagnostics point to it as the load-bearing
 lever); v6-pure stays parked at iter 11 until there's a deliberate reason to resume it
 non-concurrently.
 

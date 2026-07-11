@@ -15,52 +15,57 @@ from scattered commits.
 
 ## Read this first — executive summary
 
-**Fixed:** the actual experiment-integrity bugs KL-101 was written to fix, all
-verified with real regression tests (35/35 native CTest, 22/22 dependency-free) —
-checkpoints now carry a semantic manifest so reward/mechanics values can't silently
-default instead of inheriting from the checkpoint; the LR schedule horizon no longer
-silently re-derives on `--iterations` extension; a real "fake initial promotion" bug
-is fixed and regression-guarded; two OS-level locks now make the exact GPU-contention
-crash from earlier this session structurally impossible; an explicit `--fork-from`
-mechanism with full provenance replaces ad-hoc checkpoint copying.
+**Fixed, with a later independent correction pass:** checkpoint semantic inheritance,
+LR-horizon pinning for manifested checkpoints, exact parent-champion preservation on
+fork, one-native-GPU-process locking, write-once evaluation evidence with embedded
+hashes/invocation, durable logs, and explicit fork provenance. The independent pass
+found that the first control fork had still derived the wrong legacy LR horizon and
+that the first champion fix could relabel current weights as an older champion; both
+future code paths are now fail-closed and regression-tested. Historical runs remain
+historical evidence—they were not retroactively made causal by the code fix.
 
-**Found (the actual research result — session concluded, both attempted levers
-failed):** ran the full matched-control causal comparison KL-108 exists for, twice.
+**Found (the actual research result — session concluded, both attempted checkpoints
+failed the absolute combat bar):** the runs are valuable negative behavioral evidence,
+but the independent audit found that neither comparison isolated one causal variable.
 
-**Lever 1** (reward reshaping, `arena-crush-win-value` 0.3→0.1) **failed** — a
-checkpoint trained with the lever and a matched checkpoint trained without it are
-statistically indistinguishable on real combat skill (both land a bomb-kill in
-exactly 3.1% of games against held-out MCTS-256). The apparent score improvement
-crush01 showed earlier was a crush-mechanic artifact, not new combat skill — exactly
-the failure mode this whole harness exists to catch, caught again on a *new* lever,
-not just the old v5 claim.
+**Lever 1 checkpoint** (reward reshaping, `arena-crush-win-value` 0.3→0.1) **failed
+the bar**—it and the attempted control each landed 2/64 SD-on bomb wins. However,
+crush01 trained at LR `1.005e-4→6.188e-5` over iterations 103–130 while control03
+trained at `1e-5` throughout, so this is not a one-variable reward ablation. The
+apparent score improvement was not evidence of new combat skill: its wins remained
+crush-dominated and the attempted treatment/control comparison was LR-confounded.
 
-**Lever 2** (`sudden-death-start` 120→160, forked from the matched control) **also
-failed** — score collapsed (0.8→0.4) as losses roughly tripled (12→32), WAIT got
-worse (65.7%→67.9%), though bomb-kill did roughly double (3.1%→6.25%, the first
-movement in that metric all session — real but weak evidence at N=64, and outweighed
-by the score/loss damage).
+**Lever 2 checkpoint** (`sudden-death-start` 120→160) **also failed the bar**—the
+common-environment SD120 gate was 21-11-32, WAIT 67.9%, and 4/64 bomb wins; SD-off
+was 2-58-4. It was compared with its iteration-130 starting checkpoint rather than an
+SD120 continuation trained to iteration 160, so the delta is confounded by 30 extra
+iterations. This rules out the checkpoint as useful, not the timing variable causally.
 
 **The decisive cross-cutting finding:** with sudden-death removed (the discriminating
-control), **all three checkpoints tested — crush01, the unmodified control, and
-lever2 — collapse to 87-97% draws against MCTS, regardless of which lever was
-applied.** None of the reward-shaping or timing levers touch the actual bottleneck.
+control), **all three checkpoints tested — crush01, the LR-confounded attempted control, and
+lever2 — collapse to 87-97% draws against MCTS.** No tested checkpoint demonstrates
+combat competence without closure; these confounded runs do not isolate either lever's
+treatment effect.
 
-**Root cause (new evidence, first real use of KL-107 tracing):** the network's own
-raw policy (before any search) already agrees with the final chosen action 74-93% of
-the time — passivity is coming from the trained policy itself, not from search
-overriding an aggressive one. **This points at self-play data diversity / curriculum
-(KL-105) as the actual next step, not further reward or timing tweaks.**
+**Diagnostic hypothesis (first real use of KL-107 tracing):** the final action often
+agreed with the root prior, but that prior had already been safe-action masked and
+renormalized; the captured value was a search backup average, not the raw value head.
+This points toward the policy/data/safety-mask path, but does not yet isolate the raw
+policy head from the mask or prove search/value innocent. Finish KL-107 before making
+that distinction load-bearing; curriculum/diversity in KL-105 remains the best next
+candidate, not another blind reward/timing run.
 
-**Recommended next:** either (a) implement lever 3 (weak MCTS or frozen-self in the
-league, currently heuristic-only) — needs a small new CLI flag, deliberately not
-rushed this session — or (b) skip straight to KL-105's curriculum/self-play-diversity
-work, which the trace evidence now points at directly and is the more promising path
-given two cheaper levers have already failed for the same underlying reason.
+**Recommended next:** do not launch lever 3 yet. Finish genuine pre-mask policy/value
+tracing and effective-idle diagnostics in KL-107, then use that evidence to choose the
+first bounded KL-105 curriculum/opponent-diversity experiment. Re-running matched
+controls is only worth the GPU time if causal attribution of the retired levers is
+itself needed; the strategic stop decision already follows from their absolute fails.
 
-**Not done:** Bricks 5 (duel-v2 fidelity/ABI bump) and 6 (throughput) not started.
-Brick 3 (traces) has its capture mechanism verified but no viewer UI. Brick 7 (docs)
-is ~60% done. Full detail below, in chronological order.
+**Still roadmap work:** Bricks 5 (duel-v2 fidelity/ABI bump) and 6 (throughput) were
+not started. Brick 3 (traces) has a verified masked-prior capture mechanism but still
+needs raw heads, richer per-action telemetry, effective-idle data, and viewer UI. The
+documentation/control cleanup was completed in the independent closeout. Full detail
+follows in chronological order.
 
 ## Standing constraints (from the user, carried through the whole session)
 
@@ -199,21 +204,18 @@ Commit `d87dcf4`. Two mechanisms:
   and only 3/200 iterations in, then attempted a second `train` on a *different*
   run-dir — correctly refused with a clear "another bomber_alphazero_native.exe train
   process is already running" error, exit code 1.
-- Same live trainer, confirmed `evaluate` against its own in-progress checkpoint
-  succeeds normally while it's still training — the documented safe pattern still
-  holds after adding the lock.
+- The original session allowed evaluation beside training because checkpoint access
+  was read-only. The independent closeout rejected that interpretation: concurrent
+  CUDA work still risks OOM and invalidates timing, so train/evaluate now share the
+  global native-GPU lock.
 - `train-console.log` confirmed populated with real iteration-by-iteration output
   during that same run.
 - Automated as a permanent regression (`test_native_alphazero_lock_check.py`) — a
   self-contained script (concurrency doesn't fit the existing chained-CTest pattern) that
   manages its own background process, asserts the second launch fails with the specific
   lock-error text, cleans up. Full native CTest **35/35** pass; dependency-free **22/22**.
-- **Assumption made, not asked:** did not add locking to `evaluate` mode at all (not a
-  "weaker" lock, literally none) — this is a deliberate reading of "prevent a trainer
-  and evaluation from contending for... the same run artifacts" as "don't let two
-  WRITERS collide," not "serialize all access." Evaluate only reads an already
-  atomically-written checkpoint; two concurrent evaluates, or one train + N evaluates,
-  don't corrupt anything. Flagging the interpretation in case that's not what was meant.
+- **Superseded:** evaluate originally had no lock. The closeout regression now proves
+  concurrent train and evaluate are both refused clearly.
 - **Not done:** the system-wide lock is scoped to "this GPU" only informally (one
   well-known temp-dir path, correct for the actual single-GPU workstation this runs on)
   — it would not distinguish two GPUs on a multi-GPU machine. Not a real constraint here
@@ -281,9 +283,9 @@ mine alone, weighed against the very detailed brick plan already given and the
 honesty/rigor standards established over the whole session — not checked against a
 fresh external read.
 
-## Brick 2 (KL-108/KL-98): correct iter-130 causal evaluation — in progress
+## Brick 2 (KL-108/KL-98): historical attempted causal evaluation — in progress
 
-**Sequencing decision:** the matched-control training run (`control03-from102`) needs
+**Sequencing decision:** the attempted-control training run (`control03-from102`) needs
 ~28 iterations (~3.5-4 hours wall clock) regardless of what else happens, so it was
 launched first, immediately, rather than after building the rest of Brick 2's
 evaluation tooling — every minute of delay here is a minute added to when there's a
@@ -291,11 +293,13 @@ real answer. Built the per-match-export and SD-off evaluation infrastructure *wh
 that background run trains (GPU is held by the training process alone throughout,
 consistent with the KL-101 Part D one-trainer lock).
 
-**Control setup:** `control03-bootstrap.ps1` (run once) forks from the exact same
-v6-league iteration-102 checkpoint crush01 forked from, via the new KL-101
-`--fork-from` mechanism, changing nothing (`arena-crush-win-value` stays 0.3 — this is
-"what would have happened if the lever had never been touched," the matched control
-the earlier crush01-130-vs-parent-100 "0.4→0.6" read never actually had).
+**Attempted control setup:** `control03-bootstrap.ps1` forked from the same
+v6-league iteration-102 checkpoint and retained `arena-crush-win-value=0.3`. A later
+independent audit found it did **not** change nothing: because the legacy checkpoint
+stored no absolute LR horizon, the iteration-103 bootstrap derived and pinned 13,184
+updates, putting control03 at `1e-5`; crush01's target-200 schedule used 25,600 updates
+and stayed at `1.005e-4→6.188e-5` over the compared interval. Treat this as an
+observational comparator, not a matched reward control.
 `control03-resume.ps1` (watchdog-wrapped, ordinary resume) continues it to iteration
 130+ from there.
 
@@ -304,18 +308,20 @@ the earlier crush01-130-vs-parent-100 "0.4→0.6" read never actually had).
   it was saved before that commit — so it correctly has no manifest to inherit from
   and failed closed exactly as designed ("predates the semantic manifest... cannot be
   verified"). This is the fail-closed behavior working correctly, not a bug: fixed by
-  passing `--legacy-accept-unverified-semantics` plus an EXPLICIT
-  `--arena-crush-win-value 0.3` (not left to the struct default, even though they're
-  numerically identical — being loud and auditable about the value actually used
-  matters more here than saving one flag).
+  passing `--legacy-accept-unverified-semantics` plus an explicit reward value. That
+  was insufficient: the missing absolute LR horizon also needed an explicit
+  `--lr-schedule-updates 25600`. The corrected code now refuses a legacy training
+  fork without that evidence instead of deriving from the new bootstrap target.
 - Bootstrap relaunched after the fix; watch for its completion notification before
   trusting `results/alphazero-native-superhuman-control03-from102` exists.
 
 **Evaluation infrastructure built while the control trains:**
 - Per-match-row JSONL export (`--per-match-output PATH`, new `evaluate_baseline()`
-  parameter) — one immutable line per completed MCTS-baseline match: seed, learner
+  parameter) — one line per completed MCTS-baseline match: seed, learner
   seat, outcome, cause, steps, WAIT. Written as each match finishes, not buffered, so
-  a killed process still leaves a valid partial record. This is what a paired/seat-
+  a killed process still leaves a partial record. At this point paths still silently
+  truncated existing evidence; the independent closeout later made them write-once
+  by default, flush-checked, and added hashes/invocation to the aggregate. This is what a paired/seat-
   delta comparison needs that the aggregate `Evaluation` summary alone can't provide.
 - `v6-league-gate-eval.ps1` extended with `-SuddenDeathOff` (passes
   `--sudden-death-start 0` explicitly — zero new C++ needed, the field already existed
@@ -341,7 +347,10 @@ manifest, fail-closed) — fixed with `--legacy-accept-unverified-semantics` +
 explicit `--arena-crush-win-value 0.3`, documented above. Second attempt succeeded
 cleanly: `fork-manifest.json` verified (parent hash correct, inherited lineage
 `best_iteration=10`/`best_score=0.9375`/`promotion_count=1` matches v6-league's
-actual history, `best.pt` correctly materialized by the Part C fix). Rebuilt the
+actual history). The later independent audit found `best.pt` was *not* correctly
+materialized: current iteration-102 weights had been labeled as historical champion
+iteration 10. The corrected fork path copies and hashes the exact parent `best.pt` or
+fails closed. Rebuilt the
 trainer to pick up the per-match-export/SD-off changes made during the wait, full
 CTest 35/35, manually smoke-tested `--per-match-output` against the real control03
 checkpoint (8 rows for 4 games × 2 seats, matched the console summary exactly).
@@ -369,10 +378,10 @@ explicitly deferred, see below):
   single population site).
 - `marginal_distribution<T>()` — generalizes the existing `marginal_action()`
   joint-to-per-seat pattern to return the full distribution (not just the argmax),
-  reused for both raw priors and MCTS visits.
+  reused for both masked root priors and MCTS visits.
 - `--trace-output PATH` (evaluate `--eval-mcts`): one JSON line per learner step -
-  raw network policy (root priors marginalized) + entropy, MCTS-refined policy (root
-  visits marginalized), search-derived value estimate, root visit count, chosen
+  safety-masked policy prior (root priors marginalized) + entropy, MCTS-refined policy
+  (root visits marginalized), search-derived value estimate, root visit count, chosen
   action, running WAIT fraction. Stamped with checkpoint/executable SHA-256 + git
   commit (reusing KL-101 Part C's `sha256_file`/`current_executable_path`, not
   duplicated). Trace-off (flag unset, the default) executes none of this code, so
@@ -504,7 +513,7 @@ there's no way to know whether crush01's numbers are worse than, the same as, or
 (unlikely given the above, but not yet ruled out) better than what 28 iterations of
 completely unmodified training would have produced anyway.
 
-### Config 3/4 — control03-130, SD-on, N=32 (64 games), matched control (0.3, unmodified)
+### Config 3/4 — control03-130, SD-on, N=32 (64 games), attempted control (0.3, LR-confounded)
 
 vs MCTS-256: **45W-7D-12L, score=0.8**, WAIT=65.7%. Win-cause: bomb-kill=2 (4.4% of
 wins), arena-crush=43 (95.6%). Loss-cause: self-kill=5, arena-crush=7. Draws:
@@ -516,16 +525,10 @@ identical: 2/64 = 3.1% for both.** WAIT is within noise of each other (65.7% vs
 64.1%). Control03 simply produced more crush-wins (43 vs 29) and fewer losses (12 vs
 16) - not more real kills.
 
-**Reading so far:** the reward lever (crush01) has not improved real combat skill
-relative to doing nothing (control03) - both are equally unable to force a bomb-kill
-against MCTS, at the same 3.1% rate. If anything, by the SD-on score alone the
-*unmodified* continuation looks better, though that's plausibly just how it happens
-to navigate the crush mechanic rather than a meaningful difference, since the actual
-combat-skill number (bomb-kill%) that matters is tied. Config 4 (control03 SD-off)
-will show whether control03's underlying combat skill differs from crush01's now
-that the crush confound is removed - expecting a similarly dismal near-all-draws
-result given the identical bomb-kill rates, but not assuming it before the number is
-in hand.
+**Reading so far:** both checkpoints fail the combat bar. The later LR audit means the
+between-run delta cannot be attributed to reward value alone; control03 is not “doing
+nothing,” because it trained at a much lower LR. Its higher SD-on score is still
+crush-dominated and therefore not combat evidence.
 
 ### Config 4/4 — control03-130, SD-off, N=32 (64 games)
 
@@ -533,51 +536,45 @@ vs MCTS-256: **3W-56D-5L, score=0.5**, WAIT=58.2%, 87.5% timeout draws. Wins: 3
 bomb-kills (100%). Losses: 4 self-kill, 1 bomb-kill (the one game where MCTS itself
 landed a real kill against control03).
 
-### Paired comparison (tools/analyze_paired_gate_eval.py, identical seeds both sides)
+### Seed-paired observational comparison (identical evaluation seeds, mismatched training LR)
 
-SD-on: net bomb-win delta = **0** (2 vs 2 - and not even the same seeds). SD-off: net
+SD-on: net bomb-win delta = **0** (2 vs 2). SD-off: net
 delta = **-2** (crush01 minus control03) - the *unmodified* control landed 2 more
 paired bomb-wins. Neither comparison favors the lever.
 
-### Verdict: lever 1 FAILED, all three predeclared thresholds triggered for BOTH configs
+### Verdict: both checkpoints FAILED the bar; reward causality remains unresolved
 
 bomb-kill 3.1%/3.1% (floor ~10%), WAIT 64.1%/65.7% (ceiling ~60%), crush-win share
 93.5%/95.6% of wins. crush01's SD-on score improvement over the iter-100 baseline
 (0.4→0.6) is a crush-mechanic artifact - losses converting to crush-wins and draws,
 not new kills - confirmed by SD-off collapsing to 96.9% draws, matching the
 near-total-draw pattern found in the original investigation at iteration 50.
-**Retained as an honest negative result per KL-100's standard, not reframed.**
+**Retained as honest absolute negative evidence per KL-100.** A new 25,600-update
+control would be required to isolate the reward effect, but is intentionally deferred
+because neither existing checkpoint is close enough to the combat bar to justify the
+GPU cost solely for causal attribution.
 
 ## Root-cause diagnostic: first real use of KL-107 tracing
 
 Ran `tools/analyze_neural_trace.py` against the SD-on trace files captured during
 configs 1 and 3 (8156 and 8079 rows respectively - full per-step traces, not
-samples). Across ~13 games inspected per config: **the final chosen action agrees
-with the raw network policy's own argmax 70-95% of the time (mostly 80-90%),
-consistently in both crush01 and control03.**
+samples). Across ~13 games inspected per config, the final chosen action often agreed
+with the root prior. The field was originally labeled `raw_policy`, but code inspection
+showed it was already safety-masked and renormalized.
 
-This is the load-bearing new finding of the night. If MCTS search were the primary
-source of passivity - an aggressive raw policy getting "corrected" toward WAIT by the
-search's own value backups - chosen action would frequently *diverge* from the raw
-policy's own preference. It mostly doesn't, in either config. **The raw policy itself
-is already passive before search touches it, regardless of which reward lever was
-applied.** Neither lever 1 (reward reshaping) nor the not-yet-tried lever 2
-(sudden-death timing) touches the policy's own training signal or the self-play data
-distribution that shaped it - both operate on the environment/reward side. This
-directly informs Brick 4/KL-105's eventual "same-state diagnosis" (raw policy vs
-PUCT vs robust-search vs held-out-opponent-action) - this session's read already
-points at policy/data, not search, being the primary lever to pull there.
+This suggests search frequently preserves the policy+safe-mask path rather than
+overriding it, but it does not prove the unmasked policy head is passive: the safety
+mask itself may remove aggressive actions. It also does not exonerate opponent
+modeling or value backups. The trace format was renamed in the independent closeout
+to state this boundary explicitly; genuine logits, masks, raw value, per-action Q,
+executed action, and terminal cause remain KL-107 work.
 
-Entropy (0.77-1.18 out of a max ~1.79 for 6 actions) and value trajectories (many
-games start confident ±0.5-0.9, decay toward 0/negative as the game runs long and a
-draw becomes likely) both look like a value head that's tracking the game
-sensibly, not a broken/collapsed one - reinforcing that the issue is specifically
-about what the POLICY has learned to prefer doing, not a value-estimation failure.
+Entropy is entropy of the masked prior, and the recorded value trajectory is a search
+backup average—not the raw value head. Neither supports the original head-level
+conclusion.
 
-**Caveat, stated plainly:** this is a qualitative read of ~13 games' trace summaries
-per config, not a rigorous statistical test - a real, useful diagnostic signal, not
-proof. Worth a more systematic pass (all 64 games, not a manual sample) if/when this
-becomes load-bearing for a bigger decision.
+**Caveat:** this is a qualitative read of ~13 games and an intermediate masked/search
+signal. It is useful for prioritization, not a root-cause proof.
 
 ## Decision: lever 2 launched with calibrated (lowered) expectations
 
@@ -655,13 +652,11 @@ vs MCTS-256: **21W-11D-32L, score=0.4**, WAIT=67.9%. Win-cause: bomb-kill=4 (19.
 wins), arena-crush=17 (81.0%). Loss-cause: bomb-kill=1, self-kill=2, arena-crush=29
 (90.6% of losses). Draws: mutual-death=11.
 
-Compare to control03-130 (its own starting point): score dropped sharply (0.8→0.4),
-losses roughly tripled (12→32) - plausible mechanism: more time before the arena
-closes gives the stronger MCTS opponent more opportunity to actively hunt and kill,
-without the learner improving proportionally on offense or defense. Bomb-kill did
-roughly double (3.1%→6.25%) - the first real movement in that specific metric all
-session, but N=64 makes 2-vs-4 successes weak evidence on its own, and it's more
-than offset by the score/loss damage.
+The historical writeup compared this directly with control03-130, but lever2 has 30
+additional training iterations and no SD120 continuation-to-160 control. Its absolute
+failure is valid; neither the score drop nor the 2→4 bomb-win movement can be assigned
+causally to delayed sudden death. This SD-on gate deliberately used the common SD120
+evaluation environment; native SD160 evaluation was not run.
 
 ### lever2-160, SD-off, N=32 (64 games)
 
@@ -670,11 +665,11 @@ crush01's 96.9% and control03's 87.5% - all three checkpoints collapse to
 near-total draws once the crush mechanic is removed, regardless of which lever was
 applied to get there.
 
-### Verdict: lever 2 FAILED, all three predeclared thresholds triggered again
+### Verdict: lever2-160 FAILED the bar; timing causality remains unresolved
 
-bomb-kill 6.25% (<10% floor), WAIT 67.9% (>60% ceiling, worse than its own starting
-point), crush-win share dominant on both wins and losses. Retained as an honest
-negative result, matching lever 1's outcome.
+bomb-kill 6.25% (<10% floor), WAIT 67.9% (>60% ceiling), crush-win share dominant on
+both wins and losses, and SD-off 90.6% draws. Retained as honest absolute negative
+evidence; not described as a one-variable timing experiment.
 
 **KL-98 and KL-108 updated in Linear with the full final picture and this session's
 recommendation.** Not attempting lever 3 or 4 this session - lever 3 needs new C++
@@ -687,22 +682,41 @@ conclusion rather than cut off mid-experiment).
 
 ### What actually got accomplished tonight, in one paragraph
 
-Fixed five real, previously-undiscovered correctness bugs in the training/evaluation
-harness (semantic manifest inheritance, LR schedule horizon pinning, a fake-promotion
-bug, missing process locking, missing durable logging), all with real regression
-tests (35/35 native CTest at every commit). Built the causal-comparison
-infrastructure KL-108 asked for (per-match export, SD-off control, paired analysis)
-and the neural-trace capture KL-107 asked for, both verified against real
-checkpoints, not just unit-tested. Used that infrastructure to run two complete,
-honestly-reported, matched-control experiments - both came back negative, which is
-itself the valuable result: two plausible, cheap fixes are now *ruled out* rather
-than left as unresolved hopeful assumptions, and a specific, evidenced diagnosis
-(policy/data, not search or reward/timing) now points at what to try next. Nothing
-was overstated; both negative results are reported as plainly as the two prior
-positive-looking-but-actually-hollow claims (v5, and crush01's initial 0.4→0.6 read)
-were retracted earlier in this same investigation. That consistency - catching a
-hollow win on a brand new lever just as readily as on the original claim - is the
-actual proof the harness fix from earlier tonight works.
+Built useful integrity, per-match, SD-off, paired-analysis, and trace infrastructure
+and used it against real checkpoints. The independent closeout then found three
+important overstatements: the reward control had an LR mismatch, lever2 lacked an
+iteration-matched SD120 control, and the trace's “raw policy/value” fields were masked
+priors/search backups. The durable conclusion is narrower and still useful: every
+checkpoint tested fails the predeclared combat bar, so no further blind reward/timing
+run is justified. Causal attribution and head-level diagnosis remain explicitly open.
 
-All work committed and pushed to `polish/viz-and-policy-clarity`. Working tree clean.
-This is the end of this session's autonomous work.
+Claude's work through this point was committed and pushed to
+`polish/viz-and-policy-clarity`; the independent audit closeout below supersedes the
+causal and trace-language claims above where they conflict.
+
+## Independent audit closeout — 2026-07-11
+
+The handoff audit repaired the future evidence path without launching another long
+GPU run:
+
+- legacy training forks with no stored LR horizon now require explicit
+  `--lr-schedule-updates`; no bootstrap-target derivation is allowed;
+- all semantics are resolved before any champion, fork manifest, or config write;
+- forks copy and hash the exact parent `best.pt`, and fail closed if the claimed
+  champion artifact cannot be recovered;
+- train and evaluate share one global native-GPU lock;
+- evaluation evidence is write-once by default and embeds checkpoint/executable
+  hashes, timestamp, exact invocation, git commit, and runtime signature;
+- paired analysis rejects duplicates, partial seats, and mismatched seed blocks;
+- trace v2 names the captured signal `policy_prior_after_safety_mask` and keeps raw
+  head/value capture in KL-107 rather than pretending it already exists;
+- strict CLI parsing rejects unknown options and missing values; `--draw-value` is
+  now an explicit semantic override for both draw fields.
+
+Verification after these corrections is recorded in the closing commit/Linear
+updates: Release native CTest 41/41, dependency-free CTest 22/22, a real legacy
+fork refusal against the iteration-102 checkpoint (including explicit horizon `0`),
+and a legacy evaluation smoke proving `checkpoint_semantics_verified=false` with an
+unknown LR horizon serialized as `null`. The historical generic
+`crush01/gate-eval-iter130.json` remains invalid
+legacy evidence; use the later semantics-resolved result and do not cite the old file.

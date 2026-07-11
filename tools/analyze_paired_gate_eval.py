@@ -1,30 +1,44 @@
-"""KL-108 Brick 2: paired causal comparison between two per-match-row JSONL exports (e.g.
-crush01-130 "treatment" vs control03-130 "control"), matched by seed. Point-estimate deltas
-between independent runs are noisy; pairing on identical seeds (both runs evaluate the SAME
-MCTS seed block) removes seed-to-seed variance from the comparison, which is the whole reason
-Brick 2 exists - the earlier crush01-130-vs-parent-100 "0.4 -> 0.6" read was never a paired
-comparison and was confounded by 28 iterations of general training on top of the lever itself.
+"""KL-108 Brick 2: paired descriptive comparison between two per-match-row JSONL exports,
+matched by evaluation seed and seat. Pairing removes seed-to-seed evaluation variance, but it
+does not make independently trained checkpoints a causal treatment/control pair. Causal use
+also requires the same starting checkpoint, RNG/replay, binary, absolute LR schedule, training
+horizon, and every non-treatment semantic. The historical crush01/control03 artifacts fail
+that bar because their LR horizons differ; they remain useful absolute negative evidence only.
 
 Usage:
-    python tools/analyze_paired_gate_eval.py <treatment.jsonl> <control.jsonl> [--label-a X] [--label-b Y]
+    python tools/analyze_paired_gate_eval.py <run-a.jsonl> <run-b.jsonl> [--label-a X] [--label-b Y]
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import sys
 from collections import defaultdict
 from pathlib import Path
 
 
 def load_rows(path: Path) -> dict[int, list[dict]]:
     by_seed: dict[int, list[dict]] = defaultdict(list)
-    for line in path.read_text().splitlines():
+    seen: set[tuple[int, int]] = set()
+    required = {"seed", "learner_seat", "outcome", "cause", "learner_wait_fraction"}
+    for line_number, line in enumerate(path.read_text().splitlines(), start=1):
         if not line.strip():
             continue
         row = json.loads(line)
+        missing = required - row.keys()
+        if missing:
+            raise ValueError(f"{path}:{line_number} missing required fields {sorted(missing)}")
+        key = (row["seed"], row["learner_seat"])
+        if key in seen:
+            raise ValueError(f"{path}:{line_number} duplicates seed/seat {key}")
+        if row["learner_seat"] not in (0, 1):
+            raise ValueError(f"{path}:{line_number} has invalid learner_seat")
+        seen.add(key)
         by_seed[row["seed"]].append(row)
+    for seed, rows in by_seed.items():
+        seats = {row["learner_seat"] for row in rows}
+        if seats != {0, 1}:
+            raise ValueError(f"{path} seed {seed} is partial; expected seats 0 and 1, got {seats}")
     return by_seed
 
 
@@ -45,8 +59,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("treatment", type=Path)
     parser.add_argument("control", type=Path)
-    parser.add_argument("--label-a", default="treatment")
-    parser.add_argument("--label-b", default="control")
+    parser.add_argument("--label-a", default="run-a")
+    parser.add_argument("--label-b", default="run-b")
     args = parser.parse_args()
 
     treatment_by_seed = load_rows(args.treatment)
@@ -59,11 +73,17 @@ def main() -> None:
     summarize(treatment_rows, args.label_a)
     summarize(control_rows, args.label_b)
 
-    common_seeds = sorted(set(treatment_by_seed) & set(control_by_seed))
+    treatment_seeds = set(treatment_by_seed)
+    control_seeds = set(control_by_seed)
+    if treatment_seeds != control_seeds:
+        raise ValueError(
+            "paired evidence must contain identical complete seed blocks; "
+            f"treatment-only={sorted(treatment_seeds-control_seeds)}, "
+            f"control-only={sorted(control_seeds-treatment_seeds)}"
+        )
+    common_seeds = sorted(treatment_seeds)
     if not common_seeds:
-        print("\nNo common seeds between the two files - cannot compute a paired comparison. "
-              "Check both evaluations used the same --mcts-eval-seed-base and game count.")
-        sys.exit(1)
+        raise ValueError("paired evidence contains no matches")
 
     print(f"\n=== Paired comparison on {len(common_seeds)} common seeds "
           f"({len(treatment_rows)} vs {len(control_rows)} total games - unpaired if these "
@@ -80,8 +100,6 @@ def main() -> None:
         t_rows = {r["learner_seat"]: r for r in treatment_by_seed[seed]}
         c_rows = {r["learner_seat"]: r for r in control_by_seed[seed]}
         for seat in (0, 1):
-            if seat not in t_rows or seat not in c_rows:
-                continue
             t_bomb = t_rows[seat]["outcome"] == "win" and t_rows[seat]["cause"] == "bomb"
             c_bomb = c_rows[seat]["outcome"] == "win" and c_rows[seat]["cause"] == "bomb"
             if t_bomb and c_bomb:

@@ -164,17 +164,54 @@ if(TARGET bomber_alphazero_native)
       --channels 16 --blocks 1 --max-steps 8 --replay-capacity 128
       --eval-games 1 --eval-simulations 2
       --output ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke/eval-result.json
+      --overwrite-evidence
       --no-progress)
   set_tests_properties(test_native_alphazero_semantic_evaluate PROPERTIES
     DEPENDS test_native_alphazero_semantic_fresh TIMEOUT 60)
+  add_test(NAME test_native_alphazero_semantic_draw_alias_evaluate
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> evaluate
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke
+      --checkpoint latest.pt
+      --channels 16 --blocks 1 --max-steps 8 --replay-capacity 128
+      --eval-games 1 --eval-simulations 2 --draw-value -0.7
+      --output ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke/eval-draw-alias.json
+      --overwrite-evidence --no-progress)
+  set_tests_properties(test_native_alphazero_semantic_draw_alias_evaluate PROPERTIES
+    DEPENDS test_native_alphazero_semantic_evaluate TIMEOUT 60)
   if(Python3_Interpreter_FOUND)
     add_test(NAME test_native_alphazero_semantic_check
       COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/test_native_alphazero_semantic_check.py
         ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke)
     set_tests_properties(test_native_alphazero_semantic_check PROPERTIES
-      DEPENDS test_native_alphazero_semantic_evaluate TIMEOUT 20)
+      DEPENDS test_native_alphazero_semantic_draw_alias_evaluate TIMEOUT 20)
   endif()
+  add_test(NAME test_native_alphazero_evidence_refuses_overwrite
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> evaluate
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke
+      --checkpoint latest.pt
+      --channels 16 --blocks 1 --max-steps 8 --replay-capacity 128
+      --eval-games 1 --eval-simulations 2
+      --output ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke/eval-result.json
+      --no-progress)
+  set_tests_properties(test_native_alphazero_evidence_refuses_overwrite PROPERTIES
+    DEPENDS test_native_alphazero_semantic_evaluate TIMEOUT 20 WILL_FAIL TRUE)
+  add_test(NAME test_native_alphazero_unknown_option_fails
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> evaluate --definitely-unknown)
+  set_tests_properties(test_native_alphazero_unknown_option_fails PROPERTIES
+    TIMEOUT 20 WILL_FAIL TRUE)
+  add_test(NAME test_native_alphazero_missing_value_fails
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> evaluate --eval-games)
+  set_tests_properties(test_native_alphazero_missing_value_fails PROPERTIES
+    TIMEOUT 20 WILL_FAIL TRUE)
 
   # KL-101 regression: extending --iterations on a resume must not silently re-derive a new
   # LR schedule horizon against the same accumulated global_updates (the bug that produced the
@@ -237,6 +274,23 @@ if(TARGET bomber_alphazero_native)
       --snapshot-interval 1 --max-steps 8 --no-progress
       --arena-crush-win-value 0.22)
   set_tests_properties(test_native_alphazero_fork_parent PROPERTIES TIMEOUT 60)
+  # Advance latest.pt beyond the retained champion so the fork regression proves child
+  # best.pt is the parent's exact champion artifact, not a relabeled copy of current weights.
+  add_test(NAME test_native_alphazero_fork_parent_advance
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-fork-parent
+      --iterations 2 --games 2 --simulations 2
+      --train-steps 1 --batch-size 4 --replay-capacity 64
+      --channels 8 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 1 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2 --promotion-margin 0.49
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress)
+  set_tests_properties(test_native_alphazero_fork_parent_advance PROPERTIES
+    DEPENDS test_native_alphazero_fork_parent TIMEOUT 60)
   add_test(NAME test_native_alphazero_fork_child
     COMMAND ${CMAKE_COMMAND} -E env
       "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
@@ -253,7 +307,7 @@ if(TARGET bomber_alphazero_native)
       --snapshot-interval 1 --max-steps 8 --no-progress
       --dirty-diff-digest ctest-regression-digest)
   set_tests_properties(test_native_alphazero_fork_child PROPERTIES
-    DEPENDS test_native_alphazero_fork_parent TIMEOUT 60)
+    DEPENDS test_native_alphazero_fork_parent_advance TIMEOUT 60)
   if(Python3_Interpreter_FOUND)
     add_test(NAME test_native_alphazero_fork_check
       COMMAND ${Python3_EXECUTABLE}
@@ -262,6 +316,19 @@ if(TARGET bomber_alphazero_native)
         ${CMAKE_BINARY_DIR}/native-alphazero-fork-child)
     set_tests_properties(test_native_alphazero_fork_check PROPERTIES
       DEPENDS test_native_alphazero_fork_child TIMEOUT 20)
+
+    # A historical bug could leave current/latest tensors in best.pt while selection metadata
+    # still named an older champion. Ordinary resume must detect that mismatch, not silently
+    # keep using the fake incumbent. The script restores the fixture in a finally block.
+    add_test(NAME test_native_alphazero_corrupt_best_check
+      COMMAND ${CMAKE_COMMAND} -E env
+        "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+        ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_alphazero_corrupt_best_check.py
+        $<TARGET_FILE:bomber_alphazero_native>
+        ${CMAKE_BINARY_DIR}/native-alphazero-fork-parent)
+    set_tests_properties(test_native_alphazero_corrupt_best_check PROPERTIES
+      DEPENDS test_native_alphazero_fork_check RUN_SERIAL TRUE TIMEOUT 30)
   endif()
 
   # KL-101 Part D regression: a second `train` process must be refused while a first is still

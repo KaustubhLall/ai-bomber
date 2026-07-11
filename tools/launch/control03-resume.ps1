@@ -1,5 +1,5 @@
-# Resume control03-from102 (the matched control for the crush01 KL-98 lever-1 test - see
-# control03-bootstrap.ps1 for what this run is and why) under the auto-restart watchdog.
+# Resume the historical control03-from102 run under the watchdog. Its artifacts are useful
+# absolute negative evidence but are LR-confounded versus crush01; see control03-bootstrap.ps1.
 # Ordinary resume only - no --fresh, no --fork-from, which would re-fork from the parent and
 # discard all progress on every watchdog restart. Run control03-bootstrap.ps1 first, once.
 #

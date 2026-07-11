@@ -20,6 +20,7 @@
 #   .\tools\launch\v6-league-gate-eval.ps1 -RunDir results/alphazero-native-superhuman-v6-league-crush01
 #   .\tools\launch\v6-league-gate-eval.ps1 -MctsGames 64      # tighter Wilson LCB
 #   .\tools\launch\v6-league-gate-eval.ps1 -SuddenDeathOff    # KL-108 diagnostic control
+#   .\tools\launch\v6-league-gate-eval.ps1 -SuddenDeathStart 160 # native lever-2 semantics
 #
 # -Checkpoint is resolved by the native trainer relative to --run-dir (same
 # convention as Resolve-Champion in _env.ps1, which returns a bare filename,
@@ -53,22 +54,32 @@ param(
     [string]$PerMatchOutput = "",
     [string]$TraceOutput = "",
     [switch]$SuddenDeathOff,
-    [string]$LegacyArenaCrushWinValue = ""
+    [int]$SuddenDeathStart = -1,
+    [string]$LegacyArenaCrushWinValue = "",
+    [switch]$OverwriteEvidence
 )
 . "$PSScriptRoot\_env.ps1"
 Use-Torch
 $Checkpoint = Split-Path -Leaf $Checkpoint
 $suffix = if ($SuddenDeathOff) { "-sdoff" } else { "" }
-if ($Output -eq "") { $Output = Join-Path $RunDir "gate-eval$suffix.json" }
-if ($PerMatchOutput -eq "") { $PerMatchOutput = Join-Path $RunDir "gate-eval$suffix-per-match.jsonl" }
-$suddenDeathStart = if ($SuddenDeathOff) { "0" } else { "120" }
+$checkpointStem = [System.IO.Path]::GetFileNameWithoutExtension($Checkpoint)
+$resolvedSuddenDeathStart = if ($SuddenDeathOff) { 0 } elseif ($SuddenDeathStart -ge 0) { $SuddenDeathStart } else { 120 }
+$evidenceTag = "$checkpointStem-sd$resolvedSuddenDeathStart"
+if ($Output -eq "") { $Output = Join-Path $RunDir "gate-eval-$evidenceTag.json" }
+if ($PerMatchOutput -eq "") { $PerMatchOutput = Join-Path $RunDir "gate-eval-$evidenceTag-per-match.jsonl" }
 
-Write-Host "Gate eval: $RunDir/$Checkpoint vs MCTS-$MctsSims, N=$MctsGames games, noise OFF, greedy action selection, sudden-death-start=$suddenDeathStart."
+foreach ($path in @($Output, $PerMatchOutput, $TraceOutput)) {
+    if ($path -ne "" -and (Test-Path -LiteralPath $path) -and -not $OverwriteEvidence) {
+        throw "Refusing to overwrite evaluation evidence: $path. Choose a unique path or pass -OverwriteEvidence explicitly."
+    }
+}
+
+Write-Host "Gate eval: $RunDir/$Checkpoint vs MCTS-$MctsSims, N=$MctsGames games, noise OFF, greedy action selection, sudden-death-start=$resolvedSuddenDeathStart."
 $evalArgs = @(
     "evaluate", "--run-dir", $RunDir, "--checkpoint", $Checkpoint,
     "--channels", "128", "--blocks", "10",
     "--width", "13", "--height", "11", "--max-steps", "200", "--crate-density", "50",
-    "--flame-duration", "2", "--sudden-death-start", "$suddenDeathStart", "--shrink-interval", "4",
+    "--flame-duration", "2", "--sudden-death-start", "$resolvedSuddenDeathStart", "--shrink-interval", "4",
     "--eval-games", "32", "--eval-simulations", "96", "--eval-seed-base", "900001",
     "--eval-mcts", "--mcts-eval-games", "$MctsGames",
     "--baseline-mcts-simulations", "$MctsSims", "--baseline-mcts-depth", "16",
@@ -81,5 +92,6 @@ if ($LegacyArenaCrushWinValue -ne "") {
     $evalArgs += @("--legacy-accept-unverified-semantics", "--arena-crush-win-value", $LegacyArenaCrushWinValue)
 }
 if ($TraceOutput -ne "") { $evalArgs += @("--trace-output", $TraceOutput) }
+if ($OverwriteEvidence) { $evalArgs += "--overwrite-evidence" }
 & $NativeExe @evalArgs
 Write-Host "`nRead the 'mcts' win-cause + WAIT% lines above (or $Output; per-match rows in $PerMatchOutput). Compare against the KL-96/KL-108 decision tree before drawing any conclusion."

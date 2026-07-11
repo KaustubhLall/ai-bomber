@@ -28,6 +28,20 @@ assert manifest["inherited_champion_lineage"]["best_iteration"] >= 0, (
     "a fork from a promoted parent must inherit a real (non-sentinel) best_iteration"
 )
 
+parent_best = parent_dir / "best.pt"
+child_best = child_dir / "best.pt"
+parent_best_sha256 = hashlib.sha256(parent_best.read_bytes()).hexdigest()
+child_best_sha256 = hashlib.sha256(child_best.read_bytes()).hexdigest()
+assert actual_sha256 != parent_best_sha256, (
+    "fixture must advance latest.pt beyond best.pt or it cannot catch relabeling current "
+    "weights as a historical champion"
+)
+assert child_best_sha256 == parent_best_sha256, (
+    "forked child best.pt is not the exact parent champion artifact; current/latest weights "
+    "must never be relabeled as an older inherited best_iteration"
+)
+assert manifest["source_champion_sha256"] == parent_best_sha256
+
 child_config = json.loads((child_dir / "config.json").read_text())
 assert abs(child_config["arena_crush_win_value"] - 0.22) < 1e-9, (
     f"child's resolved arena_crush_win_value={child_config['arena_crush_win_value']}, "
@@ -35,10 +49,15 @@ assert abs(child_config["arena_crush_win_value"] - 0.22) < 1e-9, (
 )
 
 assert (child_dir / "best.pt").is_file(), (
-    "fork must materialize best.pt from inherited lineage immediately, before any "
-    "evaluation-interval iteration runs - otherwise has_incumbent reads false and the "
-    "promotion gate treats real prior lineage as if it never existed"
+    "fork must preserve the exact parent best.pt before any promotion check"
 )
+
+manifest_semantics = dict(
+    pair.split("=", 1) for pair in manifest["resolved_semantics"].split(";") if "=" in pair
+)
+assert int(manifest_semantics["learning_rate_schedule_updates"]) == int(
+    child_config["learning_rate_schedule_updates"]
+), "fork manifest must be written after LR horizon resolution and match config.json"
 
 rows = [json.loads(line) for line in (child_dir / "metrics.jsonl").read_text().splitlines()]
 promotion_reasons = [row["promotion_reason"] for row in rows if "promotion_reason" in row]
@@ -48,6 +67,6 @@ assert "promoted_initial_quality_gate" not in promotion_reasons, (
     f"inherited lineage; this is exactly the iter-110 fake-promotion bug re-occurring"
 )
 
-print("Native AlphaZero fork provenance and champion-lineage inheritance validated "
-      f"(source_checkpoint_sha256 verified, arena_crush_win_value=0.22 inherited, "
+print("Native AlphaZero fork provenance and exact champion inheritance validated "
+      f"(source + champion SHA-256 verified, arena_crush_win_value=0.22 inherited, "
       f"promotion reasons={promotion_reasons})")

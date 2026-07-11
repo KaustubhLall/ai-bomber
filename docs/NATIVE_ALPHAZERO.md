@@ -211,13 +211,25 @@ mean game length.
   --output results\alphazero-native-grokking-v1\holdout-best.json
 ```
 
+Evaluation evidence is write-once by default. Aggregate JSON records the checkpoint
+and executable SHA-256, exact argv as a JSON array, working directory, git commit,
+timestamp, runtime signature, and resolved semantics; per-match and trace paths also
+refuse silent replacement. Legacy checkpoints accepted for historical evaluation are
+marked `checkpoint_semantics_verified=false`, with an unknown LR horizon serialized as
+`null` rather than invented from current defaults.
+Use a unique path for every checkpoint/config. `--overwrite-evidence` exists only for
+an explicit disposable rerun after preserving prior evidence.
+
 Training uses disjoint defaults: `900001` for frequent random/heuristic
 validation, `1100001` for challenger-versus-incumbent promotion, and `1300001`
 for sparse native-MCTS diagnostics. Overlapping configured blocks are rejected.
 The example deliberately
 uses `1500001` as a separate final holdout; choose and record that range before
-training. Evaluation uses fixed seeds and both seat orientations. Search models the
-baseline opponent during PUCT and then plays the real persistent native agent.
+training. Evaluation uses fixed seeds and both seat orientations. Neural PUCT models
+fixed scripted opponents such as the heuristic, but deliberately does not recursively
+invoke a full MCTS opponent at every leaf; against MCTS it therefore searches with the
+learner-side policy prior while the real persistent MCTS agent acts at the game root.
+That opponent-model mismatch is an open KL-105 research issue, not a solved property.
 The native MCTS opponent is configurable with
 `--baseline-mcts-simulations` and `--baseline-mcts-depth`; the strengthened
 default is 512 simulations at depth 16. Specify 96/depth 12 to reproduce the v1

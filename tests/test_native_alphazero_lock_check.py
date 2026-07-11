@@ -1,10 +1,9 @@
-"""KL-101 Part D regression: a second `train` process must be refused (clear error, non-zero
-exit) while a first one is still running - even against a DIFFERENT run directory. This is the
-actual failure mode that crashed training twice earlier in this project's history (two full
-training loops on different run-dirs silently contending for one GPU, both killed with no
-in-app error trace). Doesn't fit the existing chained-CTest smoke/resume/gate pattern (that
-pattern is sequential dependencies on one run-dir; this needs a genuinely concurrent second
-process), so it's a self-contained script that manages its own background process."""
+"""KL-101 Part D regression: exactly one native GPU process at a time.
+
+A second train on another run directory and an evaluation against the active run must both
+fail clearly while training is live. Read-only checkpoint access does not make concurrent CUDA
+memory/compute safe or make timing evidence valid.
+"""
 
 from __future__ import annotations
 
@@ -73,6 +72,20 @@ try:
         f"second train process failed (good) but not with the expected lock error - "
         f"got: {combined_output!r}"
     )
+
+    evaluation_args = [
+        str(exe), "evaluate", "--run-dir", str(run_dir_a), "--checkpoint", "latest.pt",
+        "--channels", "32", "--blocks", "2", "--max-steps", "32",
+        "--eval-games", "1", "--eval-simulations", "2", "--no-progress",
+    ]
+    evaluation = subprocess.run(evaluation_args, capture_output=True, text=True, timeout=30)
+    assert evaluation.returncode != 0, (
+        "evaluation was allowed to contend with an active native trainer on the same GPU"
+    )
+    evaluation_output = evaluation.stdout + evaluation.stderr
+    assert "cannot acquire exclusive lock" in evaluation_output, (
+        f"concurrent evaluation failed without the expected lock error: {evaluation_output!r}"
+    )
 finally:
     background.terminate()
     try:
@@ -84,5 +97,5 @@ finally:
         if d.exists():
             shutil.rmtree(d, ignore_errors=True)
 
-print("Native AlphaZero single-trainer lock validated "
-      "(second concurrent train process correctly refused with a clear error)")
+print("Native AlphaZero single-GPU-process lock validated "
+      "(concurrent train and evaluate both refused clearly)")

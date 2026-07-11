@@ -1,12 +1,10 @@
 """KL-107: human-readable summary of a --trace-output neural decision trace.
 
-For each traced game (one seed + learner seat), prints a step-by-step or summary view of:
-raw network policy (top actions + probabilities + entropy), MCTS-refined policy, whether the
-final chosen action agreed with the raw policy's own preference or diverged from it (search
-overriding the network vs. agreeing with it), and the search-derived value trajectory. This is
-the tool for answering "did this tactical error come from the policy, the value head, or the
-search" - the actual KL-107 ask - once a real trace file exists from a checkpoint worth
-inspecting.
+For each traced game, prints the safety-masked root prior, MCTS-refined policy, agreement, and
+search backup trajectory. Important boundary: v1 called the masked prior `raw_policy`, but it
+was already filtered by the safe-action mask; neither v1 nor v2 contains the unmasked policy
+head or raw value head. This tool therefore localizes a failure to the policy+mask path versus
+search refinement, not to the neural head alone.
 
 Usage:
     python tools/analyze_neural_trace.py trace.jsonl                  # summary of every game
@@ -57,25 +55,32 @@ def main() -> None:
         steps.sort(key=lambda r: r["step"])
 
         n = len(steps)
-        mean_entropy = sum(r["raw_policy_entropy"] for r in steps) / n if n else 0.0
+        def prior(row: dict) -> list[float]:
+            return row.get("policy_prior_after_safety_mask", row.get("raw_policy"))
+
+        def prior_entropy(row: dict) -> float:
+            return row.get("policy_prior_entropy", row.get("raw_policy_entropy"))
+
+        mean_entropy = sum(prior_entropy(r) for r in steps) / n if n else 0.0
         agree = sum(1 for r in steps
-                    if r["chosen_action"] == max(range(6), key=lambda i: r["raw_policy"][i]))
+                    if r["chosen_action"] == max(range(6), key=lambda i: prior(r)[i]))
         wait_count = sum(1 for r in steps if r["chosen_action"] == 5)
         value_trajectory = [round(r["search_value_estimate"], 3) for r in steps]
 
-        print(f"seed={seed} seat={seat}: {n} steps, mean_raw_policy_entropy={mean_entropy:.3f}, "
-              f"chosen==argmax(raw_policy) in {agree}/{n} steps "
-              f"({100*agree/n:.0f}% - low means search is overriding the raw policy a lot), "
+        print(f"seed={seed} seat={seat}: {n} steps, mean_masked_prior_entropy={mean_entropy:.3f}, "
+              f"chosen==argmax(masked_prior) in {agree}/{n} steps "
+              f"({100*agree/n:.0f}% - low means search changes the masked prior often), "
               f"WAIT chosen {wait_count}/{n} times ({100*wait_count/n:.0f}%)")
         print(f"  value trajectory (first 5 -> last 5): {value_trajectory[:5]} ... "
               f"{value_trajectory[-5:]}")
 
         if args.steps:
             for row in steps:
-                argmax_raw = max(range(6), key=lambda i: row["raw_policy"][i])
-                marker = "" if row["chosen_action"] == argmax_raw else "  <- search overrode raw policy"
+                masked_prior = prior(row)
+                argmax_prior = max(range(6), key=lambda i: masked_prior[i])
+                marker = "" if row["chosen_action"] == argmax_prior else "  <- search changed masked prior"
                 print(f"    step={row['step']:>3} chosen={ACTION_NAMES[row['chosen_action']]:>5} "
-                      f"raw=[{top_actions(row['raw_policy'])}] "
+                      f"masked_prior=[{top_actions(masked_prior)}] "
                       f"mcts=[{top_actions(row['mcts_policy'])}] "
                       f"value={row['search_value_estimate']:+.3f} "
                       f"root_visits={row['root_visits']}{marker}")

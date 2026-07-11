@@ -30,11 +30,17 @@ param(
 . "$PSScriptRoot\_env.ps1"
 Use-Torch
 
+foreach ($unsafeFlag in @("--fresh", "--fork-from")) {
+    if ([array]::IndexOf($TrainerArgs, $unsafeFlag) -ge 0) {
+        throw "watchdog-train.ps1 refuses $unsafeFlag. Bootstrap/fork exactly once outside the watchdog; retries must be resume-only."
+    }
+}
+
 $runDirIndex = [array]::IndexOf($TrainerArgs, "--run-dir")
 $runDir = if ($runDirIndex -ge 0 -and $runDirIndex + 1 -lt $TrainerArgs.Count) {
     $TrainerArgs[$runDirIndex + 1]
 } else {
-    "."
+    throw "watchdog-train.ps1 requires an explicit --run-dir value; refusing to log/retry against the current directory."
 }
 if (-not (Test-Path $runDir)) { New-Item -ItemType Directory -Path $runDir -Force | Out-Null }
 $attemptLog = Join-Path $runDir "watchdog-attempts.jsonl"

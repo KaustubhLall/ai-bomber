@@ -8,6 +8,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <vector>
 
 namespace bomber::az {
 
@@ -15,18 +16,18 @@ struct TrainConfig {
     std::filesystem::path run_dir{"results/alphazero-native"};
     std::filesystem::path checkpoint{"latest.pt"};
     std::filesystem::path evaluation_output{};
-    /* KL-108 Brick 2: if set (evaluate mode with --eval-mcts), write one immutable JSON line
-       per completed MCTS-baseline match (seed, seat, outcome, cause, steps, WAIT) to this
-       path - the per-match rows a paired/seat-delta causal comparison needs, that the
-       aggregate Evaluation summary alone can't provide. CLI --per-match-output. */
+    /* KL-108 Brick 2: if set (evaluate mode with --eval-mcts), write one JSON line per
+       completed MCTS-baseline match (seed, seat, outcome, cause, steps, WAIT) to this path.
+       Evidence paths fail closed when they already exist unless --overwrite-evidence is
+       explicitly supplied; this prevents a later gate from silently replacing an earlier
+       result. CLI --per-match-output. */
     std::filesystem::path per_match_output{};
-    /* KL-107: if set (evaluate mode with --eval-mcts), write one immutable JSON line per
-       LEARNER STEP (not per match) across all MCTS-baseline matches: raw network policy
-       (root priors, marginalized per seat) + entropy, MCTS-refined policy (root visits,
-       marginalized), search-derived value estimate, root visit count, chosen action, running
-       WAIT fraction. Trace-off (this unset, the default) makes zero code-path changes -
-       everything the tracer reads was already computed by the search regardless. CLI
-       --trace-output. */
+    /* KL-107: if set (evaluate mode with --eval-mcts), write one JSON line per LEARNER STEP
+       across all MCTS-baseline matches. The captured root prior is the network policy AFTER
+       the engine's safe-action mask and renormalization; it is not an unmasked policy-head
+       output. The value is likewise the search backup average, not the raw value head. These
+       names matter because the trace cannot yet isolate policy head vs safety mask vs value
+       backup. CLI --trace-output. */
     std::filesystem::path trace_output{};
     /* If set (evaluate mode), write a v4 replay of one representative checkpoint game that
        bomber_viz --replay can play back. Opponent = heuristic, or MCTS with --eval-mcts;
@@ -124,6 +125,9 @@ struct TrainConfig {
     bool progress{true};
     bool evaluate_mcts{false};
     bool evaluation_only{false};
+    /* Evaluation evidence is write-once by default. This explicit opt-in is intended for
+       disposable tests or a deliberate rerun after the old evidence has been preserved. */
+    bool overwrite_evidence{false};
     /* A checkpoint saved before the semantic-manifest fix (KL-101) has no verified record of
        what reward/mechanics/schedule values it was actually trained under - the flat
        runtime_config signature never included arena_crush_win_value, selfkill_win_value, or
@@ -150,6 +154,11 @@ struct TrainConfig {
        working directory, etc.); AI_BOMBER_GIT_SHA already captures the committed HEAD at
        compile time, this covers uncommitted changes at fork time. CLI --dirty-diff-digest. */
     std::string dirty_diff_digest{};
+    /* Exact argv captured at parse time and embedded in evaluation evidence. */
+    /* Exact process argv retained as separate strings for evidence JSON. A reconstructed shell
+       command is not lossless on Windows (backslashes, quotes, and empty arguments), so the
+       aggregate bundle serializes this vector directly. */
+    std::vector<std::string> invocation_argv{};
     /* Populated by parse_train_config() from which semantic CLI flags were literally present
        in argv (as opposed to left at their struct default). Read by load_checkpoint() to
        decide, per semantic field: inherit the checkpoint's stored value (flag absent - the

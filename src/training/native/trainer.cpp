@@ -525,10 +525,9 @@ struct SearchConstraint {
 
 struct SearchResult {
     std::array<int, kJointActions> visits{};
-    /* KL-107: root priors (the network policy head's raw output, evaluated once when the
-       root is first expanded, BEFORE any simulation refines it) and per-seat value sums -
-       read-only copies of what the root Node already computed, added here purely so a
-       caller can capture them; nothing about the search itself changes by adding this. */
+    /* KL-107: root priors after safe-action masking/renormalization, plus per-seat search
+       backup sums. These are useful but are NOT unmasked policy-head probabilities or raw
+       value-head outputs; callers must not label them that way. */
     std::array<float, kJointActions> priors{};
     std::array<float, kJointActions> value_sum0{};
     std::array<float, kJointActions> value_sum1{};
@@ -938,8 +937,8 @@ std::filesystem::path current_executable_path() {
    process has to remember to delete. Opened with zero share mode - a second process trying to
    open the same path fails immediately with a clear "already running" error instead of the
    two processes silently contending for the GPU, which crashed training twice earlier in this
-   session (once was two full training loops on different run-dirs, so this is deliberately
-   TWO locks in practice - see acquire_trainer_locks() below - not just one scoped to run_dir). */
+   session. Every train/evaluate process takes the global lock; training also takes a run-dir
+   lock so the ownership rules remain explicit. */
 class ProcessLock {
 public:
     explicit ProcessLock(const std::filesystem::path& lock_path) : path_(lock_path) {
@@ -952,9 +951,9 @@ public:
             throw std::runtime_error(
                 "cannot acquire exclusive lock " + lock_path.string() +
                 " (Windows error " + std::to_string(error) + ", commonly "
-                "ERROR_SHARING_VIOLATION=32 - another bomber_alphazero_native.exe train "
-                "process is already running; two training processes contending for the "
-                "same GPU crashed both of them, twice, earlier in this project's history)");
+                "ERROR_SHARING_VIOLATION=32 - another bomber_alphazero_native.exe train or "
+                "evaluate process is already running; native processes must not contend for "
+                "the same GPU)");
         }
         const std::string pid_line = "pid=" + std::to_string(GetCurrentProcessId()) + "\n";
         DWORD written = 0;
@@ -968,7 +967,8 @@ public:
             descriptor_ = -1;
             throw std::runtime_error(
                 "cannot acquire exclusive lock " + lock_path.string() +
-                " - another bomber_alphazero_native.exe train process is already running");
+                " - another bomber_alphazero_native.exe train or evaluate process is already "
+                "running");
         }
         const std::string pid_line = "pid=" + std::to_string(::getpid()) + "\n";
         (void)::write(descriptor_, pid_line.data(), pid_line.size());
@@ -1197,10 +1197,32 @@ std::string json_escape(std::string_view value) {
     return result;
 }
 
+std::string utc_timestamp() {
+    const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    std::tm utc_time{};
+#ifdef _WIN32
+    gmtime_s(&utc_time, &now);
+#else
+    gmtime_r(&now, &utc_time);
+#endif
+    std::ostringstream output;
+    output << std::put_time(&utc_time, "%Y-%m-%dT%H:%M:%SZ");
+    return output.str();
+}
+
+std::vector<std::string> invocation_arguments(int argc, char** argv) {
+    std::vector<std::string> result;
+    result.reserve(static_cast<size_t>(argc));
+    for (int index = 0; index < argc; ++index) result.emplace_back(argv[index]);
+    return result;
+}
+
 template <typename T>
 T parse_number(int argc, char** argv, int first, const std::string& option, T fallback) {
-    for (int index = first; index + 1 < argc; ++index) {
+    for (int index = first; index < argc; ++index) {
         if (argv[index] == option) {
+            if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
+                throw std::invalid_argument("missing value for " + option);
             std::istringstream input(argv[index + 1]);
             T result{};
             input >> result;
@@ -1213,8 +1235,13 @@ T parse_number(int argc, char** argv, int first, const std::string& option, T fa
 
 std::string parse_string(int argc, char** argv, int first, const std::string& option,
                          std::string fallback) {
-    for (int index = first; index + 1 < argc; ++index)
-        if (argv[index] == option) return argv[index + 1];
+    for (int index = first; index < argc; ++index) {
+        if (argv[index] == option) {
+            if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
+                throw std::invalid_argument("missing value for " + option);
+            return argv[index + 1];
+        }
+    }
     return fallback;
 }
 
@@ -1222,6 +1249,43 @@ bool has_flag(int argc, char** argv, int first, const std::string& option) {
     for (int index = first; index < argc; ++index)
         if (argv[index] == option) return true;
     return false;
+}
+
+void validate_train_cli_options(int argc, char** argv, int first) {
+    static const std::set<std::string_view> value_options = {
+        "--run-dir", "--checkpoint", "--output", "--per-match-output", "--trace-output",
+        "--replay-out", "--replay-incumbent", "--incumbent-eval-games", "--width",
+        "--height", "--max-steps", "--crate-density", "--flame-duration",
+        "--sudden-death-start", "--shrink-interval", "--iterations", "--games",
+        "--simulations", "--train-steps", "--batch-size", "--replay-capacity",
+        "--channels", "--blocks", "--teacher-games", "--teacher-iterations",
+        "--eval-interval", "--eval-games", "--eval-simulations", "--promotion-games",
+        "--promotion-simulations", "--mcts-eval-interval", "--mcts-eval-games",
+        "--baseline-mcts-simulations", "--baseline-mcts-depth", "--eval-seed-base",
+        "--promotion-seed-base", "--mcts-eval-seed-base", "--snapshot-interval",
+        "--temperature-steps", "--seed", "--learning-rate", "--min-learning-rate",
+        "--lr-schedule-start-update", "--lr-schedule-updates", "--weight-decay",
+        "--c-puct", "--dirichlet-alpha", "--dirichlet-fraction", "--temperature",
+        "--bootstrap-weight", "--bootstrap-iterations", "--draw-value",
+        "--timeout-draw-value", "--mutual-death-value", "--arena-crush-win-value",
+        "--selfkill-win-value", "--league-heuristic-fraction", "--promotion-margin",
+        "--promotion-confidence-z", "--random-score-floor", "--heuristic-score-floor",
+        "--heuristic-regression-margin", "--fork-from", "--dirty-diff-digest",
+    };
+    static const std::set<std::string_view> flag_options = {
+        "--fresh", "--no-progress", "--eval-mcts", "--overwrite-evidence",
+        "--legacy-accept-unverified-semantics",
+    };
+    for (int index = first; index < argc; ++index) {
+        const std::string_view option(argv[index]);
+        if (flag_options.count(option)) continue;
+        if (!value_options.count(option))
+            throw std::invalid_argument("unknown native AlphaZero option: " +
+                                        std::string(option));
+        if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
+            throw std::invalid_argument("missing value for " + std::string(option));
+        ++index;
+    }
 }
 
 void validate_config(const TrainConfig& config) {
@@ -1296,22 +1360,20 @@ struct Trainer::Impl {
         best_path = config.run_dir / "best.pt";
         requested_checkpoint_path = config.run_dir / config.checkpoint;
         metrics_path = config.run_dir / "metrics.jsonl";
-        /* KL-101 Part D: exclusive locks, TRAIN mode only - evaluate is documented and
-           repeatedly confirmed safe to run alongside a live trainer (read-only against an
-           atomically-written checkpoint), so it does not compete for either lock. Two locks
-           because the actual incidents that crashed training twice were NOT both the same
-           run-dir contending with itself - once was two DIFFERENT run-dirs' train processes
-           sharing one GPU. run_dir_lock catches "this exact run is already being trained
-           somewhere"; system_lock catches "some OTHER bomber_alphazero_native.exe train
-           process anywhere is already using the GPU," which is the failure mode that
-           actually happened. Acquired before any file writes so a lock failure leaves
-           nothing behind to clean up. */
+        /* Every native train/evaluate path consumes the same GPU. Keep one global native
+           process at a time: an evaluation is read-only with respect to the checkpoint, but
+           it still contends for CUDA memory/compute and can invalidate timing or kill a
+           trainer. Training additionally owns its run directory. Locks are acquired before
+           any evidence/config write so refusal leaves no partial artifact. */
+        system_lock = std::make_unique<ProcessLock>(
+            /* Keep the deployed filename so a repaired evaluator also excludes an older
+               trainer binary that only knew the original training-only lock name. */
+            std::filesystem::temp_directory_path() / "bomber-alphazero-native-trainer.lock");
         if (!config.evaluation_only) {
-            system_lock = std::make_unique<ProcessLock>(
-                std::filesystem::temp_directory_path() / "bomber-alphazero-native-trainer.lock");
             run_dir_lock = std::make_unique<ProcessLock>(config.run_dir / ".trainer.lock");
         }
         model->to(device);
+        bool forked = false;
         if (config.fresh) {
             for (const auto& entry : std::filesystem::directory_iterator(config.run_dir)) {
                 const auto name = entry.path().filename().string();
@@ -1331,46 +1393,42 @@ struct Trainer::Impl {
                     throw std::runtime_error("--fork-from checkpoint not found: " +
                                              config.fork_from.string());
                 load_checkpoint(config.fork_from);
-                write_fork_manifest();
+                forked = true;
                 std::cout << "Forked from " << config.fork_from.string()
                           << " at iteration " << iteration
                           << " with " << replay.size() << " replay samples\n";
             }
         } else if (std::filesystem::exists(requested_checkpoint_path)) {
             load_checkpoint(requested_checkpoint_path);
-            reconcile_champion_state();
             std::cout << "Loaded " << requested_checkpoint_path.string()
                       << " at iteration " << iteration
                       << " with " << replay.size() << " replay samples\n";
         }
-        /* KL-101 Part C: fix the "iter-110 fake initial promotion" bug. The promotion gate's
-           has_incumbent check (run()) is a pure std::filesystem::exists(best_path) test - it
-           has no idea that best_iteration/best_score/promotion_count were just inherited from
-           a parent (via --fork-from, or the older ad-hoc copy-latest.pt-into-a-new-dir
-           convention) and already represent a real champion lineage. Left alone, the very
-           first evaluation-interval iteration in a forked/copied run-dir sees no best.pt file,
-           concludes "no incumbent exists," and promotes unconditionally under
-           promoted_initial_quality_gate - discarding real prior lineage and inflating the
-           promotion record. Materializing best.pt from the just-loaded state (which IS the
-           inherited champion, until superseded) closes the gap between the numeric state and
-           the file-existence check the gate actually reads. */
-        if (best_iteration >= 0 && !std::filesystem::exists(best_path)) {
-            save_checkpoint(best_path);
-            std::cout << "Materialized " << best_path.string()
-                      << " from inherited champion lineage (iteration " << best_iteration
-                      << ") - the promotion gate's has_incumbent check needs the file, not "
-                         "just the in-memory best_iteration/best_score\n";
+        /* A legacy checkpoint with schedule_updates=0 does not contain enough information to
+           recover the horizon that produced its optimizer history. Deriving from this
+           process's short bootstrap target created a false "matched" control at 1e-5 while
+           its treatment ran near 1e-4. Evaluation may accept the uncertainty because LR is
+           unused there; any resumed/forked TRAIN must supply the absolute horizon explicitly. */
+        if (loaded_legacy_checkpoint && !config.evaluation_only && iteration > 0 &&
+            config.learning_rate_schedule_updates <= 0) {
+            throw std::runtime_error(
+                "legacy checkpoint has no verified learning-rate schedule horizon; training "
+                "or forking it requires a positive explicit --lr-schedule-updates (derive it from the "
+                "original run evidence, not the new --iterations target)");
         }
-        /* KL-101: pin the LR schedule horizon to a concrete number the first time it's ever
-           needed (fresh run, or resuming a pre-manifest checkpoint that still carries the 0
-           "derive" sentinel), rather than leaving it at 0. Once resolved here, the semantic
-           manifest above keeps it stable across every future resume even if --iterations is
-           later extended - fixing the bug where extending a run's target silently re-derived
-           a NEW (larger) horizon against the same already-accumulated global_updates,
-           producing a sudden upward learning-rate jump mid-training. */
-        if (config.learning_rate_schedule_updates <= 0) {
+        /* Resolve all semantics BEFORE writing best.pt, fork-manifest.json, or config.json.
+           Earlier code wrote a fork manifest and a synthetic champion with horizon 0, then
+           silently changed the live run to a nonzero horizon. */
+        if (config.learning_rate_schedule_updates <= 0 &&
+            !(loaded_legacy_checkpoint && config.evaluation_only)) {
             config.learning_rate_schedule_updates = std::max<int64_t>(
                 static_cast<int64_t>(config.iterations) * config.train_steps, 1);
+        }
+        if (forked) {
+            inherit_champion_artifact(config.fork_from);
+            write_fork_manifest();
+        } else if (!config.evaluation_only) {
+            reconcile_or_restore_champion(requested_checkpoint_path);
         }
         if (!config.evaluation_only) {
             write_config();
@@ -1451,11 +1509,12 @@ struct Trainer::Impl {
     std::filesystem::path metrics_path;
     SelfPlayMetrics last_self_play;
     Evaluation last_league_play;
-    /* KL-101 Part D: held for this object's entire lifetime, released automatically (even on
-       an exception or crash) when Impl is destroyed - see acquisition site in the constructor
-       for why there are two. Null in evaluate mode. */
+    /* KL-101 Part D: global native-GPU lock is held by train and evaluate for the object's
+       lifetime; the run-dir lock is training-only. OS handles release on every exit path. */
     std::unique_ptr<ProcessLock> system_lock;
     std::unique_ptr<ProcessLock> run_dir_lock;
+    bool loaded_legacy_checkpoint{};
+    std::filesystem::path inherited_champion_source{};
     /* KL-101 Part E: phase timings for the current iteration (reset at loop top) and a
        cumulative action histogram across the whole run (the network's own moves only - both
        seats during mirror self-play, the network-controlled seat only during league play;
@@ -1492,6 +1551,11 @@ struct Trainer::Impl {
                << "  \"source_checkpoint\": \""
                << json_escape(config.fork_from.string()) << "\",\n"
                << "  \"source_checkpoint_sha256\": \"" << parent_sha256 << "\",\n"
+               << "  \"source_champion_checkpoint\": \""
+               << json_escape(inherited_champion_source.string()) << "\",\n"
+               << "  \"source_champion_sha256\": \""
+               << (inherited_champion_source.empty() ? std::string{} :
+                   sha256_file(inherited_champion_source)) << "\",\n"
                << "  \"source_run_dir\": \""
                << json_escape(config.fork_from.parent_path().string()) << "\",\n"
                << "  \"target_run_dir\": \"" << json_escape(config.run_dir.string()) << "\",\n"
@@ -2001,6 +2065,9 @@ struct Trainer::Impl {
             if (!per_match_output.parent_path().empty())
                 std::filesystem::create_directories(per_match_output.parent_path());
             per_match_log = std::make_unique<std::ofstream>(per_match_output, std::ios::trunc);
+            if (!*per_match_log)
+                throw std::runtime_error("could not open per-match evidence output: " +
+                                         per_match_output.string());
         }
         /* KL-107: per-LEARNER-STEP neural decision trace, one JSON line per step across all
            matches. Stamped with checkpoint/executable hashes (reusing KL-101 Part C's
@@ -2015,7 +2082,10 @@ struct Trainer::Impl {
             if (!trace_output.parent_path().empty())
                 std::filesystem::create_directories(trace_output.parent_path());
             trace_log = std::make_unique<std::ofstream>(trace_output, std::ios::trunc);
-            *trace_log << "{\"trace_format_version\":1,\"checkpoint_sha256\":\""
+            if (!*trace_log)
+                throw std::runtime_error("could not open neural trace output: " +
+                                         trace_output.string());
+            *trace_log << "{\"trace_format_version\":2,\"checkpoint_sha256\":\""
                        << sha256_file(requested_checkpoint_path)
                        << "\",\"executable_sha256\":\""
                        << sha256_file(current_executable_path())
@@ -2061,15 +2131,13 @@ struct Trainer::Impl {
                 const int learner_action = marginal_action(
                     search_result.visits, match.learner_seat);
                 if (trace_log) {
-                    /* Raw policy = root priors (network policy head, evaluated once before
-                       any simulation) marginalized to this seat. MCTS policy = root visits
-                       (simulation-refined) marginalized the same way. Search value estimate =
-                       this seat's accumulated backup sum / total visits at the root, summed
-                       over joint actions - the search's own belief about the position, not a
-                       separate raw-network value head read (that would need capturing the
-                       root's leaf evaluation before any backup, a deeper structural change
-                       deliberately deferred - see docs/experiment-memory/10-...md). */
-                    const auto raw_policy = marginal_distribution(search_result.priors, match.learner_seat);
+                    /* Root priors have already passed through safe-action masking and
+                       renormalization. Name them accordingly: agreement with this prior can
+                       implicate the policy+mask path, but cannot isolate the raw policy head.
+                       Search value is likewise a backed-up root average, not raw value-head
+                       output. */
+                    const auto masked_prior = marginal_distribution(
+                        search_result.priors, match.learner_seat);
                     const auto mcts_policy = marginal_distribution(search_result.visits, match.learner_seat);
                     const auto& value_sum = match.learner_seat == 0 ? search_result.value_sum0
                                                                      : search_result.value_sum1;
@@ -2082,10 +2150,11 @@ struct Trainer::Impl {
                         << ",\"learner_seat\":" << match.learner_seat
                         << ",\"step\":" << match.env.state.step
                         << ",\"chosen_action\":" << learner_action
-                        << ",\"raw_policy\":[";
+                        << ",\"policy_prior_after_safety_mask\":[";
                     for (int action = 0; action < kActions; ++action)
-                        *trace_log << (action ? "," : "") << raw_policy[action];
-                    *trace_log << "],\"raw_policy_entropy\":" << distribution_entropy(raw_policy)
+                        *trace_log << (action ? "," : "") << masked_prior[action];
+                    *trace_log << "],\"policy_prior_entropy\":"
+                        << distribution_entropy(masked_prior)
                         << ",\"mcts_policy\":[";
                     for (int action = 0; action < kActions; ++action)
                         *trace_log << (action ? "," : "") << mcts_policy[action];
@@ -2096,6 +2165,7 @@ struct Trainer::Impl {
                                 ? static_cast<double>(match.wait_steps) / match.total_steps
                                 : 0.0)
                         << "}\n";
+                    trace_log->flush();
                 }
                 Observation observation;
                 DebugSnapshot snapshot;
@@ -2167,6 +2237,7 @@ struct Trainer::Impl {
                                     ? static_cast<double>(match.wait_steps) / match.total_steps
                                     : 0.0)
                             << "}\n";
+                        per_match_log->flush();
                     }
                     total_steps += match.env.state.step;
                     ++completed;
@@ -2300,6 +2371,102 @@ struct Trainer::Impl {
         return result;
     }
 
+    struct CheckpointLineage {
+        int iteration{-1};
+        int best_iteration{-1};
+    };
+
+    CheckpointLineage checkpoint_lineage(const std::filesystem::path& path) const {
+        torch::serialize::InputArchive archive;
+        archive.load_from(path.string(), torch::kCPU);
+        torch::Tensor meta;
+        archive.read("meta", meta);
+        meta = meta.to(torch::kCPU);
+        const auto meta_values = meta.accessor<int64_t, 1>();
+        CheckpointLineage result;
+        result.iteration = static_cast<int>(meta_values[1]);
+        result.best_iteration = result.iteration;
+        torch::Tensor selection_meta;
+        if (archive.try_read("selection_meta", selection_meta)) {
+            selection_meta = selection_meta.to(torch::kCPU);
+            result.best_iteration = static_cast<int>(
+                selection_meta.accessor<int64_t, 1>()[0]);
+        }
+        return result;
+    }
+
+    void copy_checkpoint_atomically(const std::filesystem::path& source,
+                                    const std::filesystem::path& destination) const {
+        const auto temporary = destination.string() + ".tmp";
+        std::filesystem::copy_file(source, temporary,
+                                   std::filesystem::copy_options::overwrite_existing);
+        atomic_replace(temporary, destination);
+    }
+
+    /* A checkpoint's selection metadata names the historical champion, but its model tensors
+       are the CURRENT iteration's tensors. Saving the just-loaded current model as best.pt
+       therefore corrupts lineage whenever iteration != best_iteration. Preserve the exact
+       parent champion artifact instead, or fail closed when it cannot be recovered. */
+    void inherit_champion_artifact(const std::filesystem::path& source_checkpoint) {
+        if (best_iteration < 0) return;
+        auto candidate = source_checkpoint.parent_path() / "best.pt";
+        if (!std::filesystem::exists(candidate)) {
+            const auto source_lineage = checkpoint_lineage(source_checkpoint);
+            if (source_lineage.iteration == best_iteration) {
+                candidate = source_checkpoint;
+            } else {
+                throw std::runtime_error(
+                    "fork checkpoint inherits champion iteration " +
+                    std::to_string(best_iteration) + " but the exact parent best.pt is missing; "
+                    "refusing to label current iteration " + std::to_string(source_lineage.iteration) +
+                    " weights as that historical champion");
+            }
+        }
+        const auto candidate_lineage = checkpoint_lineage(candidate);
+        if (candidate_lineage.iteration != best_iteration ||
+            candidate_lineage.best_iteration != best_iteration) {
+            throw std::runtime_error(
+                "parent champion artifact does not match inherited best_iteration=" +
+                std::to_string(best_iteration) + " (artifact iteration=" +
+                std::to_string(candidate_lineage.iteration) + ", lineage=" +
+                std::to_string(candidate_lineage.best_iteration) + ")");
+        }
+        copy_checkpoint_atomically(candidate, best_path);
+        inherited_champion_source = candidate;
+        reconcile_champion_state();
+        std::cout << "Inherited exact champion artifact " << candidate.string()
+                  << " (iteration " << best_iteration << ") into " << best_path.string()
+                  << '\n';
+    }
+
+    void reconcile_or_restore_champion(const std::filesystem::path& loaded_checkpoint) {
+        if (std::filesystem::exists(best_path)) {
+            const auto champion = checkpoint_lineage(best_path);
+            if (best_iteration < 0 || champion.iteration != best_iteration ||
+                champion.best_iteration != best_iteration) {
+                throw std::runtime_error(
+                    "existing best.pt champion artifact does not match loaded lineage "
+                    "best_iteration=" + std::to_string(best_iteration) +
+                    " (artifact iteration=" + std::to_string(champion.iteration) +
+                    ", lineage=" + std::to_string(champion.best_iteration) +
+                    "); refusing to use current/latest weights as a historical champion");
+            }
+            reconcile_champion_state();
+            return;
+        }
+        if (best_iteration < 0 || !std::filesystem::exists(loaded_checkpoint)) return;
+        const auto lineage = checkpoint_lineage(loaded_checkpoint);
+        if (lineage.iteration != best_iteration) {
+            throw std::runtime_error(
+                "checkpoint records champion iteration " + std::to_string(best_iteration) +
+                " but best.pt is missing and loaded checkpoint contains iteration " +
+                std::to_string(lineage.iteration) + " weights; refusing a fake incumbent");
+        }
+        copy_checkpoint_atomically(loaded_checkpoint, best_path);
+        inherited_champion_source = loaded_checkpoint;
+        reconcile_champion_state();
+    }
+
     void reconcile_champion_state() {
         if (!std::filesystem::exists(best_path)) return;
         torch::serialize::InputArchive archive;
@@ -2413,6 +2580,7 @@ struct Trainer::Impl {
                 fork_log << "]}\n";
             }
         } else if (config.legacy_accept_unverified_semantics) {
+            loaded_legacy_checkpoint = true;
             std::cout << "UNVERIFIED SEMANTICS - " << source.string() << " predates the "
                          "semantic manifest (KL-101). Its trained arena-crush-win-value, "
                          "selfkill-win-value, league-heuristic-fraction, and other reward/"
@@ -2766,9 +2934,21 @@ struct Trainer::Impl {
         std::cout << std::defaultfloat;
     }
 
+    void require_available_evidence_path(const std::filesystem::path& path,
+                                         std::string_view label) const {
+        if (path.empty() || config.overwrite_evidence || !std::filesystem::exists(path)) return;
+        throw std::runtime_error(
+            std::string(label) + " already exists: " + path.string() +
+            "; refusing to overwrite research evidence (choose a unique path or pass "
+            "--overwrite-evidence explicitly)");
+    }
+
     void evaluate_only() {
         if (!std::filesystem::exists(requested_checkpoint_path))
             throw std::runtime_error("checkpoint not found: " + requested_checkpoint_path.string());
+        require_available_evidence_path(config.evaluation_output, "aggregate evaluation output");
+        require_available_evidence_path(config.per_match_output, "per-match evaluation output");
+        require_available_evidence_path(config.trace_output, "neural trace output");
         /* KL-101: print the RESOLVED semantic config actually in effect for this evaluation
            (after load_checkpoint()'s inheritance in the constructor above ran) - so a strong
            W-D-L score is never read without also seeing whether the reward/mechanics
@@ -2836,6 +3016,9 @@ struct Trainer::Impl {
             if (!config.evaluation_output.parent_path().empty())
                 std::filesystem::create_directories(config.evaluation_output.parent_path());
             std::ofstream output(temporary, std::ios::trunc);
+            if (!output)
+                throw std::runtime_error("could not open aggregate evaluation output: " +
+                                         temporary);
             auto write_result = [&output](const char* name, const Evaluation& value) {
                 output << "  \"" << name << "\": {\"wins\": " << value.wins
                        << ", \"draws\": " << value.draws
@@ -2869,7 +3052,33 @@ struct Trainer::Impl {
             };
             output << "{\n"
                    << "  \"schema_version\": 2,\n"
+                   << "  \"generated_at_utc\": \"" << utc_timestamp() << "\",\n"
+                   << "  \"invocation_argv\": [";
+            for (size_t index = 0; index < config.invocation_argv.size(); ++index) {
+                if (index) output << ',';
+                output << '"' << json_escape(config.invocation_argv[index]) << '"';
+            }
+            output << "],\n"
+                   << "  \"working_directory\": \""
+                   << json_escape(std::filesystem::current_path().string()) << "\",\n"
                    << "  \"checkpoint\": \"" << json_escape(config.checkpoint.string()) << "\",\n"
+                   << "  \"checkpoint_path\": \""
+                   << json_escape(std::filesystem::absolute(requested_checkpoint_path)
+                                      .lexically_normal().string()) << "\",\n"
+                   << "  \"checkpoint_sha256\": \""
+                   << sha256_file(requested_checkpoint_path) << "\",\n"
+                   << "  \"executable_path\": \""
+                   << json_escape(current_executable_path().string()) << "\",\n"
+                   << "  \"executable_sha256\": \""
+                   << sha256_file(current_executable_path()) << "\",\n"
+                   << "  \"git_commit\": \"" << AI_BOMBER_GIT_SHA << "\",\n"
+                   << "  \"runtime_config_signature\": \""
+                   << json_escape(runtime_config_signature(config)) << "\",\n"
+                   << "  \"checkpoint_semantics_verified\": "
+                   << (loaded_legacy_checkpoint ? "false" : "true") << ",\n"
+                   << "  \"checkpoint_semantics_source\": \""
+                   << (loaded_legacy_checkpoint ? "legacy_cli_unverified" : "checkpoint_manifest")
+                   << "\",\n"
                    << "  \"checkpoint_iteration\": " << iteration << ",\n"
                    << "  \"seed_base\": " << config.evaluation_seed_base << ",\n"
                    << "  \"seeds_per_opponent\": " << config.evaluation_games << ",\n"
@@ -2887,8 +3096,12 @@ struct Trainer::Impl {
                    << ", \"selfkill_win_value\": " << config.selfkill_win_value
                    << ", \"league_heuristic_fraction\": " << config.league_heuristic_fraction
                    << ", \"c_puct\": " << config.c_puct
-                   << ", \"learning_rate_schedule_updates\": "
-                   << config.learning_rate_schedule_updates << "},\n";
+                   << ", \"learning_rate_schedule_updates\": ";
+            if (loaded_legacy_checkpoint && config.learning_rate_schedule_updates <= 0)
+                output << "null";
+            else
+                output << config.learning_rate_schedule_updates;
+            output << "},\n";
             if (config.evaluate_mcts)
                 output << "  \"baseline_mcts_simulations\": "
                        << config.baseline_mcts_simulations << ",\n"
@@ -2913,7 +3126,9 @@ struct Trainer::Impl {
 };
 
 TrainConfig parse_train_config(int argc, char** argv, int first) {
+    validate_train_cli_options(argc, argv, first);
     TrainConfig config;
+    config.invocation_argv = invocation_arguments(argc, argv);
     config.run_dir = parse_string(argc, argv, first, "--run-dir", config.run_dir.string());
     config.checkpoint = parse_string(argc, argv, first, "--checkpoint", config.checkpoint.string());
     config.evaluation_output = parse_string(argc, argv, first, "--output", "");
@@ -2997,10 +3212,15 @@ TrainConfig parse_train_config(int argc, char** argv, int first) {
     config.fresh = has_flag(argc, argv, first, "--fresh");
     config.progress = !has_flag(argc, argv, first, "--no-progress");
     config.evaluate_mcts = has_flag(argc, argv, first, "--eval-mcts");
+    config.overwrite_evidence = has_flag(argc, argv, first, "--overwrite-evidence");
     config.legacy_accept_unverified_semantics =
         has_flag(argc, argv, first, "--legacy-accept-unverified-semantics");
     for (const auto& [key, flag] : semantic_field_flags())
         if (has_flag(argc, argv, first, flag)) config.explicit_semantic_flags.insert(key);
+    if (has_flag(argc, argv, first, "--draw-value")) {
+        config.explicit_semantic_flags.insert("timeout_draw_value");
+        config.explicit_semantic_flags.insert("mutual_death_value");
+    }
     validate_config(config);
     return config;
 }
@@ -3021,15 +3241,16 @@ void print_native_help() {
         "  --run-dir PATH            Checkpoint/result directory\n"
         "  --checkpoint FILE         Checkpoint to load (default latest.pt)\n"
         "  --output PATH             Write evaluation results as JSON\n"
-        "  --per-match-output PATH   (evaluate --eval-mcts) Write one immutable JSON line per\n"
+        "  --per-match-output PATH   (evaluate --eval-mcts) Write one JSON line per\n"
         "                            completed MCTS-baseline match: seed, seat, outcome, cause,\n"
-        "                            steps, WAIT - the per-match rows a paired/seat-delta causal\n"
-        "                            comparison needs (KL-108)\n"
-        "  --trace-output PATH       (evaluate --eval-mcts) Write one immutable JSON line per\n"
-        "                            LEARNER STEP: raw network policy + entropy, MCTS-refined\n"
-        "                            policy, search value estimate, root visits, chosen action -\n"
-        "                            the neural decision trace for diagnosing whether a tactical\n"
-        "                            error came from the policy, value, or search (KL-107)\n"
+        "                            steps, WAIT - rows for paired/seat-delta descriptive\n"
+        "                            comparison; causal use also requires matched training\n"
+        "                            lineage, schedule, binary, and non-treatment semantics\n"
+        "  --trace-output PATH       (evaluate --eval-mcts) Write one JSON line per LEARNER\n"
+        "                            STEP: safety-masked policy prior + entropy, MCTS-refined\n"
+        "                            policy, search backup value, root visits, chosen action\n"
+        "  --overwrite-evidence      Explicitly allow existing output/per-match/trace paths\n"
+        "                            to be replaced (default is fail closed)\n"
         "  --draw-value X            Set both per-seat draw values (timeout+mutual death) to X\n"
         "                            in [-1,0]; the aggression dial (default -0.5/-0.2)\n"
         "  --arena-crush-win-value X Value of a win by sudden-death arena crush (default 0.3)\n"

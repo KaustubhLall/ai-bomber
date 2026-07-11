@@ -1,10 +1,9 @@
-# Brick 2 (KL-108/KL-98) matched control: forks from the SAME v6-league iteration-102
-# checkpoint crush01 forked from, changing NOTHING semantically (arena-crush-win-value stays
-# 0.3, matching what this parent was actually trained under its entire history). This is what
-# v6-league would have kept doing if the reward lever had never been touched - the missing
-# matched control the crush01 gate-eval numbers were never actually compared against
-# (comparing crush01-130 to parent-100 directly would be confounded by 28 iterations of
-# general training, replay turnover, and LR phase, none of which is the lever under test).
+# Brick 2 (KL-108/KL-98) control launcher. IMPORTANT: the historical control03 artifacts
+# were produced before this correction and are LR-CONFOUNDED (13,184-update horizon instead
+# of crush01's 25,600). Do not overwrite them or call their comparison causal. This script now
+# pins 25,600 explicitly for any intentionally new run cloned to a new directory.
+# A corrected rerun would fork from the same v6-league iteration-102 checkpoint crush01 used,
+# keep arena-crush-win-value=0.3, and explicitly match crush01's 25,600-update schedule.
 #
 # NOTE: this parent checkpoint predates KL-101's semantic-manifest fix (it was saved before
 # that commit), so it has no manifest to inherit from and correctly fails closed without
@@ -24,12 +23,17 @@
 Use-Torch
 
 $parentCheckpoint = "results/alphazero-native-superhuman-v6-league/latest.pt"
+$runDir = "results/alphazero-native-superhuman-control03-from102"
 if (-not (Test-Path $parentCheckpoint)) {
     throw "Parent checkpoint not found: $parentCheckpoint - v6-league's iteration-102 latest.pt must exist to fork from."
 }
+if ((Test-Path -LiteralPath $runDir) -and
+    (Get-ChildItem -LiteralPath $runDir -Force -ErrorAction Stop | Select-Object -First 1)) {
+    throw "Historical or partial control03 artifacts already exist at $runDir and are retained as evidence. Refusing --fresh overwrite of any non-empty run directory; copy this launcher to a new run-dir if a corrected causal rerun is explicitly approved."
+}
 
 $trainerArgs = @(
-    "--run-dir", "results/alphazero-native-superhuman-control03-from102",
+    "--run-dir", $runDir,
     "--fresh", "--fork-from", $parentCheckpoint,
     "--iterations", "103",
     "--width", "13", "--height", "11", "--max-steps", "200", "--crate-density", "50",
@@ -37,6 +41,7 @@ $trainerArgs = @(
     "--channels", "128", "--blocks", "10", "--games", "128", "--simulations", "96",
     "--train-steps", "128", "--batch-size", "512", "--replay-capacity", "200000",
     "--learning-rate", "0.0002", "--min-learning-rate", "0.00001",
+    "--lr-schedule-updates", "25600",
     "--weight-decay", "0.0001", "--c-puct", "1.5", "--dirichlet-alpha", "0.3", "--dirichlet-fraction", "0.25",
     "--temperature", "1", "--temperature-steps", "30",
     "--teacher-games", "32", "--teacher-iterations", "20",

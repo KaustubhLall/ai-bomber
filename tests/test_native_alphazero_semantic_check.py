@@ -5,6 +5,7 @@ evaluate command line - semantics are inherited from the checkpoint's manifest."
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 from pathlib import Path
 
@@ -19,5 +20,25 @@ assert abs(resolved - 0.15) < 1e-9, (
     f"which is exactly the KL-101 silent-semantics bug"
 )
 
-print("Native AlphaZero semantic-manifest inheritance validated "
-      f"(arena_crush_win_value={resolved} correctly inherited from checkpoint)")
+checkpoint = run_dir / "latest.pt"
+assert result["checkpoint_sha256"] == hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+assert result["executable_sha256"], "evaluation evidence must identify the executable"
+assert result["generated_at_utc"].endswith("Z")
+assert "evaluate" in result["invocation_argv"], (
+    "evaluation evidence must preserve exact argv as a JSON array"
+)
+assert result["checkpoint_semantics_verified"] is True
+assert result["checkpoint_semantics_source"] == "checkpoint_manifest"
+assert Path(result["checkpoint_path"]).is_absolute()
+assert result["working_directory"]
+assert result["runtime_config_signature"]
+
+draw_alias = json.loads((run_dir / "eval-draw-alias.json").read_text())
+assert abs(draw_alias["resolved_semantics"]["timeout_draw_value"] - (-0.7)) < 1e-9
+assert abs(draw_alias["resolved_semantics"]["mutual_death_value"] - (-0.7)) < 1e-9, (
+    "explicit --draw-value must override both inherited draw fields"
+)
+
+print("Native AlphaZero semantic inheritance + evidence provenance validated "
+      f"(arena_crush_win_value={resolved}, --draw-value alias honored, "
+      "checkpoint/executable/exact argv recorded)")
