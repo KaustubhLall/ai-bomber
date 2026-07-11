@@ -360,3 +360,38 @@ computes); the actual "inspect one win/loss/draw against MCTS and identify root
 cause" analysis (deliberately waiting for control03's real iteration-130 result,
 so the games analyzed are the ones that actually matter to the open question, not
 placeholder games from a checkpoint about to be superseded).
+
+## Brick 7 (KL-104): substantial progress during the control03 wait
+
+Continued using GPU-idle windows productively rather than sitting idle or piling
+more unverified C++ on top of the already-blocked Brick 3 work:
+
+- Champion launchers (`champion-eval.ps1`, `champion-replay.ps1`) relabeled as
+  retracted — loud runtime warning + header comments + README table markers.
+  Deliberately reworded rather than renamed (the user's own phrasing allowed
+  either): renaming would break any existing desktop shortcuts pointing at these
+  exact filenames, which can't be discovered or fixed from inside the repo. This is
+  exactly the kind of "hard to reverse, affects something outside the local
+  environment" action worth avoiding when an equally-compliant safer option exists.
+- Obsidian project note (`Project Management/Projects/AI Bomber Search &
+  Self-Play.md`) updated with all five standing rules the user asked for: one-trainer
+  rule, semantic-fork provenance, LR-horizon rule, claim-evidence hierarchy (five
+  ranked items, each tied to a specific thing that was actually exploited or nearly
+  was, not abstract principles), fresh-holdout rule. Written as a durable "why this
+  exists" preamble + checklist, not just a rule dump, per this vault's own writing
+  conventions (General Preferences.md: "principle -> rule -> one-line rationale").
+  Not committed via git - this file lives outside the ai-bomber repo entirely, in the
+  Obsidian vault that syncs via Obsidian Git on its own, not something this session
+  has a git remote for.
+- KL-104 updated in Linear with the real state: 3 of 7 acceptance items done this
+  session, 1 discovered already-done (KL-81/KL-109 reconciliation predates tonight),
+  2 genuinely not started ("distinguish current vs archived truth in fidelity/
+  campaign docs" and "repository/Linear/Obsidian links agree" - both broader,
+  open-ended verification passes rather than a single bounded fix, deliberately not
+  rushed).
+
+Control03 still healthy at iteration 104/130 throughout this entire stretch (checked
+without disrupting it - read-only tasklist/metrics.jsonl checks only). Settling back
+into a lower-activity monitoring posture now rather than continuing to manufacture
+more parallel work threads - the Monitor (task b3n749li0) will notify at the next
+5-iteration milestone or on completion.
