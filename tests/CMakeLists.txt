@@ -217,4 +217,50 @@ if(TARGET bomber_alphazero_native)
     set_tests_properties(test_native_alphazero_schedule_check PROPERTIES
       DEPENDS test_native_alphazero_schedule_extend TIMEOUT 20)
   endif()
+
+  # KL-101 Part C regression: --fork-from must inherit weights/semantics/champion-lineage from
+  # an external checkpoint, record full provenance, and NOT re-trigger the "iter-110 fake
+  # initial promotion" bug (has_incumbent used to be a pure best.pt file-existence check, blind
+  # to inherited lineage - see write_fork_manifest()'s best.pt materialization in trainer.cpp).
+  add_test(NAME test_native_alphazero_fork_parent
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-fork-parent
+      --fresh --iterations 1 --games 2 --simulations 2
+      --train-steps 1 --batch-size 4 --replay-capacity 64
+      --channels 8 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 1 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress
+      --arena-crush-win-value 0.22)
+  set_tests_properties(test_native_alphazero_fork_parent PROPERTIES TIMEOUT 60)
+  add_test(NAME test_native_alphazero_fork_child
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-fork-child
+      --fresh --fork-from ${CMAKE_BINARY_DIR}/native-alphazero-fork-parent/latest.pt
+      --iterations 3 --games 2 --simulations 2
+      --train-steps 1 --batch-size 4 --replay-capacity 64
+      --channels 8 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 1 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress
+      --dirty-diff-digest ctest-regression-digest)
+  set_tests_properties(test_native_alphazero_fork_child PROPERTIES
+    DEPENDS test_native_alphazero_fork_parent TIMEOUT 60)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME test_native_alphazero_fork_check
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_alphazero_fork_check.py
+        ${CMAKE_BINARY_DIR}/native-alphazero-fork-parent
+        ${CMAKE_BINARY_DIR}/native-alphazero-fork-child)
+    set_tests_properties(test_native_alphazero_fork_check PROPERTIES
+      DEPENDS test_native_alphazero_fork_child TIMEOUT 20)
+  endif()
 endif()

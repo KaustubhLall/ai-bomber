@@ -21,6 +21,7 @@ extern "C" {
 #include <cmath>
 #include <csignal>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <fstream>
 #include <iomanip>
@@ -56,6 +57,94 @@ constexpr int kFormatVersion = 1;
 std::atomic<bool> stop_requested{false};
 
 void signal_handler(int) { stop_requested.store(true); }
+
+/* Self-contained streaming SHA-256 (FIPS 180-4) - no existing hash utility anywhere in this
+   codebase, and this is the only place one is needed (KL-101 fork/checkpoint provenance:
+   parent checkpoint hash, own executable hash). Deliberately not shelling out to an external
+   tool (certutil/sha256sum) from inside the trainer - keeps provenance capture portable and
+   dependency-free, matching how the rest of this file avoids extra libraries. Verified against
+   the standard test vectors (SHA-256("") and SHA-256("abc")) and cross-checked against
+   PowerShell's Get-FileHash on a real file before being trusted for provenance records. */
+std::string sha256_file(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) throw std::runtime_error("cannot open for hashing: " + path.string());
+
+    static constexpr uint32_t k[64] = {
+        0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+        0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+        0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+        0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+        0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+        0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+        0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+        0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
+    uint32_t h[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+                      0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+    const auto rotr = [](uint32_t x, int n) { return (x >> n) | (x << (32 - n)); };
+    const auto process_block = [&](const unsigned char* data) {
+        uint32_t w[64];
+        for (int i = 0; i < 16; ++i)
+            w[i] = (static_cast<uint32_t>(data[i * 4]) << 24) |
+                   (static_cast<uint32_t>(data[i * 4 + 1]) << 16) |
+                   (static_cast<uint32_t>(data[i * 4 + 2]) << 8) |
+                   static_cast<uint32_t>(data[i * 4 + 3]);
+        for (int i = 16; i < 64; ++i) {
+            const uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+            const uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+        for (int i = 0; i < 64; ++i) {
+            const uint32_t s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+            const uint32_t ch = (e & f) ^ (~e & g);
+            const uint32_t temp1 = hh + s1 + ch + k[i] + w[i];
+            const uint32_t s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+            const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            const uint32_t temp2 = s0 + maj;
+            hh = g; g = f; f = e; e = d + temp1; d = c; c = b; b = a; a = temp1 + temp2;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d;
+        h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+    };
+
+    std::vector<char> read_buffer(1 << 20);
+    unsigned char block[64];
+    size_t block_used = 0;
+    uint64_t total_length = 0;
+    while (file) {
+        file.read(read_buffer.data(), static_cast<std::streamsize>(read_buffer.size()));
+        const std::streamsize got = file.gcount();
+        if (got <= 0) break;
+        total_length += static_cast<uint64_t>(got);
+        size_t offset = 0;
+        while (offset < static_cast<size_t>(got)) {
+            const size_t take = std::min(static_cast<size_t>(got) - offset, size_t{64} - block_used);
+            std::memcpy(block + block_used, read_buffer.data() + offset, take);
+            block_used += take;
+            offset += take;
+            if (block_used == 64) {
+                process_block(block);
+                block_used = 0;
+            }
+        }
+    }
+    const uint64_t bit_length = total_length * 8;
+    block[block_used++] = 0x80;
+    if (block_used > 56) {
+        while (block_used < 64) block[block_used++] = 0;
+        process_block(block);
+        block_used = 0;
+    }
+    while (block_used < 56) block[block_used++] = 0;
+    for (int i = 7; i >= 0; --i)
+        block[block_used++] = static_cast<unsigned char>((bit_length >> (i * 8)) & 0xff);
+    process_block(block);
+
+    std::ostringstream hex;
+    hex << std::hex << std::setfill('0');
+    for (const uint32_t word : h) hex << std::setw(8) << word;
+    return hex.str();
+}
 
 std::string format_duration(double seconds) {
     if (!std::isfinite(seconds) || seconds < 0.0) return "--:--:--";
@@ -691,6 +780,26 @@ void atomic_copy_file(const std::filesystem::path& source,
     atomic_replace(temporary, destination);
 }
 
+/* KL-101 Part C: this process's own executable path, for self-hashing into fork-manifest.json
+   provenance (which exact binary produced this checkpoint). argv[0] is not reliable (may be a
+   relative path, or just "bomber_alphazero_native" if found via PATH) - query the OS directly. */
+std::filesystem::path current_executable_path() {
+#ifdef _WIN32
+    std::vector<wchar_t> buffer(MAX_PATH);
+    for (;;) {
+        const DWORD length = GetModuleFileNameW(nullptr, buffer.data(),
+                                                 static_cast<DWORD>(buffer.size()));
+        if (length == 0)
+            throw std::runtime_error("GetModuleFileNameW failed: Windows error " +
+                                     std::to_string(GetLastError()));
+        if (length < buffer.size()) return std::filesystem::path(buffer.data());
+        buffer.resize(buffer.size() * 2);
+    }
+#else
+    return std::filesystem::read_symlink("/proc/self/exe");
+#endif
+}
+
 torch::Tensor string_tensor(const std::string& value) {
     return torch::from_blob(const_cast<char*>(value.data()),
                             {static_cast<int64_t>(value.size())}, torch::kUInt8).clone();
@@ -953,6 +1062,10 @@ void validate_config(const TrainConfig& config) {
     if (config.learning_rate_schedule_start_update < 0 ||
         config.learning_rate_schedule_updates < 0)
         throw std::invalid_argument("learning-rate schedule updates cannot be negative");
+    if (!config.fork_from.empty() && !config.fresh)
+        throw std::invalid_argument(
+            "--fork-from requires --fresh (a fork establishes a new lineage/run-dir, "
+            "it is not an ordinary resume)");
     if (config.promotion_margin < 0.0 || config.promotion_margin >= 0.5 ||
         config.promotion_confidence_z < 0.0 || config.random_score_floor < 0.0 ||
         config.random_score_floor > 1.0 || config.heuristic_score_floor < 0.0 ||
@@ -1000,12 +1113,45 @@ struct Trainer::Impl {
                      name.ends_with(".tmp")))
                     std::filesystem::remove(entry.path());
             }
+            if (!config.fork_from.empty()) {
+                /* KL-101 Part C: explicit fork - load the parent's weights/optimizer/replay/
+                   RNG/semantics/champion-lineage into this fresh run, then record full
+                   provenance. Reuses load_checkpoint() so a fork gets the exact same ABI
+                   hard-fail, semantic inheritance, and legacy-checkpoint handling as an
+                   ordinary resume - a fork is not a special, less-verified code path. */
+                if (!std::filesystem::exists(config.fork_from))
+                    throw std::runtime_error("--fork-from checkpoint not found: " +
+                                             config.fork_from.string());
+                load_checkpoint(config.fork_from);
+                write_fork_manifest();
+                std::cout << "Forked from " << config.fork_from.string()
+                          << " at iteration " << iteration
+                          << " with " << replay.size() << " replay samples\n";
+            }
         } else if (std::filesystem::exists(requested_checkpoint_path)) {
             load_checkpoint(requested_checkpoint_path);
             reconcile_champion_state();
             std::cout << "Loaded " << requested_checkpoint_path.string()
                       << " at iteration " << iteration
                       << " with " << replay.size() << " replay samples\n";
+        }
+        /* KL-101 Part C: fix the "iter-110 fake initial promotion" bug. The promotion gate's
+           has_incumbent check (run()) is a pure std::filesystem::exists(best_path) test - it
+           has no idea that best_iteration/best_score/promotion_count were just inherited from
+           a parent (via --fork-from, or the older ad-hoc copy-latest.pt-into-a-new-dir
+           convention) and already represent a real champion lineage. Left alone, the very
+           first evaluation-interval iteration in a forked/copied run-dir sees no best.pt file,
+           concludes "no incumbent exists," and promotes unconditionally under
+           promoted_initial_quality_gate - discarding real prior lineage and inflating the
+           promotion record. Materializing best.pt from the just-loaded state (which IS the
+           inherited champion, until superseded) closes the gap between the numeric state and
+           the file-existence check the gate actually reads. */
+        if (best_iteration >= 0 && !std::filesystem::exists(best_path)) {
+            save_checkpoint(best_path);
+            std::cout << "Materialized " << best_path.string()
+                      << " from inherited champion lineage (iteration " << best_iteration
+                      << ") - the promotion gate's has_incumbent check needs the file, not "
+                         "just the in-memory best_iteration/best_score\n";
         }
         /* KL-101: pin the LR schedule horizon to a concrete number the first time it's ever
            needed (fresh run, or resuming a pre-manifest checkpoint that still carries the 0
@@ -1097,6 +1243,55 @@ struct Trainer::Impl {
     std::filesystem::path metrics_path;
     SelfPlayMetrics last_self_play;
     Evaluation last_league_play;
+
+    /* KL-101 Part C: immutable fork provenance, written once at fork time (--fresh
+       --fork-from PATH). Deliberately a SEPARATE file from config.json/config-history.jsonl
+       (which describe THIS run's own evolving config) - a fork record answers "where did
+       this lineage's starting point come from and can I trust it," which needs to survive
+       and stay unambiguous even as config.json is later overwritten iteration after
+       iteration. Any semantic differences between the parent and this run's explicit CLI
+       overrides at fork time are already captured by load_checkpoint()'s own
+       semantic-fork-log.jsonl (called just before this) - referenced here, not duplicated. */
+    void write_fork_manifest() const {
+        const auto destination = config.run_dir / "fork-manifest.json";
+        const std::string parent_sha256 = sha256_file(config.fork_from);
+        const std::string executable_path = current_executable_path().string();
+        const std::string executable_sha256 = sha256_file(executable_path);
+        const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        std::tm utc_time{};
+#ifdef _WIN32
+        gmtime_s(&utc_time, &now);
+#else
+        gmtime_r(&now, &utc_time);
+#endif
+        std::ostringstream timestamp;
+        timestamp << std::put_time(&utc_time, "%Y-%m-%dT%H:%M:%SZ");
+
+        std::ofstream output(destination, std::ios::trunc);
+        output << std::setprecision(9) << "{\n"
+               << "  \"forked_at_utc\": \"" << timestamp.str() << "\",\n"
+               << "  \"source_checkpoint\": \""
+               << json_escape(config.fork_from.string()) << "\",\n"
+               << "  \"source_checkpoint_sha256\": \"" << parent_sha256 << "\",\n"
+               << "  \"source_run_dir\": \""
+               << json_escape(config.fork_from.parent_path().string()) << "\",\n"
+               << "  \"target_run_dir\": \"" << json_escape(config.run_dir.string()) << "\",\n"
+               << "  \"target_iteration_at_fork\": " << iteration << ",\n"
+               << "  \"executable_path\": \"" << json_escape(executable_path) << "\",\n"
+               << "  \"executable_sha256\": \"" << executable_sha256 << "\",\n"
+               << "  \"git_commit\": \"" << AI_BOMBER_GIT_SHA << "\",\n"
+               << "  \"dirty_diff_digest\": \""
+               << json_escape(config.dirty_diff_digest) << "\",\n"
+               << "  \"seed\": " << config.seed << ",\n"
+               << "  \"inherited_champion_lineage\": {\"best_iteration\": " << best_iteration
+               << ", \"best_score\": " << best_score
+               << ", \"promotion_count\": " << promotion_count << "},\n"
+               << "  \"resolved_semantics\": \"" << json_escape(semantic_manifest_string(config))
+               << "\",\n"
+               << "  \"semantic_forks_note\": \"any explicit CLI overrides that diverged from "
+                  "the parent at fork time are in semantic-fork-log.jsonl, not duplicated here\""
+               << "\n}\n";
+    }
 
     void write_config() const {
         const auto temporary = config.run_dir / "config.json.tmp";
@@ -2409,6 +2604,9 @@ TrainConfig parse_train_config(int argc, char** argv, int first) {
     config.random_score_floor = parse_number(argc, argv, first, "--random-score-floor", config.random_score_floor);
     config.heuristic_score_floor = parse_number(argc, argv, first, "--heuristic-score-floor", config.heuristic_score_floor);
     config.heuristic_regression_margin = parse_number(argc, argv, first, "--heuristic-regression-margin", config.heuristic_regression_margin);
+    config.fork_from = parse_string(argc, argv, first, "--fork-from", config.fork_from.string());
+    config.dirty_diff_digest = parse_string(argc, argv, first, "--dirty-diff-digest",
+                                            config.dirty_diff_digest);
     config.fresh = has_flag(argc, argv, first, "--fresh");
     config.progress = !has_flag(argc, argv, first, "--no-progress");
     config.evaluate_mcts = has_flag(argc, argv, first, "--eval-mcts");
@@ -2452,6 +2650,14 @@ void print_native_help() {
         "                            schedule values cannot be verified from the checkpoint, so\n"
         "                            this loudly opts in to using this process's CLI values as\n"
         "                            unverified rather than failing closed\n"
+        "  --fork-from PATH          (train --fresh) Seed this run's weights/optimizer/replay/\n"
+        "                            RNG/semantics/champion-lineage from an external checkpoint\n"
+        "                            and record full provenance to fork-manifest.json - the\n"
+        "                            explicit, verified alternative to copying a .pt file into\n"
+        "                            a new run-dir by hand\n"
+        "  --dirty-diff-digest STR   Opaque working-tree diff digest (e.g. `git diff | sha256`,\n"
+        "                            computed by the calling script) recorded verbatim in\n"
+        "                            fork-manifest.json alongside the compiled-in git commit\n"
         "  --replay-out FILE         (evaluate) Write a v4 replay of one checkpoint game for\n"
         "                            bomber_viz --replay (vs heuristic, or MCTS with --eval-mcts)\n"
         "  --replay-incumbent FILE   (evaluate) Record/evaluate checkpoint-vs-checkpoint; with\n"

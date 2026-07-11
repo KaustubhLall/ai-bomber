@@ -120,6 +120,23 @@ struct TrainConfig {
        unmissable "UNVERIFIED SEMANTICS" warning - never silently. CLI
        --legacy-accept-unverified-semantics. */
     bool legacy_accept_unverified_semantics{false};
+    /* KL-101 Part C: explicit fork - seed THIS run's lineage (weights, optimizer, replay, RNG,
+       semantics, champion/promotion state) from an external checkpoint, rather than the
+       ad-hoc "copy latest.pt into a new run-dir, then resume normally" convention used before
+       this existed (which is invisible to the trainer and is what caused the iter-110 fake
+       "initial promotion" bug - see reconcile_champion_state()/has_incumbent in trainer.cpp).
+       Must be combined with --fresh (a fork establishes a new lineage/run-dir, it is not an
+       ordinary resume). Requires the SAME model ABI (channels/blocks/observation) as the
+       parent; semantic fields are inherited from the parent exactly like a normal resume
+       (apply_semantic_manifest), and any explicit CLI override at fork time is captured as
+       the fork's own config diff, not silently applied. CLI --fork-from PATH. */
+    std::filesystem::path fork_from{};
+    /* Optional, opaque to the trainer: a working-tree "dirty diff" digest computed by the
+       CALLING script (e.g. `git diff | sha256`) and recorded verbatim in fork-manifest.json.
+       The trainer does not shell out to git itself (fragile - needs git on PATH, assumes a
+       working directory, etc.); AI_BOMBER_GIT_SHA already captures the committed HEAD at
+       compile time, this covers uncommitted changes at fork time. CLI --dirty-diff-digest. */
+    std::string dirty_diff_digest{};
     /* Populated by parse_train_config() from which semantic CLI flags were literally present
        in argv (as opposed to left at their struct default). Read by load_checkpoint() to
        decide, per semantic field: inherit the checkpoint's stored value (flag absent - the
