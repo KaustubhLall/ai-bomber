@@ -35,6 +35,7 @@ extern "C" {
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #ifdef _WIN32
@@ -200,6 +201,44 @@ private:
     std::ofstream log_;
     TeeStreambuf buf_;
     std::streambuf* original_;
+};
+
+/* KL-101 Part E: adds elapsed wall-clock time to accumulator on destruction (RAII, so it's
+   recorded even if the timed block throws). Scoped-per-call-site rather than a global
+   profiler - this is deliberately the simplest thing that gives Brick 6/KL-102 the
+   "phase timings + same-machine baseline" its own ordered plan lists as its first step,
+   without building general-purpose profiling infrastructure this project doesn't need yet. */
+class ScopedTimer {
+public:
+    explicit ScopedTimer(double& accumulator)
+        : accumulator_(accumulator), started_(std::chrono::steady_clock::now()) {}
+    ~ScopedTimer() {
+        accumulator_ += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started_).count();
+    }
+    ScopedTimer(const ScopedTimer&) = delete;
+    ScopedTimer& operator=(const ScopedTimer&) = delete;
+
+private:
+    double& accumulator_;
+    std::chrono::steady_clock::time_point started_;
+};
+
+/* KL-101 Part E: one iteration's worth of phase timings, all 7 phases KL-101/KL-102 ask for.
+   Reset at the top of each run() loop iteration; checkpoint serialization/durable flush
+   accumulate (+=) rather than overwrite since save_checkpoint() can be called more than once
+   per iteration (latest.pt always, best.pt on promotion). */
+struct PhaseTimings {
+    double mirror_collection_seconds{};
+    double league_collection_seconds{};
+    double optimization_seconds{};
+    double evaluation_random_seconds{};
+    double evaluation_heuristic_seconds{};
+    double evaluation_incumbent_seconds{};
+    double evaluation_mcts_seconds{};
+    double replay_serialization_seconds{};
+    double checkpoint_serialization_seconds{};
+    double durable_flush_seconds{};
 };
 
 std::string format_duration(double seconds) {
@@ -1379,6 +1418,12 @@ struct Trainer::Impl {
        for why there are two. Null in evaluate mode. */
     std::unique_ptr<ProcessLock> system_lock;
     std::unique_ptr<ProcessLock> run_dir_lock;
+    /* KL-101 Part E: phase timings for the current iteration (reset at loop top) and a
+       cumulative action histogram across the whole run (the network's own moves only - both
+       seats during mirror self-play, the network-controlled seat only during league play;
+       never the scripted opponent's actions). */
+    PhaseTimings last_phase_timings;
+    std::array<int64_t, kActions> action_histogram{};
 
     /* KL-101 Part C: immutable fork provenance, written once at fork time (--fresh
        --fork-from PATH). Deliberately a SEPARATE file from config.json/config-history.jsonl
@@ -1623,6 +1668,8 @@ struct Trainer::Impl {
                 last_self_play.total_steps += 2;
                 if (actions[0] == ACTION_WAIT) last_self_play.wait_steps++;
                 if (actions[1] == ACTION_WAIT) last_self_play.wait_steps++;
+                action_histogram[static_cast<size_t>(actions[0])]++;
+                action_histogram[static_cast<size_t>(actions[1])]++;
                 game.done = env_step_joint(&game.env, actions, 2).done != 0;
                 if (game.done) {
                     /* Per-seat terminal values: decisive games are antisymmetric (+1/-1),
@@ -1761,6 +1808,7 @@ struct Trainer::Impl {
                 last_league_play.learner_total_steps++;
                 if (learner_action == static_cast<int>(ACTION_WAIT))
                     last_league_play.learner_wait_steps++;
+                action_histogram[static_cast<size_t>(learner_action)]++;
 
                 const StepResult step_result = env_step_joint(&game.env, actions, 2);
                 game.done = step_result.done != 0;
@@ -2147,7 +2195,11 @@ struct Trainer::Impl {
         torch::serialize::OutputArchive optimizer_archive;
         optimizer.save(optimizer_archive);
         archive.write("optimizer", optimizer_archive);
-        auto [states, policies, values] = replay.tensors();
+        torch::Tensor states, policies, values;
+        {
+            ScopedTimer timer(last_phase_timings.replay_serialization_seconds);
+            std::tie(states, policies, values) = replay.tensors();
+        }
         archive.write("replay_states", states);
         archive.write("replay_policies", policies);
         archive.write("replay_values", values);
@@ -2180,8 +2232,14 @@ struct Trainer::Impl {
         archive.write("config_signature", string_tensor(config_signature(config)));
         archive.write("runtime_config", string_tensor(runtime_config_signature(config)));
         archive.write("semantic_manifest", string_tensor(semantic_manifest_string(config)));
-        archive.save_to(temporary);
-        durable_flush(temporary);
+        {
+            ScopedTimer timer(last_phase_timings.checkpoint_serialization_seconds);
+            archive.save_to(temporary);
+        }
+        {
+            ScopedTimer timer(last_phase_timings.durable_flush_seconds);
+            durable_flush(temporary);
+        }
         atomic_replace(temporary, destination);
     }
 
@@ -2287,7 +2345,37 @@ struct Trainer::Impl {
                << ",\"policy_loss\":" << optimization.policy_loss
                << ",\"value_loss\":" << optimization.value_loss
                << ",\"entropy\":" << optimization.entropy
-               << ",\"learning_rate\":" << optimization.learning_rate << '}';
+               << ",\"learning_rate\":" << optimization.learning_rate << '}'
+               /* KL-101 Part E: this iteration's phase timings (all 7 phases KL-101/KL-102
+                  ask for) - the "same-machine/same-config baseline" KL-102's throughput work
+                  needs as its own first step, captured here instead of duplicated there. */
+               << ",\"phase_timings\":{\"mirror_collection_seconds\":"
+               << last_phase_timings.mirror_collection_seconds
+               << ",\"league_collection_seconds\":"
+               << last_phase_timings.league_collection_seconds
+               << ",\"optimization_seconds\":" << last_phase_timings.optimization_seconds
+               << ",\"evaluation_random_seconds\":"
+               << last_phase_timings.evaluation_random_seconds
+               << ",\"evaluation_heuristic_seconds\":"
+               << last_phase_timings.evaluation_heuristic_seconds
+               << ",\"evaluation_incumbent_seconds\":"
+               << last_phase_timings.evaluation_incumbent_seconds
+               << ",\"evaluation_mcts_seconds\":" << last_phase_timings.evaluation_mcts_seconds
+               << ",\"replay_serialization_seconds\":"
+               << last_phase_timings.replay_serialization_seconds
+               << ",\"checkpoint_serialization_seconds\":"
+               << last_phase_timings.checkpoint_serialization_seconds
+               << ",\"durable_flush_seconds\":" << last_phase_timings.durable_flush_seconds
+               << '}'
+               /* Cumulative across the whole run (not reset per iteration) - the network's
+                  own moves only, both seats during mirror self-play, learner seat only
+                  during league play. */
+               << ",\"action_histogram_cumulative\":{\"up\":" << action_histogram[ACTION_UP]
+               << ",\"down\":" << action_histogram[ACTION_DOWN]
+               << ",\"left\":" << action_histogram[ACTION_LEFT]
+               << ",\"right\":" << action_histogram[ACTION_RIGHT]
+               << ",\"place_bomb\":" << action_histogram[ACTION_PLACE_BOMB]
+               << ",\"wait\":" << action_histogram[ACTION_WAIT] << '}';
         auto write_evaluation = [&output](const char* name, const Evaluation* value) {
             if (!value) return;
             output << ",\"" << name << "\":{\"wins\":" << value->wins
@@ -2345,6 +2433,7 @@ struct Trainer::Impl {
         int completed_this_run = 0;
         while (iteration < config.iterations && !stop_requested.load()) {
             const auto started = std::chrono::steady_clock::now();
+            last_phase_timings = {};
             std::vector<Sample> collected;
             if (iteration < config.teacher_iterations && config.teacher_games > 0) {
                 auto teacher = collect_teacher(config.teacher_games);
@@ -2357,7 +2446,11 @@ struct Trainer::Impl {
                       0, config.self_play_games)
                 : 0;
             const int mirror_games = config.self_play_games - league_games;
-            auto self_play = collect_self_play(mirror_games);
+            std::vector<Sample> self_play;
+            {
+                ScopedTimer timer(last_phase_timings.mirror_collection_seconds);
+                self_play = collect_self_play(mirror_games);
+            }
             {
                 const int decisive = last_self_play.win_by_bomb + last_self_play.win_by_selfkill +
                                      last_self_play.win_by_crush;
@@ -2377,7 +2470,11 @@ struct Trainer::Impl {
             collected.insert(collected.end(), std::make_move_iterator(self_play.begin()),
                              std::make_move_iterator(self_play.end()));
             if (league_games > 0 && !stop_requested.load()) {
-                auto league_play = collect_league_play(league_games, AGENT_HEURISTIC);
+                std::vector<Sample> league_play;
+                {
+                    ScopedTimer timer(last_phase_timings.league_collection_seconds);
+                    league_play = collect_league_play(league_games, AGENT_HEURISTIC);
+                }
                 std::cout << "  league-heuristic[" << iteration << "]: " << last_league_play.wins
                           << "W " << last_league_play.draws << "D " << last_league_play.losses
                           << "L mean_steps=" << last_league_play.mean_steps << '\n';
@@ -2388,7 +2485,11 @@ struct Trainer::Impl {
             if (stop_requested.load()) break;
             const size_t new_samples = collected.size();
             replay.add(collected);
-            const auto optimization = optimize();
+            OptimizationMetrics optimization;
+            {
+                ScopedTimer timer(last_phase_timings.optimization_seconds);
+                optimization = optimize();
+            }
             ++iteration;
 
             if (stop_requested.load()) {
@@ -2411,12 +2512,18 @@ struct Trainer::Impl {
             bool promoted = false;
             std::string promotion_reason = "not_evaluated";
             if (!stop_requested.load() && iteration % config.evaluation_interval == 0) {
-                random_result = evaluate_baseline(AGENT_RANDOM, config.evaluation_games,
-                                                  config.evaluation_simulations,
-                                                  config.evaluation_seed_base);
-                heuristic_result = evaluate_baseline(AGENT_HEURISTIC, config.evaluation_games,
-                                                     config.evaluation_simulations,
-                                                     config.evaluation_seed_base);
+                {
+                    ScopedTimer timer(last_phase_timings.evaluation_random_seconds);
+                    random_result = evaluate_baseline(AGENT_RANDOM, config.evaluation_games,
+                                                      config.evaluation_simulations,
+                                                      config.evaluation_seed_base);
+                }
+                {
+                    ScopedTimer timer(last_phase_timings.evaluation_heuristic_seconds);
+                    heuristic_result = evaluate_baseline(AGENT_HEURISTIC, config.evaluation_games,
+                                                         config.evaluation_simulations,
+                                                         config.evaluation_seed_base);
+                }
                 random_ptr = &random_result;
                 heuristic_ptr = &heuristic_result;
                 const bool random_gate = random_result.score >= config.random_score_floor;
@@ -2434,9 +2541,12 @@ struct Trainer::Impl {
                     promotion_reason = "heuristic_regression_gate_failed";
                 } else {
                     const auto incumbent = load_model_from_checkpoint(best_path);
-                    incumbent_result = evaluate_incumbent(
-                        incumbent, config.promotion_games,
-                        config.promotion_simulations, config.promotion_seed_base);
+                    {
+                        ScopedTimer timer(last_phase_timings.evaluation_incumbent_seconds);
+                        incumbent_result = evaluate_incumbent(
+                            incumbent, config.promotion_games,
+                            config.promotion_simulations, config.promotion_seed_base);
+                    }
                     incumbent_ptr = &incumbent_result;
                     if (incumbent_result.lower_confidence_bound >
                         0.5 + config.promotion_margin) {
@@ -2453,6 +2563,7 @@ struct Trainer::Impl {
                 }
             }
             if (!stop_requested.load() && iteration % config.mcts_evaluation_interval == 0) {
+                ScopedTimer timer(last_phase_timings.evaluation_mcts_seconds);
                 mcts_result = evaluate_baseline(AGENT_MCTS, config.mcts_evaluation_games,
                                                 config.evaluation_simulations,
                                                 config.mcts_evaluation_seed_base);

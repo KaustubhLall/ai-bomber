@@ -171,4 +171,46 @@ Commit (pending push, this section written pre-commit). Two mechanisms:
   (per the Obsidian project note: "Primary local workstation target: RTX 5080-class
   GPU," singular), noted in case that ever changes.
 
-### Brick 1, Part E — phase and training telemetry (next)
+### Brick 1, Part E — phase and training telemetry
+
+**Explicit scoping decision, made autonomously, documented here for review:** Part E's
+full ask spans phase timings (7 phases) AND per-source W-D-L/cause, explicit WAIT,
+"effective idle," blocked-vs-executed movement, action histograms, bomb/crate/powerup/
+territory stats, and replay sample source/cause composition with buffer-turnover
+tracking. Implementing all of it with the same rigor as Parts A-D would be a
+multi-hour effort on its own and would come directly out of the time budget for
+actually running and monitoring the Brick 2 experiment — which is the explicit,
+separately-stated goal for tonight ("run the experiment and monitor autonomously"),
+not just infrastructure. Splitting Part E:
+
+**Doing now** (cheap relative to value, and phase timings specifically are the
+stated *first* deliverable of Brick 6/KL-102 — "Add phase timings and a
+same-machine/same-config baseline" is its ordered-work item #1, so this isn't just
+Part E scope, it's a direct prerequisite for a brick two bricks from now):
+- Phase timings for all 7 named phases: mirror collection, league collection,
+  optimization, each evaluation opponent (random/heuristic/incumbent/MCTS separately),
+  replay serialization, checkpoint serialization, durable flush.
+- Action histogram (six discrete actions, cheap counter).
+- Per-source W-D-L/cause was already substantially present (mirror and league are
+  already reported as separate `Evaluation`/`SelfPlayMetrics` objects with win-cause
+  breakdowns) — light polish to make sure phase timings sit alongside it consistently
+  in the same metrics row, not a rebuild.
+
+**Deferred, not silently dropped** — each needs real design work, not a rushed
+bolt-on, and rushing risks exactly the kind of half-finished instrumentation that's
+worse than an honest gap:
+- "Effective idle" (WAIT is already tracked; "effective idle" is a materially
+  different, richer concept — e.g. a non-WAIT move that doesn't reduce danger or close
+  distance — that needs its own definition before it can be measured correctly).
+- Executed-vs-blocked movement (needs checking whether the underlying C step API
+  surfaces a collision/blocked signal at all before this can be measured, not
+  assumed).
+- Bomb placements/crates/powerups/territory (needs deeper per-step game-state
+  instrumentation than currently exists anywhere in the native trainer).
+- Replay sample source/cause tagging + cumulative buffer-turnover tracking (needs a
+  structural change to `Sample`/`Replay` to carry per-sample provenance, which is a
+  bigger, riskier change than the rest of this brick and deserves its own focused
+  pass rather than being squeezed in here).
+
+Revisit this list explicitly if/when telemetry gaps actually block a decision -
+don't build it speculatively ahead of that.
