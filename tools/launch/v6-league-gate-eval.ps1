@@ -32,6 +32,18 @@
 # this as a deliberate diagnostic override (semantic-fork-log.jsonl), not a silent
 # substitution. This is intentional: SD-off is the discriminating control that tells
 # real combat skill apart from "survives to the crush window" - see KL-96/KL-108.
+#
+# -LegacyArenaCrushWinValue X: required for any checkpoint saved BEFORE KL-101's
+# semantic-manifest fix (e.g. crush01's iteration_000130.pt, stopped before that commit
+# existed) - such a checkpoint has no manifest to inherit from and fails closed
+# otherwise. Passes --legacy-accept-unverified-semantics plus an explicit
+# --arena-crush-win-value X (X = whatever that checkpoint was actually trained under -
+# check its launcher script, do not guess). Checkpoints created after KL-101 (e.g.
+# control03) don't need this - their manifest is authoritative.
+#
+# -TraceOutput PATH: KL-107 per-step neural decision trace (see trainer.cpp
+# evaluate_baseline). Optional - files get large at N=32 (thousands of rows); pass
+# explicitly only for the runs you intend to actually inspect.
 param(
     [string]$RunDir = "results/alphazero-native-superhuman-v6-league",
     [string]$Checkpoint = "latest.pt",
@@ -39,7 +51,9 @@ param(
     [int]$MctsSims = 256,
     [string]$Output = "",
     [string]$PerMatchOutput = "",
-    [switch]$SuddenDeathOff
+    [string]$TraceOutput = "",
+    [switch]$SuddenDeathOff,
+    [string]$LegacyArenaCrushWinValue = ""
 )
 . "$PSScriptRoot\_env.ps1"
 Use-Torch
@@ -62,5 +76,10 @@ $evalArgs = @(
     "--output", $Output,
     "--per-match-output", $PerMatchOutput
 )
+if ($LegacyArenaCrushWinValue -ne "") {
+    Write-Host "Legacy checkpoint: forcing --arena-crush-win-value $LegacyArenaCrushWinValue explicitly (--legacy-accept-unverified-semantics)."
+    $evalArgs += @("--legacy-accept-unverified-semantics", "--arena-crush-win-value", $LegacyArenaCrushWinValue)
+}
+if ($TraceOutput -ne "") { $evalArgs += @("--trace-output", $TraceOutput) }
 & $NativeExe @evalArgs
 Write-Host "`nRead the 'mcts' win-cause + WAIT% lines above (or $Output; per-match rows in $PerMatchOutput). Compare against the KL-96/KL-108 decision tree before drawing any conclusion."
