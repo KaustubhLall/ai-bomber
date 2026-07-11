@@ -15,8 +15,9 @@
 # checkpoint has actually cleared this gate.
 #
 # Usage:
-#   .\tools\launch\v6-league-gate-eval.ps1                    # checkpoint=latest.pt, N=32
+#   .\tools\launch\v6-league-gate-eval.ps1                    # v6-league, checkpoint=latest.pt, N=32
 #   .\tools\launch\v6-league-gate-eval.ps1 -Checkpoint iteration_000100.pt
+#   .\tools\launch\v6-league-gate-eval.ps1 -RunDir results/alphazero-native-superhuman-v6-league-crush01
 #   .\tools\launch\v6-league-gate-eval.ps1 -MctsGames 64      # tighter Wilson LCB
 #
 # -Checkpoint is resolved by the native trainer relative to --run-dir (same
@@ -25,18 +26,20 @@
 # prefix doubles it and fails with "checkpoint not found". This script
 # strips any leading path so either form works.
 param(
+    [string]$RunDir = "results/alphazero-native-superhuman-v6-league",
     [string]$Checkpoint = "latest.pt",
     [int]$MctsGames = 32,
     [int]$MctsSims = 256,
-    [string]$Output = "results/alphazero-native-superhuman-v6-league/gate-eval.json"
+    [string]$Output = ""
 )
 . "$PSScriptRoot\_env.ps1"
 Use-Torch
 $Checkpoint = Split-Path -Leaf $Checkpoint
+if ($Output -eq "") { $Output = Join-Path $RunDir "gate-eval.json" }
 
-Write-Host "Gate eval: $Checkpoint vs MCTS-$MctsSims, N=$MctsGames games, noise OFF, greedy action selection."
+Write-Host "Gate eval: $RunDir/$Checkpoint vs MCTS-$MctsSims, N=$MctsGames games, noise OFF, greedy action selection."
 $evalArgs = @(
-    "evaluate", "--run-dir", "results/alphazero-native-superhuman-v6-league", "--checkpoint", $Checkpoint,
+    "evaluate", "--run-dir", $RunDir, "--checkpoint", $Checkpoint,
     "--channels", "128", "--blocks", "10",
     "--width", "13", "--height", "11", "--max-steps", "200", "--crate-density", "50",
     "--flame-duration", "2", "--sudden-death-start", "120", "--shrink-interval", "4",
