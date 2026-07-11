@@ -24,36 +24,39 @@ is fixed and regression-guarded; two OS-level locks now make the exact GPU-conte
 crash from earlier this session structurally impossible; an explicit `--fork-from`
 mechanism with full provenance replaces ad-hoc checkpoint copying.
 
-**Found (the actual research result):** ran the full matched-control causal
-comparison KL-108 exists for. **Lever 1 (reward reshaping, `arena-crush-win-value`
-0.3→0.1) failed** — a checkpoint trained with the lever and a matched checkpoint
-trained without it are statistically indistinguishable on real combat skill (both
-land a bomb-kill in exactly 3.1% of games against held-out MCTS-256; a
-sudden-death-off control shows both collapse to 87-97% draws with the crush mechanic
-removed). The apparent score improvement crush01 showed earlier was a crush-mechanic
-artifact, not new combat skill — exactly the failure mode this whole harness exists
-to catch, and it caught it on the *new* lever this time, not just the old v5 claim.
-**New root-cause evidence:** first real use of the KL-107 neural-trace capture shows
-the network's own raw policy (before any search) already agrees with the final
-chosen action 74-93% of the time — passivity is coming from the trained policy
-itself, not from search overriding an aggressive one. This points at self-play data
-diversity / curriculum (KL-105) as a more promising lever than further reward or
-timing tweaks.
+**Found (the actual research result — session concluded, both attempted levers
+failed):** ran the full matched-control causal comparison KL-108 exists for, twice.
 
-**Running:** lever 2 (`sudden-death-start` 120→160), launched with explicitly
-calibrated low confidence given the finding above — it doesn't touch the policy
-training signal either, so it's plausibly going to fail the same way. Running it
-anyway since it's cheap, next in the predeclared order, and a wrong prediction
-logged honestly is better than a skipped step. Check `tasklist` /
-`results/alphazero-native-superhuman-lever2-sdstart160/metrics.jsonl` for where it
-landed.
+**Lever 1** (reward reshaping, `arena-crush-win-value` 0.3→0.1) **failed** — a
+checkpoint trained with the lever and a matched checkpoint trained without it are
+statistically indistinguishable on real combat skill (both land a bomb-kill in
+exactly 3.1% of games against held-out MCTS-256). The apparent score improvement
+crush01 showed earlier was a crush-mechanic artifact, not new combat skill — exactly
+the failure mode this whole harness exists to catch, caught again on a *new* lever,
+not just the old v5 claim.
 
-**Recommended next, if lever 2 also fails (or if you'd rather skip straight there):**
-lever 3 — add a *weak* MCTS or a frozen-self checkpoint to the self-play league
-(currently heuristic-only) — needs a small new CLI flag (league opponent type),
-deliberately not implemented tonight to avoid rushing new C++ under time pressure
-late in the session. Or skip the remaining reserve levers and go straight to KL-105's
-curriculum/self-play-diversity work, which the trace evidence now points at directly.
+**Lever 2** (`sudden-death-start` 120→160, forked from the matched control) **also
+failed** — score collapsed (0.8→0.4) as losses roughly tripled (12→32), WAIT got
+worse (65.7%→67.9%), though bomb-kill did roughly double (3.1%→6.25%, the first
+movement in that metric all session — real but weak evidence at N=64, and outweighed
+by the score/loss damage).
+
+**The decisive cross-cutting finding:** with sudden-death removed (the discriminating
+control), **all three checkpoints tested — crush01, the unmodified control, and
+lever2 — collapse to 87-97% draws against MCTS, regardless of which lever was
+applied.** None of the reward-shaping or timing levers touch the actual bottleneck.
+
+**Root cause (new evidence, first real use of KL-107 tracing):** the network's own
+raw policy (before any search) already agrees with the final chosen action 74-93% of
+the time — passivity is coming from the trained policy itself, not from search
+overriding an aggressive one. **This points at self-play data diversity / curriculum
+(KL-105) as the actual next step, not further reward or timing tweaks.**
+
+**Recommended next:** either (a) implement lever 3 (weak MCTS or frozen-self in the
+league, currently heuristic-only) — needs a small new CLI flag, deliberately not
+rushed this session — or (b) skip straight to KL-105's curriculum/self-play-diversity
+work, which the trace evidence now points at directly and is the more promising path
+given two cheaper levers have already failed for the same underlying reason.
 
 **Not done:** Bricks 5 (duel-v2 fidelity/ABI bump) and 6 (throughput) not started.
 Brick 3 (traces) has its capture mechanism verified but no viewer UI. Brick 7 (docs)
@@ -639,3 +642,67 @@ following the exact same 4-eval-config + paired-comparison pattern as lever 1) o
 redirect based on what's found. All work is committed and pushed;
 `git log --oneline` on this branch is the complete, ordered record of tonight
 if this file's narrative form isn't wanted.
+
+## Session conclusion — lever 2 result and final wrap-up
+
+`lever2-sdstart160` reached iteration 160 cleanly (trainer's loop exited naturally
+at its target, exit code 0, watchdog did not restart — the same clean pattern as
+control03, no risky stop needed).
+
+### lever2-160, SD-on, N=32 (64 games)
+
+vs MCTS-256: **21W-11D-32L, score=0.4**, WAIT=67.9%. Win-cause: bomb-kill=4 (19.0% of
+wins), arena-crush=17 (81.0%). Loss-cause: bomb-kill=1, self-kill=2, arena-crush=29
+(90.6% of losses). Draws: mutual-death=11.
+
+Compare to control03-130 (its own starting point): score dropped sharply (0.8→0.4),
+losses roughly tripled (12→32) - plausible mechanism: more time before the arena
+closes gives the stronger MCTS opponent more opportunity to actively hunt and kill,
+without the learner improving proportionally on offense or defense. Bomb-kill did
+roughly double (3.1%→6.25%) - the first real movement in that specific metric all
+session, but N=64 makes 2-vs-4 successes weak evidence on its own, and it's more
+than offset by the score/loss damage.
+
+### lever2-160, SD-off, N=32 (64 games)
+
+vs MCTS-256: **2W-58D-4L, score=0.5, 90.6% timeout draws.** Essentially identical to
+crush01's 96.9% and control03's 87.5% - all three checkpoints collapse to
+near-total draws once the crush mechanic is removed, regardless of which lever was
+applied to get there.
+
+### Verdict: lever 2 FAILED, all three predeclared thresholds triggered again
+
+bomb-kill 6.25% (<10% floor), WAIT 67.9% (>60% ceiling, worse than its own starting
+point), crush-win share dominant on both wins and losses. Retained as an honest
+negative result, matching lever 1's outcome.
+
+**KL-98 and KL-108 updated in Linear with the full final picture and this session's
+recommendation.** Not attempting lever 3 or 4 this session - lever 3 needs new C++
+(a league opponent-type CLI flag) that deserves unhurried implementation, and this
+session is now well past its nominal ~10-hour budget (started ~01:15-02:00 AM PDT,
+concluding ~23:20 UTC / ~4:20 PM PDT - roughly 14-15 hours elapsed, not 10; the
+30-iteration lever-2 training run plus its evaluation matrix took longer in
+wall-clock than originally estimated, and this was allowed to run to a clean
+conclusion rather than cut off mid-experiment).
+
+### What actually got accomplished tonight, in one paragraph
+
+Fixed five real, previously-undiscovered correctness bugs in the training/evaluation
+harness (semantic manifest inheritance, LR schedule horizon pinning, a fake-promotion
+bug, missing process locking, missing durable logging), all with real regression
+tests (35/35 native CTest at every commit). Built the causal-comparison
+infrastructure KL-108 asked for (per-match export, SD-off control, paired analysis)
+and the neural-trace capture KL-107 asked for, both verified against real
+checkpoints, not just unit-tested. Used that infrastructure to run two complete,
+honestly-reported, matched-control experiments - both came back negative, which is
+itself the valuable result: two plausible, cheap fixes are now *ruled out* rather
+than left as unresolved hopeful assumptions, and a specific, evidenced diagnosis
+(policy/data, not search or reward/timing) now points at what to try next. Nothing
+was overstated; both negative results are reported as plainly as the two prior
+positive-looking-but-actually-hollow claims (v5, and crush01's initial 0.4→0.6 read)
+were retracted earlier in this same investigation. That consistency - catching a
+hollow win on a brand new lever just as readily as on the original claim - is the
+actual proof the harness fix from earlier tonight works.
+
+All work committed and pushed to `polish/viz-and-policy-clarity`. Working tree clean.
+This is the end of this session's autonomous work.
