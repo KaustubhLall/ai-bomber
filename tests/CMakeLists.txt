@@ -263,4 +263,20 @@ if(TARGET bomber_alphazero_native)
     set_tests_properties(test_native_alphazero_fork_check PROPERTIES
       DEPENDS test_native_alphazero_fork_child TIMEOUT 20)
   endif()
+
+  # KL-101 Part D regression: a second `train` process must be refused while a first is still
+  # running, even on a different run-dir - the actual failure mode that crashed training twice
+  # earlier in this project's history. Self-contained (manages its own background process),
+  # not part of the chained smoke/resume/gate/fork pattern above.
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME test_native_alphazero_lock_check
+      COMMAND ${CMAKE_COMMAND} -E env
+        "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+        ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_alphazero_lock_check.py
+        $<TARGET_FILE:bomber_alphazero_native>
+        ${CMAKE_BINARY_DIR}/native-alphazero-lock-a
+        ${CMAKE_BINARY_DIR}/native-alphazero-lock-b)
+    set_tests_properties(test_native_alphazero_lock_check PROPERTIES TIMEOUT 60)
+  endif()
 endif()

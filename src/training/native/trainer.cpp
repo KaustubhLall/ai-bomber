@@ -43,6 +43,7 @@ extern "C" {
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <sys/file.h>
 #include <unistd.h>
 #endif
 
@@ -145,6 +146,61 @@ std::string sha256_file(const std::filesystem::path& path) {
     for (const uint32_t word : h) hex << std::setw(8) << word;
     return hex.str();
 }
+
+/* KL-101 Part D: durable stdout capture. Redirects std::cout's underlying streambuf to write
+   to both the real console AND an append-only log file, for the process's lifetime (RAII,
+   scoped to run()). One centralized change here captures every existing std::cout print
+   statement throughout this file (progress bars, promotion-gate lines, semantic forks,
+   behavior reports...) without touching each call site individually - and any future one
+   added later, without needing to remember to also log it. This is what an unattended
+   watchdog-wrapped overnight run needs to be inspectable after the fact: the live console
+   window is not the only place iteration-by-iteration output exists. */
+class TeeStreambuf : public std::streambuf {
+public:
+    TeeStreambuf(std::streambuf* console, std::ostream& file) : console_(console), file_(file) {}
+
+protected:
+    int overflow(int character) override {
+        if (character != EOF) {
+            console_->sputc(static_cast<char>(character));
+            file_.put(static_cast<char>(character));
+        }
+        return character;
+    }
+    std::streamsize xsputn(const char* data, std::streamsize count) override {
+        console_->sputn(data, count);
+        file_.write(data, count);
+        file_.flush();
+        return count;
+    }
+
+private:
+    std::streambuf* console_;
+    std::ostream& file_;
+};
+
+class ConsoleTee {
+public:
+    explicit ConsoleTee(const std::filesystem::path& log_path)
+        : log_(log_path, std::ios::app), buf_(std::cout.rdbuf(), log_),
+          original_(std::cout.rdbuf(&buf_)) {
+        log_ << "\n--- console tee started, pid=" <<
+#ifdef _WIN32
+            GetCurrentProcessId()
+#else
+            ::getpid()
+#endif
+            << " ---\n";
+    }
+    ~ConsoleTee() { std::cout.rdbuf(original_); }
+    ConsoleTee(const ConsoleTee&) = delete;
+    ConsoleTee& operator=(const ConsoleTee&) = delete;
+
+private:
+    std::ofstream log_;
+    TeeStreambuf buf_;
+    std::streambuf* original_;
+};
 
 std::string format_duration(double seconds) {
     if (!std::isfinite(seconds) || seconds < 0.0) return "--:--:--";
@@ -800,6 +856,66 @@ std::filesystem::path current_executable_path() {
 #endif
 }
 
+/* KL-101 Part D: OS-level exclusive lock, held for the process's lifetime, auto-released on
+   any exit (normal, crash, or kill) because it's a raw OS handle, not an advisory file the
+   process has to remember to delete. Opened with zero share mode - a second process trying to
+   open the same path fails immediately with a clear "already running" error instead of the
+   two processes silently contending for the GPU, which crashed training twice earlier in this
+   session (once was two full training loops on different run-dirs, so this is deliberately
+   TWO locks in practice - see acquire_trainer_locks() below - not just one scoped to run_dir). */
+class ProcessLock {
+public:
+    explicit ProcessLock(const std::filesystem::path& lock_path) : path_(lock_path) {
+#ifdef _WIN32
+        handle_ = CreateFileW(lock_path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                              0 /* no sharing - exclusive */, nullptr, OPEN_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle_ == INVALID_HANDLE_VALUE) {
+            const DWORD error = GetLastError();
+            throw std::runtime_error(
+                "cannot acquire exclusive lock " + lock_path.string() +
+                " (Windows error " + std::to_string(error) + ", commonly "
+                "ERROR_SHARING_VIOLATION=32 - another bomber_alphazero_native.exe train "
+                "process is already running; two training processes contending for the "
+                "same GPU crashed both of them, twice, earlier in this project's history)");
+        }
+        const std::string pid_line = "pid=" + std::to_string(GetCurrentProcessId()) + "\n";
+        DWORD written = 0;
+        WriteFile(handle_, pid_line.data(), static_cast<DWORD>(pid_line.size()),
+                  &written, nullptr);
+        FlushFileBuffers(handle_);
+#else
+        descriptor_ = ::open(lock_path.c_str(), O_CREAT | O_RDWR, 0644);
+        if (descriptor_ < 0 || ::flock(descriptor_, LOCK_EX | LOCK_NB) != 0) {
+            if (descriptor_ >= 0) ::close(descriptor_);
+            descriptor_ = -1;
+            throw std::runtime_error(
+                "cannot acquire exclusive lock " + lock_path.string() +
+                " - another bomber_alphazero_native.exe train process is already running");
+        }
+        const std::string pid_line = "pid=" + std::to_string(::getpid()) + "\n";
+        (void)::write(descriptor_, pid_line.data(), pid_line.size());
+#endif
+    }
+    ~ProcessLock() {
+#ifdef _WIN32
+        if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_);
+#else
+        if (descriptor_ >= 0) { ::flock(descriptor_, LOCK_UN); ::close(descriptor_); }
+#endif
+    }
+    ProcessLock(const ProcessLock&) = delete;
+    ProcessLock& operator=(const ProcessLock&) = delete;
+
+private:
+    std::filesystem::path path_;
+#ifdef _WIN32
+    HANDLE handle_{INVALID_HANDLE_VALUE};
+#else
+    int descriptor_{-1};
+#endif
+};
+
 torch::Tensor string_tensor(const std::string& value) {
     return torch::from_blob(const_cast<char*>(value.data()),
                             {static_cast<int64_t>(value.size())}, torch::kUInt8).clone();
@@ -1103,6 +1219,21 @@ struct Trainer::Impl {
         best_path = config.run_dir / "best.pt";
         requested_checkpoint_path = config.run_dir / config.checkpoint;
         metrics_path = config.run_dir / "metrics.jsonl";
+        /* KL-101 Part D: exclusive locks, TRAIN mode only - evaluate is documented and
+           repeatedly confirmed safe to run alongside a live trainer (read-only against an
+           atomically-written checkpoint), so it does not compete for either lock. Two locks
+           because the actual incidents that crashed training twice were NOT both the same
+           run-dir contending with itself - once was two DIFFERENT run-dirs' train processes
+           sharing one GPU. run_dir_lock catches "this exact run is already being trained
+           somewhere"; system_lock catches "some OTHER bomber_alphazero_native.exe train
+           process anywhere is already using the GPU," which is the failure mode that
+           actually happened. Acquired before any file writes so a lock failure leaves
+           nothing behind to clean up. */
+        if (!config.evaluation_only) {
+            system_lock = std::make_unique<ProcessLock>(
+                std::filesystem::temp_directory_path() / "bomber-alphazero-native-trainer.lock");
+            run_dir_lock = std::make_unique<ProcessLock>(config.run_dir / ".trainer.lock");
+        }
         model->to(device);
         if (config.fresh) {
             for (const auto& entry : std::filesystem::directory_iterator(config.run_dir)) {
@@ -1243,6 +1374,11 @@ struct Trainer::Impl {
     std::filesystem::path metrics_path;
     SelfPlayMetrics last_self_play;
     Evaluation last_league_play;
+    /* KL-101 Part D: held for this object's entire lifetime, released automatically (even on
+       an exception or crash) when Impl is destroyed - see acquisition site in the constructor
+       for why there are two. Null in evaluate mode. */
+    std::unique_ptr<ProcessLock> system_lock;
+    std::unique_ptr<ProcessLock> run_dir_lock;
 
     /* KL-101 Part C: immutable fork provenance, written once at fork time (--fresh
        --fork-from PATH). Deliberately a SEPARATE file from config.json/config-history.jsonl
@@ -2201,6 +2337,7 @@ struct Trainer::Impl {
     }
 
     void run() {
+        ConsoleTee console_tee(config.run_dir / "train-console.log");
         stop_requested.store(false);
         const auto previous = std::signal(SIGINT, signal_handler);
         PhaseProgress iterations("iterations", std::max(config.iterations - iteration, 1),

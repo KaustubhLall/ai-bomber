@@ -6,6 +6,13 @@
 # stopped normally). Checkpoints save after every completed iteration, so a kill loses at most
 # the single in-flight iteration.
 #
+# KL-101 Part D: every launch/restart/crash/give-up event is now also appended durably to
+# <run-dir>/watchdog-attempts.jsonl, not just printed to the live console window - an
+# unattended overnight run needs this inspectable after the fact even if the window was closed,
+# scrolled past, or the whole machine was left unattended. The trainer itself now also tees its
+# own stdout to <run-dir>/train-console.log (see ConsoleTee in trainer.cpp), so the two logs
+# together cover both "did the process keep dying" and "what did it print before each death."
+#
 # Usage: pass the FULL trainer argument list (everything you'd normally give
 # tools/run_native_alphazero.ps1, including --run-dir/--iterations) as one explicit array to
 # -TrainerArgs. A single array parameter sidesteps PowerShell's ambiguous parsing of
@@ -23,21 +30,43 @@ param(
 . "$PSScriptRoot\_env.ps1"
 Use-Torch
 
+$runDirIndex = [array]::IndexOf($TrainerArgs, "--run-dir")
+$runDir = if ($runDirIndex -ge 0 -and $runDirIndex + 1 -lt $TrainerArgs.Count) {
+    $TrainerArgs[$runDirIndex + 1]
+} else {
+    "."
+}
+if (-not (Test-Path $runDir)) { New-Item -ItemType Directory -Path $runDir -Force | Out-Null }
+$attemptLog = Join-Path $runDir "watchdog-attempts.jsonl"
+
+function Write-AttemptLog {
+    param([hashtable]$Record)
+    ($Record | ConvertTo-Json -Compress) | Out-File -FilePath $attemptLog -Append -Encoding utf8
+}
+
 $restarts = 0
 while ($true) {
     Write-Host "[watchdog] Launching trainer (attempt $($restarts + 1))..."
+    Write-AttemptLog @{ event = "launch"; attempt = ($restarts + 1)
+        timestamp_utc = (Get-Date -Format "o"); watchdog_pid = $PID }
     & $NativeExe train @TrainerArgs
     $code = $LASTEXITCODE
 
     if ($code -eq 0) {
         Write-Host "[watchdog] Trainer exited cleanly (code 0) - reached target or stopped normally. Done."
+        Write-AttemptLog @{ event = "exit_clean"; attempt = ($restarts + 1)
+            timestamp_utc = (Get-Date -Format "o") }
         break
     }
 
     $restarts++
     Write-Host "[watchdog] Trainer exited with code $code (crash/kill #$restarts of $MaxRestarts). Checkpoint is safe - resuming, not fresh."
+    Write-AttemptLog @{ event = "crash"; attempt = $restarts; exit_code = $code
+        timestamp_utc = (Get-Date -Format "o") }
     if ($restarts -ge $MaxRestarts) {
         Write-Host "[watchdog] Max restarts ($MaxRestarts) reached - giving up. Investigate manually before relaunching."
+        Write-AttemptLog @{ event = "giving_up"; max_restarts = $MaxRestarts
+            timestamp_utc = (Get-Date -Format "o") }
         exit 1
     }
     Write-Host "[watchdog] Restarting in ${RestartDelaySeconds}s..."

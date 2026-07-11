@@ -75,7 +75,7 @@ Commit `7f69250`. Full detail in KL-101's "Progress 2026-07-11" section. Summary
   (below) still applies to it going forward since it's a pure code fix, not a
   run-dir-specific patch.
 
-### Brick 1, Part C — fork/checkpoint provenance (in progress as this file is created)
+### Brick 1, Part C — fork/checkpoint provenance
 
 Root cause of the "iter-110 fake initial promotion" bug found by reading the actual
 promotion-gate code (`trainer.cpp` ~line 2091): `const bool has_incumbent =
@@ -87,7 +87,88 @@ correctly showing 20+ prior promotions worth of real lineage — a genuine logic
 inconsistency between the numeric state (real champion exists) and the file-existence
 check (no incumbent found), and the promotion gate believed the file check.
 
-*(This section is being filled in live; see the rest of this file / KL-101 for the
-completed fix, or if you're reading this before it's been updated further, the fix
-was still in progress at last-save time — check `git log` on
-`src/training/native/trainer.cpp` for the actual landed state.)*
+**Fix landed, commit `59dfe88`.** Whenever a run inherits a real `best_iteration`
+(≥0) but `best.pt` doesn't exist locally, the trainer now materializes it from the
+just-loaded state immediately, before any evaluation-interval iteration runs — closing
+the gap between the numeric lineage state and the file-existence check the promotion
+gate actually reads.
+
+Also built the explicit `--fork-from PATH` mechanism Part C asked for (train
+`--fresh` only): seeds weights/optimizer/replay/RNG/semantics/champion-lineage from an
+external checkpoint via the same `load_checkpoint()` path an ordinary resume uses (same
+ABI hard-fail, same semantic inheritance, same legacy-checkpoint handling — forking
+isn't a separate, less-verified path). Writes `fork-manifest.json`: parent checkpoint
+path+SHA-256, own executable path+SHA-256, compile-time git commit, an optional
+`--dirty-diff-digest` string for the calling script to supply, source/target run dirs,
+seed, inherited lineage, resolved semantics.
+
+- **SHA-256 note:** nothing existed in this codebase; hand-implemented rather than
+  shelling out to `certutil`/`sha256sum` from inside the trainer (fragile,
+  platform-specific). **Verified bit-correct against two independent references**
+  before being trusted for provenance — PowerShell `Get-FileHash` and Python's
+  `hashlib.sha256`, both matching exactly on the same real file.
+- Verified: new CTest chain (`test_native_alphazero_fork_*`) proves inheritance,
+  hash-matches the manifest against an independently computed SHA-256, and — the
+  actual regression guard — asserts `"promoted_initial_quality_gate"` never appears
+  again in a forked child's promotion history. Full native CTest 34/34.
+- **Assumption made, not asked:** did not retroactively generate a `fork-manifest.json`
+  for crush01 itself (it predates this mechanism and was forked via ad-hoc copy, not
+  `--fork-from`). Its provenance stays informal/historical; only the has_incumbent
+  *code fix* applies to it retroactively (a behavior fix, not a record backfill).
+- **Not done in Part C:** RNG/seed provenance is captured (seed value, and RNG state is
+  already byte-for-byte inherited via the normal checkpoint mechanism) but not
+  independently *verified* beyond what the existing checkpoint round-trip already
+  guarantees — judged sufficient for now; flagging in case a future session wants a
+  stronger seed-provenance proof.
+
+### Brick 1, Part D — process/logging safety
+
+Commit (pending push, this section written pre-commit). Two mechanisms:
+
+1. **OS-level exclusive locks** (`ProcessLock`, Windows `CreateFileW` with zero share
+   mode / POSIX `flock`) — held for the trainer's entire lifetime, auto-released on any
+   exit including a crash (it's a raw OS handle, not an advisory file to remember to
+   delete). **Deliberately two locks, not one:** a per-run-dir lock catches "this exact
+   run is already being trained somewhere," but the *actual* incident that crashed
+   training twice earlier in this session was two DIFFERENT run-dirs' train processes
+   sharing one GPU — a per-run-dir lock alone would not have caught that. A second,
+   system-wide lock (`%TEMP%\bomber-alphazero-native-trainer.lock`) catches it. Both
+   are TRAIN-mode only; evaluate is documented and re-confirmed here to coexist safely
+   (see verification below), so it doesn't compete for either lock.
+2. **Durable console capture** (`ConsoleTee`) — redirects `std::cout`'s streambuf to
+   write to both the real console and `<run-dir>/train-console.log` for the duration of
+   `run()`. One centralized change captures every existing print statement (progress
+   bars, promotion gates, semantic forks, behavior reports) without touching each call
+   site, and any future one added later. `watchdog-train.ps1` now also durably logs
+   every launch/crash/restart/give-up event to `<run-dir>/watchdog-attempts.jsonl` with
+   timestamps, not just to the live (possibly-closed, possibly-scrolled-past) console
+   window.
+
+**Verified, not just built:**
+- Manually reproduced the exact real incident as a test: launched a genuinely
+  long-running trainer in the background, confirmed via `tasklist` it was still alive
+  and only 3/200 iterations in, then attempted a second `train` on a *different*
+  run-dir — correctly refused with a clear "another bomber_alphazero_native.exe train
+  process is already running" error, exit code 1.
+- Same live trainer, confirmed `evaluate` against its own in-progress checkpoint
+  succeeds normally while it's still training — the documented safe pattern still
+  holds after adding the lock.
+- `train-console.log` confirmed populated with real iteration-by-iteration output
+  during that same run.
+- Automated as a permanent regression (`test_native_alphazero_lock_check.py`) — a
+  self-contained script (concurrency doesn't fit the existing chained-CTest pattern) that
+  manages its own background process, asserts the second launch fails with the specific
+  lock-error text, cleans up. Full native CTest **35/35** pass; dependency-free **22/22**.
+- **Assumption made, not asked:** did not add locking to `evaluate` mode at all (not a
+  "weaker" lock, literally none) — this is a deliberate reading of "prevent a trainer
+  and evaluation from contending for... the same run artifacts" as "don't let two
+  WRITERS collide," not "serialize all access." Evaluate only reads an already
+  atomically-written checkpoint; two concurrent evaluates, or one train + N evaluates,
+  don't corrupt anything. Flagging the interpretation in case that's not what was meant.
+- **Not done:** the system-wide lock is scoped to "this GPU" only informally (one
+  well-known temp-dir path, correct for the actual single-GPU workstation this runs on)
+  — it would not distinguish two GPUs on a multi-GPU machine. Not a real constraint here
+  (per the Obsidian project note: "Primary local workstation target: RTX 5080-class
+  GPU," singular), noted in case that ever changes.
+
+### Brick 1, Part E — phase and training telemetry (next)
