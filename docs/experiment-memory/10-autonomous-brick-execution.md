@@ -773,3 +773,74 @@ passing. Committed and pushed (`54a2a42`). Linear KL-107 updated with the same
 detail. KL-105 curriculum work remains the next decision point, not yet started -
 this increment was diagnostic-only, deliberately scoped smaller than a full
 curriculum change per the advisor consultation that preceded it.
+
+## Systematic WAIT-diagnostic pass, 2026-07-11 (same session, user chose this over KL-105 design)
+
+Given a three-way choice after KL-107 v3 (systematic pass / design a KL-105
+experiment / stop), the user picked the systematic pass. Read-only evaluation
+against three already-trained checkpoints, no training launch - consistent with
+what had and hadn't been authorized up to this point.
+
+Ran `evaluate --eval-mcts --trace-output` against crush01-iteration130 (SD120,
+legacy checkpoint, `--legacy-accept-unverified-semantics --arena-crush-win-value
+0.1`), control03-iteration130 (SD120, loads cleanly - postdates KL-101), and
+lever2-iteration160 (evaluated in its own native SD160 environment rather than
+forced into SD120, since this pass makes absolute claims about each checkpoint,
+not causal comparisons between them) - 32 MCTS-256 matches each, same diagnostic
+seed block (1300001, not the burned A3/B3 holdout blocks).
+
+**Lever2's run took dramatically longer than the other two** (crush01/control03
+each ~15-20 minutes for the MCTS phase; lever2 took roughly 2+ hours). Verified
+repeatedly via CPU-time-delta (the established technique from earlier in this
+session) that it was genuinely computing throughout, not hung - and the eventual
+trace file confirmed why: lever2's games in its native SD160 environment ran close
+to the 200-step cap almost every match (5349 steps / 32 matches ≈ 167 steps/match,
+vs crush01's 4104/32 ≈ 128), consistent with the longer pre-sudden-death window
+giving both agents more time to stall before a decisive or forced outcome. This is
+itself a small additional data point about lever2's behavior, not just a runtime
+inconvenience.
+
+**Result** (`tools/analyze_wait_diagnostic.py`, new - forced-vs-chosen WAIT split
+with a Wilson lower confidence bound per checkpoint, plus raw-vs-masked top-action
+agreement):
+
+| checkpoint | steps | WAIT% | forced (LCB) | chosen (LCB) | raw==masked top |
+| --- | --- | --- | --- | --- | --- |
+| crush01-iter130, SD120 | 4104 | 62.0% | 0.8% (0.6%) | 61.2% (59.7%) | 99.7% |
+| control03-iter130, SD120 | 4004 | 62.5% | 0.6% (0.4%) | 61.9% (60.4%) | 99.6% |
+| lever2-iter160, SD160 | 5349 | 64.2% | 0.6% (0.5%) | 63.6% (62.3%) | 99.7% |
+
+This is the cleanest finding of the whole session. Forced idling (WAIT was the
+position's only safe action) is negligible everywhere - the environment is not
+producing the WAIT rate. Chosen idling (WAIT picked with real alternatives
+available) is 61-64% of *all* traced steps with a Wilson floor safely above 59%
+in every checkpoint, regardless of reward lever, LR-schedule validity, or
+sudden-death timing. And the safety mask leaves the raw policy's own top-ranked
+action unchanged 99.6-99.7% of the time, meaning the earlier "search agrees with
+the masked prior" observation extends one level deeper: the masked prior agrees
+with the raw policy head's own top choice almost always too. Raw policy, mask,
+search, and final action all converge on the same passive preference - this
+answers the question the last correction had explicitly left open ("does not yet
+isolate the raw policy head from the mask") in the raw policy head's favor: it's
+the head, not the mask, not search, not the environment.
+
+The three checkpoints differ in reward lever, LR-schedule validity, and
+sudden-death timing but share the same v6-league lineage and self-play data
+history - the fact that the passivity signature is essentially identical across
+all three despite those differences points at the shared training data/curriculum
+as the actual source, not at any lever tried this session. Directly informs
+KL-105 (updated in Linear): a curriculum change needs to alter what the policy
+head has actually seen reinforced, not just retune reward magnitude or
+environment timing around an unchanged data distribution.
+
+**Caveat, stated plainly:** steps within one game are autocorrelated, not
+independent trials, and the checkpoints share seeds but diverge into different
+trajectories once play differs - the Wilson LCB is a floor against sampling noise
+within each file, not a formal independent-trials confidence interval. Still
+meaningfully stronger than the original single-checkpoint, 8-match spot check,
+and the direction is unambiguous across three independently-trained checkpoints.
+
+Committed and pushed (`55aae15` and the Linear updates to KL-107/KL-105). Per the
+standing constraint from three turns back, no KL-105 code or training launch was
+started - this remains diagnostic-only, the next decision (what specific bounded
+curriculum intervention to try) is the user's to make.
