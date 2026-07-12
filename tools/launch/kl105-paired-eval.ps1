@@ -44,10 +44,19 @@ $commonEval = @(
     "--no-progress"
 )
 
-function Invoke-Step($label, $args) {
+# Parameter deliberately NOT named $args: that is PowerShell's AUTOMATIC unbound-arguments
+# variable inside every function, and naming a parameter after it makes `@args` splat the
+# (empty) automatic array instead - the exe then runs with NO arguments, prints help, and
+# exits 0, which sails straight through the exit-code check. Exactly this happened on this
+# script's first run; the per-step output-file existence check below is the belt-and-braces
+# guard against any future silently-successful no-op of the same shape.
+function Invoke-Step($label, $exeArgs, $expectedOutput) {
     Write-Host "=== [$([DateTime]::Now.ToString('HH:mm:ss'))] $label ==="
-    & $NativeExe @args
+    & $NativeExe @exeArgs
     if ($LASTEXITCODE -ne 0) { throw "$label FAILED with exit code $LASTEXITCODE" }
+    if ($expectedOutput -and -not (Test-Path $expectedOutput)) {
+        throw "$label exited 0 but produced no $expectedOutput - the invocation was a no-op"
+    }
 }
 
 Invoke-Step "$tag gates (96 sims)" @(
@@ -56,20 +65,20 @@ Invoke-Step "$tag gates (96 sims)" @(
     "--max-steps", "200", "--crate-density", "50", "--flame-duration", "2",
     "--sudden-death-start", "120", "--shrink-interval", "4",
     "--eval-simulations", "96", "--no-progress",
-    "--output", "$OutDir/$tag-gates.json")
+    "--output", "$OutDir/$tag-gates.json") "$OutDir/$tag-gates.json"
 
 Invoke-Step "$tag SD-on diagnostic (trace + per-match)" (
     @("evaluate") + $commonEval + @(
     "--sudden-death-start", "120",
     "--trace-output", "$OutDir/$tag-SDon-trace.jsonl",
     "--per-match-output", "$OutDir/$tag-SDon-permatch.jsonl",
-    "--output", "$OutDir/$tag-SDon-agg.json"))
+    "--output", "$OutDir/$tag-SDon-agg.json")) "$OutDir/$tag-SDon-agg.json"
 
 Invoke-Step "$tag SD-off control" (
     @("evaluate") + $commonEval + @(
     "--sudden-death-start", "0",
     "--trace-output", "$OutDir/$tag-SDoff-trace.jsonl",
     "--per-match-output", "$OutDir/$tag-SDoff-permatch.jsonl",
-    "--output", "$OutDir/$tag-SDoff-agg.json"))
+    "--output", "$OutDir/$tag-SDoff-agg.json")) "$OutDir/$tag-SDoff-agg.json"
 
 Write-Host "=== $tag paired-eval battery complete -> $OutDir ==="
