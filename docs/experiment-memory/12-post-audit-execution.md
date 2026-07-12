@@ -194,3 +194,121 @@ file's own standing constraint requires. Next: Phase 1 (KL-107 to diagnostic-com
 fields, clean-binary re-run, representative writeups, overhead benchmark) — advisor checkpoint 2
 applies if any test-assertion/threshold change is needed along the way; checkpoint 3 (hard stop
 if advisor is down) applies before Phase 2's design work begins.
+
+## Session handoff, 2026-07-11 22:xx — a second execution session picked up this plan
+
+This file was written by one session executing Phase 0 (advisor unavailable, self-review
+fallback per the plan's own clause). A **separate** session, on the same branch/HEAD
+(`e399a5b`, clean tree), was independently told to execute the same plan file
+(`C:\Users\kaust\.claude\plans\can-you-audit-the-jolly-sutherland.md`) starting from Phase 1.
+Advisor checkpoint 1 (session start) was attempted again in this second session and errored
+again, matching the first session's experience exactly - proceeded per the plan's documented-
+self-review fallback (permitted for checkpoint 1). Self-review: read this file in full, verified
+`git log`/`ctest -N`/Linear KL-107 all showed Phase 0 genuinely complete and matching the plan's
+own accept criteria before starting Phase 1, rather than assuming it from the plan text alone.
+
+No native GPU process was running at handoff (`Get-Process bomber_alphazero_native` empty); the
+two `.trainer.lock` files under `results/` are stale content from training runs that finished
+hours earlier (Windows releases the underlying OS-level exclusive handle on process exit -
+`ProcessLock` in `trainer.cpp` - so a leftover lock **file** does not mean a leftover lock
+**hold**; the file's continued existence is not itself a hazard, only a currently-running
+process holding its handle would be). Continuing to check for a running process before every
+GPU-touching step here, as the standing one-process rule requires regardless of how many
+sessions might be involved.
+
+## Phase 1a: v4 trace fields (`opponent_modeled_as`, `learner_moved`)
+
+Added to `--trace-output` (`trace_format_version` 3→4, `src/training/native/trainer.cpp`):
+
+- **`opponent_modeled_as`**: what `SearchConstraint` told the search to assume for the opposing
+  seat during this step's lookahead - `"self"` when `fixed_opponent_seat == -1` (meaning
+  `expand_and_backup` used the network's own policy for BOTH seats internally, regardless of who
+  the outer match is actually being scored against) or the fixed baseline agent's name otherwise.
+  Read directly off `constraints[active_index]`, already in scope at the trace call site - no
+  new computation, just surfacing an existing decision.
+- **`learner_moved`**: whether the learner's board position (`match.env.state.agents[seat].x/y`)
+  actually changed this step. WAIT and PLACE_BOMB never move the agent by construction (asserted
+  as a hard, fixture-independent invariant in the regression test, not just observed). A movement
+  action with `learner_moved == false` means it was blocked - by terrain/a bomb/the opponent, or
+  by losing a simultaneous-move collision resolution - which is exactly the "effective idle"
+  category the original audit flagged as invisible to WAIT% alone (its concrete example: two
+  agents repeatedly attempting the same tile, the joint resolver rejecting both for ~40 ticks).
+
+**Structural note, not a bug:** `learner_moved` needs the POST-step position, but the rest of the
+row (raw policy/value, masked prior, Q values) is captured PRE-step, and no existing hook in
+`expand_and_backup` exposes post-step state at the pre-step capture point. Rather than
+restructure the search internals, the trace row is now built in two pieces within the same
+per-`active_index` loop iteration: everything through `opponent_modeled_as` is written and the
+JSON object is left deliberately open (no closing brace, no flush) at the point where `--trace-
+output` used to close it; `env_step_joint` runs (unchanged); then a second `if (trace_log)`
+block appends `learner_moved` and closes/flushes the row. This loop body is not
+OpenMP-parallelized (confirmed by re-reading the function - only the earlier tree-descent root
+loop inside `search()` carries `#pragma omp parallel for`), so holding a partially-written
+`ofstream` object open across the intervening `env_observe`/`agent_act`/`env_step_joint` calls
+within one iteration is safe - nothing else writes to `trace_log` concurrently.
+
+**Also found while implementing:** with the current wiring, `opponent_modeled_as` will read
+`"self"` on **every row of every trace file this code can currently produce**, always - because
+`--trace-output` is only ever threaded into the MCTS-baseline `evaluate_baseline()` call (Phase
+0d / F6), which forces `type == AGENT_MCTS`, which forces `modeled_seat = -1` for every traced
+match. This is not a bug or a wasted field: it converts the previously-qualitative caveat already
+documented in `docs/NATIVE_ALPHAZERO.md` ("neural PUCT does not recursively invoke a real MCTS
+opponent at internal search nodes during vs-MCTS evaluation") into a concrete, per-row,
+mechanically-verified fact rather than a design-doc assertion - and it future-proofs the trace
+format for if/when trace capture is ever extended to the random/heuristic evaluate path, where
+this field would then show real variance. Recorded here explicitly so a future reader (including
+a future session) doesn't mistake "this field is always the same value" for "this field must be
+broken" - exactly the shape of misreading this whole KL-107 effort exists to prevent.
+
+**Test coverage** (`tests/test_native_alphazero_trace_raw_check.py`, `trace_format_version`
+bumped to 4 in the assertion): the fixture uses `--eval-mcts`, so every row's
+`opponent_modeled_as` is asserted to equal exactly `"self"` (a fixture-specific exact-value
+check, not just a type/non-empty check - matches this file's established property-testing
+philosophy). `learner_moved` is asserted to be a bool, and `chosen_action in {BOMB, WAIT} =>
+learner_moved is False` is asserted as a hard invariant on every row.
+
+**Docs updated:** `trainer.h`'s `trace_output` field comment, the CLI `--help` text for
+`--trace-output`, and both analyzer tools' module docstrings.
+
+**Verification:** full reconfigure (`cmake -S . -B build-native-gpu`, per the Phase 0b lesson
+that `cmake --build` alone reuses a stale configure-time git SHA) + `cmake --build ... --config
+Release -j 12` - clean, zero errors. `ctest --test-dir build-native-gpu -C Release`: **43/43
+passed**, including the extended `test_native_alphazero_trace_raw_check` exercising both new v4
+assertions. `ctest --test-dir build -C Release` (dependency-free): **22/22 passed**, unaffected.
+
+## Phase 1d: trace overhead benchmark
+
+Ran the same small MCTS eval (control03-iter130, 2 games × 2 seats = 4 matches, 96 search
+simulations, seeds 900001/1300001 - identical in every flag) twice against the freshly-rebuilt
+v4 binary: once without `--trace-output`, once with.
+
+```
+without trace: 230.4 sec
+with trace:    208.3 sec  (466 trace rows)
+```
+
+**Both runs produced byte-identical game outcomes** (2W-0D-2L vs MCTS, WAIT=72.3%, bomb-kill=0/2
+wins by arena-crush, same heuristic/random breakdowns) - confirming trace capture is genuinely
+read-only with respect to the actual search/action-selection RNG streams, not just designed to
+be. This is itself useful evidence, independent of the timing question: turning tracing on does
+not perturb what the checkpoint does.
+
+**On overhead specifically: not measurably distinguishable from run-to-run wall-clock noise at
+this scale.** The traced run was nominally *faster* (208s vs 230s, ~10%) - this is not a real
+speedup (an extra single-position forward pass per step cannot make a superset of the same work
+faster) but ordinary variance (OS scheduling, GPU clock state, disk I/O timing) that exceeds
+whatever the true per-step trace cost is at this configuration size (128 channels, 10 blocks,
+4 matches). A single paired run is the plan's own stated bar ("benchmarked... report per-step
+overhead once") and that bar is met, but reporting a fabricated per-step millisecond figure from
+noise this size would be a precision claim this data doesn't support - the honest report is "no
+measurable overhead at this scale in one paired trial," not a specific number. Multiple repeated
+trials would be needed for a real per-step estimate; not done here as out of scope for a
+one-time benchmark check.
+
+**Accept criteria met:** benchmarked once, with/without comparison reported, disable-by-default
+zero-cost behavior already established in the v3 work and reconfirmed structurally unchanged
+here (both new v4 fields are declared/computed only inside `if (trace_log)` guards).
+
+Both 1a and 1d committed together (one coherent slice: the v4 field addition, verified twice -
+once via the CTest fixture, once via a real-checkpoint timing/outcome check - not two separate
+semantic changes).

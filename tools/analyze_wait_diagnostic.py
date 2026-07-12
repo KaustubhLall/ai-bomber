@@ -35,6 +35,16 @@ defaults to 0.0 for actions with zero visits - comparing against that default wo
 "genuinely evaluated as worthless" with "search never looked at this option"). Restricted to
 "comparable" rows where WAIT itself was visited and at least one other action was too.
 
+The fourth table (v4 trace files only, needs learner_moved) reports EFFECTIVE idle, not just
+explicit WAIT: a movement action (UP/DOWN/LEFT/RIGHT) that didn't actually change the learner's
+board position - blocked by terrain, a bomb, the opponent, or a lost simultaneous-move collision
+- is functionally idle even though it isn't a WAIT. This is exactly the gap the prior audit
+flagged: "in one heuristic replay the agents repeatedly attempted moves into the same middle
+tile, the joint resolver rejected both for about 40 ticks" - invisible to WAIT% alone. Also
+reports a per-game idle-streak histogram (longest run of consecutive combined-idle steps within
+a game), since a handful of very long stalls can produce the same aggregate idle rate as many
+short ones but represents a materially different failure mode.
+
 Usage:
     python tools/analyze_wait_diagnostic.py crush01=crush01-trace.jsonl \
                                              control03=control03-trace.jsonl \
@@ -49,7 +59,9 @@ import math
 from pathlib import Path
 
 WAIT = 5
+BOMB = 4
 ACTIONS = 6
+MOVEMENT_ACTIONS = (0, 1, 2, 3)  # UP, DOWN, LEFT, RIGHT
 
 
 def wilson_lower_bound(successes: int, n: int, z: float = 1.96) -> float:
@@ -79,6 +91,36 @@ def load_rows(path: Path) -> list[dict]:
 
 def argmax(values: list[float]) -> int:
     return max(range(len(values)), key=lambda i: values[i])
+
+
+def is_combined_idle(row: dict) -> bool:
+    """WAIT, or a movement action that didn't actually change the learner's position (blocked
+    by terrain/a bomb/the opponent, or lost a simultaneous-move collision). PLACE_BOMB is
+    deliberately NOT idle even though it never moves the agent - placing a bomb is a real
+    tactical action, unlike a rejected movement attempt."""
+    if row["chosen_action"] == WAIT:
+        return True
+    return row["chosen_action"] in MOVEMENT_ACTIONS and not row["learner_moved"]
+
+
+def group_games(rows: list[dict]) -> dict[tuple[int, int], list[dict]]:
+    games: dict[tuple[int, int], list[dict]] = {}
+    for row in rows:
+        games.setdefault((row["seed"], row["learner_seat"]), []).append(row)
+    for steps in games.values():
+        steps.sort(key=lambda r: r["step"])
+    return games
+
+
+def longest_idle_streak(steps: list[dict]) -> int:
+    longest = current = 0
+    for row in steps:
+        if is_combined_idle(row):
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return longest
 
 
 def main() -> None:
@@ -205,6 +247,50 @@ def main() -> None:
     print("  the pipeline the passivity bottleneck sits: a high WAIT_loses rate alongside a high")
     print("  chosen==WAIT rate would mean the prior, not search's own value estimate, is")
     print("  dominating the final decision.")
+
+    print("\n=== Effective idle: WAIT + blocked movement (v4 trace files only) ===")
+    any_v4 = any(rows and all("learner_moved" in r for r in rows) for rows in rows_by_label.values())
+    if not any_v4:
+        print("  (no v4 trace file in this run - learner_moved not present; skipping)")
+    else:
+        print(f"{'checkpoint':<16} {'WAIT%':>7} {'blocked_move%':>14} {'combined_idle%':>15} "
+              f"{'combined_lcb':>13} {'mean_streak':>12} {'max_streak':>11} "
+              f"{'streaks>=10':>12} {'streaks>=40':>12}")
+        for label in labels:
+            rows = rows_by_label[label]
+            n = len(rows)
+            has_v4 = rows and all("learner_moved" in r for r in rows)
+            if not has_v4:
+                print(f"{label:<16} (predates v4 - no learner_moved field)")
+                continue
+            wait_frac = sum(1 for r in rows if r["chosen_action"] == WAIT) / n
+            blocked_move = sum(
+                1 for r in rows if r["chosen_action"] in MOVEMENT_ACTIONS and not r["learner_moved"])
+            combined = sum(1 for r in rows if is_combined_idle(r))
+            combined_lcb = wilson_lower_bound(combined, n)
+
+            games = group_games(rows)
+            streaks = [longest_idle_streak(steps) for steps in games.values()]
+            mean_streak = sum(streaks) / len(streaks) if streaks else 0.0
+            max_streak = max(streaks) if streaks else 0
+            streaks_10plus = sum(1 for s in streaks if s >= 10)
+            streaks_40plus = sum(1 for s in streaks if s >= 40)
+
+            print(f"{label:<16} {100*wait_frac:>6.1f}% {100*blocked_move/n:>13.1f}% "
+                  f"{100*combined/n:>14.1f}% {100*combined_lcb:>12.1f}% "
+                  f"{mean_streak:>12.1f} {max_streak:>11} "
+                  f"{streaks_10plus:>7}/{len(streaks):<4} {streaks_40plus:>7}/{len(streaks):<4}")
+
+        print("\nblocked_move% = movement action (UP/DOWN/LEFT/RIGHT) chosen but the learner's")
+        print("  position didn't actually change - terrain/bomb/opponent blocked it, or it lost a")
+        print("  simultaneous-move collision. Not counted in WAIT% at all.")
+        print("combined_idle% = WAIT% + blocked_move% (PLACE_BOMB excluded - it's a real tactical")
+        print("  action even though it never moves the agent) - the true floor on passivity that")
+        print("  explicit WAIT counting alone understates.")
+        print("mean/max_streak = per-game longest run of consecutive combined-idle steps,")
+        print("  averaged/maxed across all traced games. streaks>=N = how many games had at least")
+        print("  one idle run of N+ consecutive steps (>=40 matches the prior audit's own")
+        print("  qualitative observation of a ~40-tick mutual-rejection stall).")
 
     print("\nCaveat: steps within one game are autocorrelated (not independent trials), and "
           "different checkpoints faced the same seeds but not fully independent game "

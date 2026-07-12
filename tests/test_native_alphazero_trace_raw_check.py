@@ -1,4 +1,4 @@
-"""KL-107 v3 regression: trace-output's policy_head_raw_recomputed must be genuinely raw
+"""KL-107 v3/v4 regression: trace-output's policy_head_raw_recomputed must be genuinely raw
 (pre-safety-mask) and safe_action_mask must be the real mask applied to derive
 policy_prior_after_safety_mask - not another copy of the search's already-masked prior. This
 guards against the exact class of bug already found once in this project: v1/v2 called the
@@ -6,7 +6,11 @@ masked prior raw_policy and reported "the policy itself is passive" from it (see
 in Linear KL-98/KL-100 and docs/experiment-memory/10-autonomous-brick-execution.md). A test that
 only checks well-formedness (distributions sum to 1, arrays are the right length) would have
 passed on the old mislabeled data too - every assertion below instead checks a property that is
-specifically false if raw_policy is secretly the masked prior again."""
+specifically false if raw_policy is secretly the masked prior again.
+
+v4 adds opponent_modeled_as (checked against this fixture's specific AGENT_MCTS opponent, which
+must produce "self" on every row) and learner_moved (checked against the hard WAIT/PLACE_BOMB-
+never-move invariant)."""
 
 from __future__ import annotations
 
@@ -15,6 +19,7 @@ import sys
 from pathlib import Path
 
 ACTIONS = 6
+BOMB = 4
 WAIT = 5
 EPSILON = 1e-6
 
@@ -23,9 +28,10 @@ lines = [line for line in path.read_text().splitlines() if line.strip()]
 assert len(lines) >= 2, f"expected a header line plus at least one traced step, got {len(lines)}"
 
 header = json.loads(lines[0])
-assert header["trace_format_version"] == 3, (
-    f"expected trace_format_version 3, got {header.get('trace_format_version')!r} - "
-    f"this test's assertions are specific to the v3 raw/mask/Q fields"
+assert header["trace_format_version"] == 4, (
+    f"expected trace_format_version 4, got {header.get('trace_format_version')!r} - "
+    f"this test's assertions are specific to the v3 raw/mask/Q fields plus v4's "
+    f"opponent_modeled_as/learner_moved"
 )
 assert header["checkpoint_sha256"] and header["executable_sha256"] and header["git_commit"]
 
@@ -55,6 +61,24 @@ for row in rows:
     if row["wait_forced"]:
         assert row["safe_action_count"] == 1 and row["safe_action_mask"][WAIT] == 1, (
             f"wait_forced set but not exactly one safe action with WAIT as that action, row={row}"
+        )
+    # v4: this fixture's evaluate call uses --eval-mcts (AGENT_MCTS baseline), and trace_output
+    # only ever captures rows during the MCTS-baseline match loop (Phase 0d / F6) - so the
+    # search's internal opponent-model assumption is unconditionally "self" for every row here
+    # (trainer.cpp: modeled_seat = type == AGENT_MCTS ? -1 : ...). A fixture-specific exact-value
+    # check, not just a type check, since "self" vs a baseline-agent name is exactly the
+    # opponent-model-mismatch distinction this field exists to make visible.
+    assert row["opponent_modeled_as"] == "self", (
+        f"expected opponent_modeled_as=='self' for every row in this AGENT_MCTS fixture, "
+        f"got {row['opponent_modeled_as']!r}, row={row}"
+    )
+    assert isinstance(row["learner_moved"], bool)
+    # WAIT and PLACE_BOMB never change the agent's board position by construction - true
+    # regardless of fixture or checkpoint, not just expected empirically on this small fixture.
+    if row["chosen_action"] in (BOMB, WAIT):
+        assert row["learner_moved"] is False, (
+            f"chosen_action={row['chosen_action']} (BOMB or WAIT) can never move the agent, "
+            f"but learner_moved=True, row={row}"
         )
 
 # wait_forced must never be true when more than one action is safe - this is the property that
@@ -125,7 +149,9 @@ for row in rows:
             )
 
 forced_count = sum(1 for r in rows if r["wait_forced"])
-print(f"Native AlphaZero KL-107 v3 raw-trace validated ({len(rows)} rows, "
+moved_count = sum(1 for r in rows if r["learner_moved"])
+print(f"Native AlphaZero KL-107 v4 raw-trace validated ({len(rows)} rows, "
       f"{len(masked_rows)} with a masked action, all {len(divergent)} showing real raw-vs-masked "
       f"divergence, max cross-check diff={max_cross_check_diff:.4f}, "
-      f"{forced_count} forced-WAIT rows)")
+      f"{forced_count} forced-WAIT rows, {moved_count} learner_moved=true rows, "
+      f"opponent_modeled_as=='self' on all rows)")

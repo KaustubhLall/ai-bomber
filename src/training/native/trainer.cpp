@@ -2093,7 +2093,21 @@ struct Trainer::Impl {
            mask used to derive masked_prior from it, a wait_forced flag (idling forced by the
            mask vs chosen among alternatives), and root Q per learner action - the raw/value
            recomputation costs one extra single-position forward pass per traced step, still
-           entirely gated behind trace_output being set. */
+           entirely gated behind trace_output being set.
+           v4 adds opponent_modeled_as (what the search's internal lookahead assumed for the
+           opposing seat during this step's search - "self" when SearchConstraint::
+           fixed_opponent_seat is -1, meaning expand_and_backup used the network's own policy
+           for BOTH seats internally regardless of who the outer match is actually being played
+           against, or the fixed baseline agent's type name otherwise - this is the concrete,
+           per-row form of the opponent-model-mismatch caveat already documented in
+           docs/NATIVE_ALPHAZERO.md) and learner_moved (whether the learner's board position
+           actually changed this step - false for WAIT/PLACE_BOMB by construction, and false for
+           a movement action that was blocked by a wall/crate/bomb/other agent or lost a
+           simultaneous-move collision resolution; makes "effective idle," not just explicit
+           WAIT, directly measurable from the trace). learner_moved needs the post-step position,
+           so unlike every other v4-and-earlier field it is captured and appended to the row
+           AFTER env_step_joint runs, not in this block - the row is intentionally left open
+           (no closing brace/flush) until then. */
         std::unique_ptr<std::ofstream> trace_log;
         if (!trace_output.empty()) {
             if (!trace_output.parent_path().empty())
@@ -2102,7 +2116,7 @@ struct Trainer::Impl {
             if (!*trace_log)
                 throw std::runtime_error("could not open neural trace output: " +
                                          trace_output.string());
-            *trace_log << "{\"trace_format_version\":3,\"checkpoint_sha256\":\""
+            *trace_log << "{\"trace_format_version\":4,\"checkpoint_sha256\":\""
                        << sha256_file(requested_checkpoint_path)
                        << "\",\"executable_sha256\":\""
                        << sha256_file(current_executable_path())
@@ -2147,7 +2161,19 @@ struct Trainer::Impl {
                 const auto& search_result = searches[active_index];
                 const int learner_action = marginal_action(
                     search_result.visits, match.learner_seat);
+                /* v4: pre-step position and the opponent-model assumption, both declared at
+                   loop scope (like Observation/DebugSnapshot below) so learner_moved can be
+                   computed and appended to the still-open trace row after env_step_joint runs,
+                   further down this same loop body. Trivial cost when trace_log is null - same
+                   tolerance the file already accepts for the unconditional Observation/
+                   DebugSnapshot declarations a few lines below. */
+                int pre_move_x = 0, pre_move_y = 0;
+                const char* opponent_modeled_as = "";
                 if (trace_log) {
+                    opponent_modeled_as = constraints[active_index].fixed_opponent_seat == -1
+                        ? "self" : agent_type_name(constraints[active_index].fixed_opponent_type);
+                    pre_move_x = match.env.state.agents[match.learner_seat].x;
+                    pre_move_y = match.env.state.agents[match.learner_seat].y;
                     /* Root priors have already passed through safe-action masking and
                        renormalization. Name them accordingly: agreement with this prior can
                        implicate the policy+mask path, but cannot isolate the raw policy head.
@@ -2254,8 +2280,9 @@ struct Trainer::Impl {
                         << (match.total_steps > 0
                                 ? static_cast<double>(match.wait_steps) / match.total_steps
                                 : 0.0)
-                        << "}\n";
-                    trace_log->flush();
+                        << ",\"opponent_modeled_as\":\"" << opponent_modeled_as << "\"";
+                    /* Row intentionally left open (no closing brace, no flush) - learner_moved
+                       needs the post-step position and is appended after env_step_joint below. */
                 }
                 Observation observation;
                 DebugSnapshot snapshot;
@@ -2275,6 +2302,22 @@ struct Trainer::Impl {
                 }
                 const StepResult step_result = env_step_joint(&match.env, actions, 2);
                 match.done = step_result.done != 0;
+                if (trace_log) {
+                    /* WAIT and PLACE_BOMB never move the agent by construction (true
+                       regardless of fixture or checkpoint - asserted as a hard invariant in
+                       test_native_alphazero_trace_raw_check.py, not just expected empirically).
+                       A movement action with learner_moved==false means it was blocked - by a
+                       wall/crate/bomb/other agent, or by losing a simultaneous-move collision
+                       resolution against the opponent's chosen action - and is exactly the
+                       "effective idle" the last audit flagged as invisible to explicit-WAIT
+                       counting alone. */
+                    const bool learner_moved =
+                        match.env.state.agents[match.learner_seat].x != pre_move_x ||
+                        match.env.state.agents[match.learner_seat].y != pre_move_y;
+                    *trace_log << ",\"learner_moved\":" << (learner_moved ? "true" : "false")
+                               << "}\n";
+                    trace_log->flush();
+                }
                 if (recorder && indices[active_index] == 0) {
                     replay_record_env(recorder.get(), &match.env, step_result);
                     if (match.done) {
@@ -3347,8 +3390,12 @@ void print_native_help() {
         "                            STEP: safety-masked policy prior + entropy, MCTS-refined\n"
         "                            policy, search backup value, root visits, chosen action,\n"
         "                            plus a genuinely raw pre-mask policy/value recomputation,\n"
-        "                            the safe-action mask, a wait_forced flag, and root Q per\n"
-        "                            action (trace_format_version 3)\n"
+        "                            the safe-action mask, a wait_forced flag, root Q per\n"
+        "                            action, the search's own opponent-model assumption\n"
+        "                            (opponent_modeled_as), and whether the learner actually\n"
+        "                            moved this step (learner_moved, false = blocked/rejected\n"
+        "                            move - effective idle beyond explicit WAIT) (trace_format\n"
+        "                            _version 4)\n"
         "  --overwrite-evidence      Explicitly allow existing output/per-match/trace paths\n"
         "                            to be replaced (default is fail closed)\n"
         "  --draw-value X            Set both per-seat draw values (timeout+mutual death) to X\n"

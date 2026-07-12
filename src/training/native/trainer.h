@@ -31,7 +31,11 @@ struct TrainConfig {
        the search evaluated), the safe_action_mask used to derive the masked prior, a
        wait_forced flag (idling was the position's only safe action, not a preference), and
        root Q per action (search_root_q_values, marginalized from existing search backup data).
-       CLI --trace-output. */
+       v4 adds opponent_modeled_as (what the search's internal lookahead assumed for the
+       opposing seat - "self" or a fixed baseline agent type name) and learner_moved (false for
+       WAIT/PLACE_BOMB by construction, and false for a movement action blocked by terrain or a
+       lost simultaneous-move collision - "effective idle" beyond explicit WAIT). CLI
+       --trace-output. */
     std::filesystem::path trace_output{};
     /* If set (evaluate mode), write a v4 replay of one representative checkpoint game that
        bomber_viz --replay can play back. Opponent = heuristic, or MCTS with --eval-mcts;

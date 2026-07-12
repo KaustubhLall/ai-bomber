@@ -6,8 +6,12 @@ was already filtered by the safe-action mask; v1/v2 contain no unmasked policy h
 head at all. v3 adds a genuinely recomputed pre-mask policy/value (policy_head_raw_recomputed,
 value_head_raw_recomputed), the safe_action_mask used to derive the masked prior, a wait_forced
 flag (idling was the position's only safe action, not a preference), and root Q per action
-(search_root_q_values) - this tool reports all of these when present, and falls back to the v2
-masked-prior-only view on older files.
+(search_root_q_values). v4 adds opponent_modeled_as (what the search's internal lookahead
+assumed for the opposing seat - "self" or a fixed baseline agent name; see docs/NATIVE_ALPHAZERO.md
+for why this can differ from the actual match opponent) and learner_moved (false for a movement
+action blocked by terrain/a bomb/the opponent, or a lost simultaneous-move collision - "effective
+idle" beyond explicit WAIT). This tool reports all of these when present, and falls back to the
+v2 masked-prior-only view on older files.
 
 Usage:
     python tools/analyze_neural_trace.py trace.jsonl                  # summary of every game
@@ -95,6 +99,18 @@ def main() -> None:
                   f"{wait_not_forced}/{n} steps ({100*wait_not_forced/n:.0f}%) - "
                   f"the latter is the real passivity signal, the former is not a policy choice")
 
+        has_v4 = all("learner_moved" in r for r in steps) if steps else False
+        if has_v4:
+            movement_actions = (0, 1, 2, 3)
+            blocked = sum(1 for r in steps
+                          if r["chosen_action"] in movement_actions and not r["learner_moved"])
+            combined_idle = sum(1 for r in steps if r["chosen_action"] == 5 or
+                                (r["chosen_action"] in movement_actions and not r["learner_moved"]))
+            modeled_as = {r["opponent_modeled_as"] for r in steps}
+            print(f"  [v4] blocked movement (chose a direction, didn't move) {blocked}/{n} steps "
+                  f"({100*blocked/n:.0f}%); combined idle (WAIT + blocked) {combined_idle}/{n} "
+                  f"({100*combined_idle/n:.0f}%); opponent modeled as: {', '.join(sorted(modeled_as))}")
+
         if args.steps:
             for row in steps:
                 masked_prior = prior(row)
@@ -110,6 +126,11 @@ def main() -> None:
                     line += (f"\n        raw=[{top_actions(row['policy_head_raw_recomputed'])}] "
                              f"raw_value={row['value_head_raw_recomputed']:+.3f} "
                              f"safe={row['safe_action_count']}/6{forced_tag}")
+                if "learner_moved" in row:
+                    blocked_tag = (" BLOCKED" if row["chosen_action"] in (0, 1, 2, 3)
+                                   and not row["learner_moved"] else "")
+                    line += (f"\n        modeled_opponent={row['opponent_modeled_as']} "
+                             f"moved={row['learner_moved']}{blocked_tag}")
                 print(line)
         print()
 
