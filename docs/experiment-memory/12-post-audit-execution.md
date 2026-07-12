@@ -312,3 +312,58 @@ here (both new v4 fields are declared/computed only inside `if (trace_log)` guar
 Both 1a and 1d committed together (one coherent slice: the v4 field addition, verified twice -
 once via the CTest fixture, once via a real-checkpoint timing/outcome check - not two separate
 semantic changes).
+
+## Phase 1b, attempt 1: self-caught repeat of the exact Phase 0b provenance mistake
+
+Wrote `tools/launch/kl107-v4-diagnostic-rerun.ps1` (four sequential `evaluate --trace-output`
+calls: crush01-130, control03-130, lever2-160 native SD160, and a new lever2-160-forced-to-SD120
+variant for cross-checkpoint uniformity), launched it in the background, and it completed
+cleanly in **~53 minutes total** - far faster than doc 11's ~3h estimate (dominated by a ~2h
+lever2-SD160 leg last time; this run's equivalent leg took 16.8 min). All four legs' win/loss/
+draw and WAIT-fraction numbers looked sane on inspection. No investigation into *why* it was
+faster this time was pursued beyond confirming the data itself was intact (row counts, header
+provenance) - faster and clean does not carry the same "is this actually still running"
+uncertainty slower or hung would, so the CPU-time-delta liveness check this project uses for
+suspiciously slow runs wasn't needed here.
+
+**Then the header check caught a real problem:** every trace file's `git_commit` read
+`e399a5b7be3a-dirty` - the *sibling session's* Phase 0d commit, not this session's Phase 1a
+commit (`57f48dc`, already made and pushed by the time this run started). Root cause: the
+binary used for this run was built (reconfigure + compile) *before* the Phase 1a commit, while
+those exact same changes sat uncommitted in the working tree - so CMake's dirty-check correctly
+saw a modified tree relative to `e399a5b` and stamped it `-dirty`, and committing afterward
+didn't retroactively fix an already-built binary's embedded string. This is the identical
+failure shape Phase 0b just fixed and documented one section above in this same file - the
+binary's *content* was correct (the diagnostic data is from the real v4 code), only its
+self-description was stale, but producing Phase-1b evidence that repeats the exact provenance
+gap Phase 1b exists to supersede would have been a real (if minor) embarrassment, not just a
+cosmetic slip, given this project's own standing rule about exactly this.
+
+**Rebuilding at HEAD didn't immediately fix it either - a second, smaller wrinkle.** A
+reconfigure + rebuild at `57f48dc` (tracked files all committed) still stamped `-dirty` on the
+CI fixture smoke-check. Cause: `CMakeLists.txt`'s dirty-check uses `git status --porcelain
+--untracked-files=all`, which counts untracked files as dirty too - and this session's own
+`tools/launch/kl107-v4-diagnostic-rerun.ps1` was sitting untracked in the tree the whole time.
+Fix: committed the launch script first (`f81cecc` - it belongs in the repo regardless, per the
+plan's own "archive per 0c" instruction for this evidence), *then* reconfigured/rebuilt.
+Confirmed clean: the CI fixture's trace header now reads `"git_commit":"f81ceccf830a"` with no
+`-dirty` suffix, exact match to HEAD. 43/43 native CTest still green. Deleted the attempt-1
+trace/agg files (dirty-stamped, otherwise-valid data - not archived, not cited) and re-launched
+all four configs against the properly-stamped binary.
+
+**Lesson, stated plainly for next time:** the correct order is commit -> reconfigure/build ->
+generate evidence, never build -> generate evidence -> commit. Phase 0b's own fix message said
+almost exactly this ("a git_commit stamp... is only trustworthy if `cmake -S . -B <builddir>`
+was explicitly re-run since the last commit") but didn't spell out that *any* uncommitted
+change - tracked or untracked - invalidates the stamp, which is what actually tripped this up.
+Caught by this session's own header-verification habit (checking `trace_format_version`/
+`git_commit`/`executable_sha256` on the output before treating it as evidence), not by a
+process failure or test failure - both attempts' underlying computation was fine throughout.
+
+## Phase 1b, attempt 2: clean-binary re-run (in progress at time of writing)
+
+Re-launched with the properly clean-stamped binary (`executable_sha256` to be recorded once
+complete). Will report: reconciliation against the attempt-1/v3 numbers (should match within
+BF16/CUDA noise, since the underlying computation was identical - only the stamp differed), the
+new v4 effective-idle table (blocked-move fraction, combined idle, idle-streak histogram) via
+the extended `tools/analyze_wait_diagnostic.py`, and the Phase 0c-pattern evidence archive.
