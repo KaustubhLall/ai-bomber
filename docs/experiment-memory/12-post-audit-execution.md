@@ -744,3 +744,34 @@ what it exists for) and metrics.jsonl, not from the truncated live capture. Less
 
 Resume to iteration 154 launched under the watchdog (backgrounded properly this time),
 watchdog-attempts.jsonl shows attempt 1 running. Control arm follows sequentially after.
+
+## Phase 3 verdict: FLAT/NEGATIVE — the capped cause-balanced replay lever is killed
+
+Both arms completed 131→154 cleanly (one watchdog attempt each; final LR identical to the
+digit at 7.7844e-5; the control's iteration-131 collection was bit-identical to the
+treatment's, and the evidence files' resolved_semantics differ in exactly one key,
+`replay_cause_balance_cap` — verified programmatically). The frozen criteria applied verbatim:
+(a) bomb-kill 1/64 vs required ≥6 — FAIL; (b) chosen-WAIT −6.3pp vs required −8pp — FAIL
+(real attenuation, 1.7pp short of the frozen bar; the bar does not move after the fact);
+(c) SD-off draws 92.2% vs 93.75% — PASS. SUCCESS and DIRECTIONAL both unmet → FLAT/NEGATIVE
+per the pre-registered ladder. No re-runs.
+
+**The genuinely new finding is the control arm's own drift:** 24 iterations of ordinary
+v6-league training at a restored ~1e-4 LR made the control +11.7pp more passive than the
+shared base (chosen-WAIT 61.9% → 73.6%) with zero bomb-kills. The data distribution itself
+teaches waiting faster than an ~8.5× kill-sample boost can counteract — strong, controlled
+evidence for prioritizing generation-side change (league diversification / opponent mix,
+KL-105 ordered-scope item 3's other half, or H2/H3) over further sampler-side reweighting.
+
+Evidence archived at `docs/experiment-memory/evidence/kl105-arm-eval-2026-07-12/` (decision
+table + descriptive findings in its README). One operational bug caught mid-battery and fixed
+before any evidence existed: the paired-eval script's step function had a parameter named
+`$args`, which PowerShell's automatic variable shadowed into an empty splat — the binary ran
+with no arguments, printed help, exited 0, and all three steps "passed" in one second. Fixed
+with a rename + per-step expected-output existence checks (commit `43cd75b`); the no-op run
+wrote nothing.
+
+**Phase 3 complete. The plan's scope (Phases 0-3) is fully executed.** Next decision — which
+lever gets the next design pass (league diversification, H2 value/objective, or H3
+opponent-model) — is deliberately NOT taken autonomously: the frozen protocol ends here, and
+lever selection is a fresh design decision for the user/planner with these results in hand.

@@ -1,0 +1,14 @@
+8ae9d7ec7b78728137543e019b1597b80b9ee4fdbc03ee111ce4e29b2142dfeb *control-iter154-SDoff-agg.json
+d7acae786b248dc4bf621a2b9cc1720303fd41e7922d7efccc1e340f1b7546e8 *control-iter154-SDon-agg.json
+b1ce75984fbc81c9a40b8ad6457be2d63ae857d4103aa5734c25c1d4b541bcb4 *control-iter154-gates.json
+98272c1a3f3c7cfad685d1f4c7b834efd3b93cd74710e1116efd2bdd7d50cd0f *treatment-iter154-SDoff-agg.json
+e74a9a79bc9f7aced916a396f20ec5ac84fda4e6eee38ea087cb95f8e6c01e5e *treatment-iter154-SDon-agg.json
+0490eab1f250993b2166ded98cc9688f73faf39e0895cd0eb7ae0273554e5a3e *treatment-iter154-gates.json
+530d8133d42e4a02bef492fce2756b31aeb5cd5deb3f14f518d8023a2eb65568 *results/kl105-arm-eval-2026-07-12/control-iter154-SDoff-trace.jsonl
+457920d258dccd3766a4314c4dde956fb23473464810dd071196da7a5c19846f *results/kl105-arm-eval-2026-07-12/control-iter154-SDon-trace.jsonl
+9441db14b49d52c5cc36187a993f9e247d90f129820569bfb895e5a54a267d51 *results/kl105-arm-eval-2026-07-12/treatment-iter154-SDoff-trace.jsonl
+d406ae830fc9cece2fc520422af00be3a9ab77b82d957427e3766c0178ffa8d6 *results/kl105-arm-eval-2026-07-12/treatment-iter154-SDon-trace.jsonl
+914e57be6ee1613cb12d4b2d0ca9d5ae4f3d8c01b6352716f977c035e821d6c2 *results/kl105-arm-eval-2026-07-12/control-iter154-SDoff-permatch.jsonl
+e32f39089db529962a04529abfbdef8667c2abc8e4334538997dc4c94655935a *results/kl105-arm-eval-2026-07-12/control-iter154-SDon-permatch.jsonl
+612ceea1915a47040b5e8f1439f928c31c97163de58d343f1386d85da701b7f2 *results/kl105-arm-eval-2026-07-12/treatment-iter154-SDoff-permatch.jsonl
+89e1570e0eb5fb399376eec8c6fac59606da402edaea2750eaa7d99a137033d7 *results/kl105-arm-eval-2026-07-12/treatment-iter154-SDon-permatch.jsonl
