@@ -1,0 +1,38 @@
+# SHA-256 manifest for the 2026-07-11 KL-107 v4 clean-binary diagnostic re-run.
+# Supersedes docs/experiment-memory/evidence/kl107-wait-diagnostic-2026-07-11/ (v3, produced by
+# a binary stamped git_commit d6eeb4ea30d3-dirty) - same three overlapping checkpoints reproduce
+# their v3 numbers EXACTLY (not just within noise; see 12-post-audit-execution.md Phase 1b), plus
+# one new config (lever2-160 forced to SD120) and two new fields (opponent_modeled_as,
+# learner_moved). Generated with `sha256sum`. Verify with: sha256sum -c SHA256SUMS (run from this
+# directory for the *-agg.json lines; the trace/checkpoint/binary lines are for local
+# verification only - see README.md for where those files live).
+#
+# === Committed in this directory (verify with `sha256sum -c` from here) ===
+e5e62fdfbece47d411e69896668441c8ba654674abe266dd72c1788f59752ac7  control03-iter130-agg.json
+d3d1954757d10166f077f3b8b835329283b953f624452b1a1448f16e16160a94  crush01-iter130-agg.json
+059cb5179a8017f6f3a5fc76e7a5f6616c9db4b203de97aa1a4bdeeb8a1776c4  lever2-iter160-SD120uniform-agg.json
+c1824d5f980a2b896b802bdec2b073230e74d3d4c6087e96f59ab6cdc8ce06fa  lever2-iter160-SD160native-agg.json
+#
+# === Raw trace JSONLs (NOT committed - stay local under results/, git-ignored;
+#     hashes recorded here so a copy can be verified against this record if preserved
+#     or regenerated) ===
+b143c0b2509753dff2b821ba54b2b4927f8a4c26ed17460ce57991dc7d8b9250  crush01-iter130-trace.jsonl (4104 rows + header; originally at results/kl107-wait-diagnostic-v4-2026-07-11/)
+45025aa059a65afe960063ecbc3a1c3c0e05819091332aa396cdd94127fbaaaf  control03-iter130-trace.jsonl (4004 rows + header)
+da0a580217a87f50f3aea9c05f37bb0f571f55519f8462086196dbc876eb0ed6  lever2-iter160-SD160native-trace.jsonl (5349 rows + header)
+48e002d74ced75a78d68c7584d8bd9f945c35394fe96969cae6dd105dd44ee0a  lever2-iter160-SD120uniform-trace.jsonl (4051 rows + header; NEW config, not in the v3 evidence)
+#
+# === Checkpoints evaluated (each agg's own checkpoint_sha256, restated here for a
+#     single lookup point - identical to the v3 evidence, same checkpoints) ===
+416993ce3a9f272226afb7f8f650cd6cd02fe7b9390eb60f009741773f1ba1a1  v6-league-crush01/iteration_000130.pt
+ab5771d34f3be18e0911b1da51690fa62dc75f5ec6d0a06dba082cdc069cb288  control03-from102/iteration_000130.pt
+29930a4ce30b0cfef69827c98a04b7590cbd700e3f8a0ef7338d4bd6239fe5c3  lever2-sdstart160/iteration_000160.pt (used for both SD160native and SD120uniform)
+#
+# === Executable ===
+# Built via a full reconfigure (`cmake -S . -B build-native-gpu`) at commit f81cecc with a
+# genuinely clean tree (zero tracked or untracked changes) - git_commit correctly reads
+# "f81ceccf830a" with no -dirty suffix in every trace/agg file this binary produced, confirmed
+# directly against the CI fixture and all four diagnostic runs before this evidence was archived.
+# A first attempt at this run used a binary built BEFORE its own source was committed, which
+# stamped -dirty even though the content was correct - see 12-post-audit-execution.md "Phase 1b,
+# attempt 1" for the full account. That attempt's evidence was deleted, not archived, not cited.
+836d3a3d91c7906e4217280e47e049dc76df7a65933921816618ea82e2900674  bomber_alphazero_native.exe (commit f81cecc, clean tree, used to produce all evidence in this directory)

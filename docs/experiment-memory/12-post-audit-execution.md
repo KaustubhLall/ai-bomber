@@ -360,10 +360,88 @@ Caught by this session's own header-verification habit (checking `trace_format_v
 `git_commit`/`executable_sha256` on the output before treating it as evidence), not by a
 process failure or test failure - both attempts' underlying computation was fine throughout.
 
-## Phase 1b, attempt 2: clean-binary re-run (in progress at time of writing)
+## Phase 1b, attempt 2: clean-binary re-run — complete
 
-Re-launched with the properly clean-stamped binary (`executable_sha256` to be recorded once
-complete). Will report: reconciliation against the attempt-1/v3 numbers (should match within
-BF16/CUDA noise, since the underlying computation was identical - only the stamp differed), the
-new v4 effective-idle table (blocked-move fraction, combined idle, idle-streak histogram) via
-the extended `tools/analyze_wait_diagnostic.py`, and the Phase 0c-pattern evidence archive.
+Re-launched with the properly clean-stamped binary (commit `f81cecc`, executable SHA-256
+`836d3a3d91c7906e...`). All four configs completed in **~47.5 minutes total** (crush01 10.4min,
+control03 10.5min, lever2-SD160native 15.1min, lever2-SD120uniform 11.3min) - consistent with
+attempt 1's ~53 minutes (not the ~3h originally estimated from doc 11's historical lever2-SD160
+timing; no investigation pursued into why this session's runs are faster, since the data itself
+verified sound - see "what to check" note below). Header provenance verified directly on all
+four trace files before treating any of it as evidence: `trace_format_version:4`,
+`git_commit:"f81ceccf830a"` (exact HEAD match, no `-dirty`), same `executable_sha256` across all
+four (confirms one consistent binary produced everything).
+
+**Row counts and every outcome number are byte-identical to attempt 1's dirty-stamped run**
+(4104/4004/5349/4051 trace rows; identical W-D-L, WAIT%, and win-cause breakdown on all four
+configs) - this is expected (attempt 1's underlying computation was already correct, only its
+self-description was stale) but was verified directly rather than assumed, closing the loop on
+the attempt-1 mistake with actual evidence that no data was lost or altered by the rebuild.
+
+**Exact reproduction of the v3 evidence**, for the three overlapping configs (crush01-130,
+control03-130, lever2-160-SD160): WAIT%/forced%/forced_lcb%/chosen%/chosen_lcb% match the
+original systematic-pass table to the tenth of a percent on every figure, every checkpoint -
+not "within noise," genuinely identical. Confirms the v3→v4 field addition didn't touch the
+existing computation path (only added new fields), and that the v3 evidence's `-dirty` stamp
+(Phase 0b) was purely a self-description problem, never a data problem.
+
+### The v4 effective-idle table (new)
+
+```
+checkpoint                    WAIT%  blocked_move%  combined_idle%  combined_lcb  mean_streak  max_streak  streaks>=10  streaks>=40
+crush01-iter130                62.0%           0.3%           62.3%         60.8%         38.8         111        30/32        13/32
+control03-iter130              62.5%           0.4%           62.9%         61.4%         44.9         104        31/32        19/32
+lever2-iter160-SD160native     64.2%           0.6%           64.8%         63.5%         63.3         144        31/32        20/32
+lever2-iter160-SD120uniform    68.0%           0.4%           68.4%         67.0%         57.5         112        31/32        19/32
+```
+
+**Two distinct findings here, worth separating clearly:**
+
+1. **Blocked movement's contribution to the instantaneous idle RATE is small.** `combined_idle%`
+   (WAIT + blocked) exceeds `WAIT%` alone by only 0.3-0.6 percentage points across all four
+   configs. This is a real, measured correction to the last audit's "explicit WAIT understates
+   passivity" claim, but the honest magnitude is modest at the aggregate level - explicit WAIT
+   was already capturing the large majority of what "idle" means here. Reporting this precisely
+   rather than assuming the earlier qualitative flag implied a large hidden effect.
+2. **The STREAK structure is the actually striking finding, and it's not visible from any rate
+   alone.** 94-97% of traced games (30-31 of 32) have at least one run of 10+ consecutive
+   combined-idle steps; 41-63% (13-20 of 32) have a run of 40+ consecutive steps - directly
+   corroborating, and now quantifying across every traced game rather than one anecdote, the
+   original audit's qualitative observation ("the joint resolver rejected both for about 40
+   ticks"). Mean longest-streak length is 39-63 steps per game (games run roughly 125-170 steps
+   on average per the earlier win-cause tables), and the single longest observed streak was 144
+   steps - meaning idle time is not spread evenly through a game, it clumps into long stalls that
+   dominate large fractions of many individual games even though the aggregate rate looks similar
+   to WAIT% alone.
+
+**A new, unplanned observation:** `lever2-iter160-SD120uniform` (the checkpoint forced OUT of
+its own trained SD160 environment into the common SD120 one) shows the **highest** WAIT/passivity
+numbers of all four configs (68.0% WAIT vs. 64.2% for the same checkpoint at its native SD160,
+69.0% raw-argmax==WAIT, mean raw P(WAIT)=0.436 - all four of these are the highest value in their
+column). This was not predicted by the plan and deserves a plain caveat rather than a causal
+story: this is one checkpoint, one diagnostic pass, evaluated in an environment it wasn't trained
+for - consistent with "an off-distribution environment makes this checkpoint more passive," but
+equally consistent with the SD-timing lever itself (already known to be causally unresolved per
+KL-98) doing something specific to this one checkpoint's policy. Flagging as a new data point for
+KL-105's design, not a conclusion.
+
+**What to check:** the run finished roughly 4x faster than doc 11's historical estimate for the
+equivalent lever2-SD160 leg (15.1min here vs. ~2h there) despite identical `--mcts-eval-games`
+and simulation counts. Both this session's runs (attempt 1 and 2) showed the same fast timing,
+and the actual trace row counts/outcomes are internally consistent and byte-identical between
+attempts, so there's no evidence of truncated or corrupted work - but the cause of the speedup
+(different system load, GPU/driver state, or something specific to doc 11's original session)
+was not investigated and remains unexplained. Not blocking, but worth knowing before treating any
+future timing estimate in this project's docs as load-bearing.
+
+**Evidence archived** at
+`docs/experiment-memory/evidence/kl107-wait-diagnostic-v4-2026-07-11/` (four agg JSONs +
+SHA256SUMS + README, raw traces stay local per the user's standing decision on evidence
+preservation) - same pattern as Phase 0c.
+
+**Accept criteria met:** v4 evidence at a clean commit hash (`f81cecc`, confirmed via direct
+header inspection, not assumed); WAIT/forced/chosen stats reproduce v3 values exactly (stronger
+than the plan's own "within noise" bar); effective-idle quantified with both a rate table and a
+streak-structure table - the "explicit WAIT understates passivity" claim from the original audit
+now has real numbers on both counts, with the streak structure being the more informative of the
+two.
