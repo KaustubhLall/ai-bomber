@@ -7,6 +7,7 @@ extern "C" {
 #include "core/config.h"
 #include "core/replay.h"
 #include "env/env.h"
+#include "env/bomber_map.h"
 #include "sim/evaluator.h"
 }
 
@@ -24,6 +25,7 @@ extern "C" {
 #include <ctime>
 #include <deque>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -1283,6 +1285,7 @@ void validate_train_cli_options(int argc, char** argv, int first) {
         "--selfkill-win-value", "--league-heuristic-fraction", "--promotion-margin",
         "--promotion-confidence-z", "--random-score-floor", "--heuristic-score-floor",
         "--heuristic-regression-margin", "--fork-from", "--dirty-diff-digest",
+        "--gates-agent",
     };
     static const std::set<std::string_view> flag_options = {
         "--fresh", "--no-progress", "--eval-mcts", "--overwrite-evidence",
@@ -1354,6 +1357,399 @@ void validate_config(const TrainConfig& config) {
         overlaps(config.promotion_seed_base, config.promotion_games,
                  config.mcts_evaluation_seed_base, config.mcts_evaluation_games))
         throw std::invalid_argument("evaluation, promotion, and MCTS seed blocks overlap");
+}
+
+/* ============================================================================================
+   KL-105 Phase 2b: deterministic tactical gates ("gates" subcommand).
+
+   Six hand-constructed scenarios probe specific tactical competencies (bomb-and-escape,
+   corridor-clear, trap, chase, flame-timing, stall-break) directly, independent of any
+   training run's self-play statistics. Every scenario is built on the SAME crate_density=0
+   lattice env_reset() already produces - border walls plus a solid-wall pillar at every
+   internal (even x, even y) intersection, see map_generate() in src/env/bomber_map.c - with a
+   handful of hand-placed crates/walls layered on top; nothing here fights the generated
+   lattice. All coordinates below assume the project's standard 13x11 board (width=13,
+   height=11 - the TrainConfig/config_battle default, and the only size any of this project's
+   real checkpoints can load under, since width/height are part of the checkpoint ABI signature
+   checked at load time). Learner is always seat 0. */
+
+enum class GateOpponentMode { kNone, kConstant, kAgent };
+enum class GateLearnerMode { kSearch, kRaw, kAgent };
+
+struct GateScenarioSpec {
+    std::string name;
+    int k_steps{};
+    std::function<void(BomberEnv&)> build;
+    GateOpponentMode opponent_mode{GateOpponentMode::kNone};
+    Action opponent_constant_action{ACTION_WAIT};
+    AgentType opponent_agent_type{AGENT_RANDOM};
+    /* Evaluated on the state AFTER each step (post env_step_joint). */
+    std::function<bool(const BomberEnv&)> pass_predicate;
+};
+
+struct GateResult {
+    bool passed{};
+    int steps_used{};
+    std::string terminal{};
+    std::string note{};
+};
+
+/* Human-readable label for env_step_joint's own terminal classification. rules_check_terminal
+   is always evaluated from seat 0 - the learner's - perspective (src/env/bomber_rules.c), so
+   TERMINAL_WIN means the learner won and TERMINAL_AGENT_DEAD means the learner itself died.
+   Only used when a scenario's pass_predicate did NOT already fire on the same step - the
+   runner checks pass_predicate first, so e.g. scenario 3's opponent death is reported as
+   "pass," not this generic terminal label, even though it is simultaneously TERMINAL_WIN. */
+const char* gate_terminal_label(TerminalReason reason) {
+    switch (reason) {
+        case TERMINAL_NONE: return "none";
+        case TERMINAL_AGENT_DEAD: return "learner_dead";
+        case TERMINAL_ENEMY_DEAD: return "opponent_dead";
+        case TERMINAL_WIN: return "learner_win";
+        case TERMINAL_LOSS: return "learner_loss";
+        case TERMINAL_DRAW: return "mutual_death";
+        case TERMINAL_TIMEOUT: return "timeout";
+        default: return "unknown";
+    }
+}
+
+/* Explicit whitelist rather than delegating to agent_parse_type() directly: that helper
+   silently maps any unrecognized name to AGENT_RANDOM (src/agents/agent.c) - exactly the kind
+   of silent-wrong-value failure this codebase otherwise fails loudly on (KL-101 discipline).
+   --gates-agent is a deliberate, named choice; a typo must be rejected, not quietly become
+   "random." */
+AgentType parse_gate_agent_name(const std::string& name) {
+    static const std::vector<std::pair<std::string, AgentType>> known = {
+        {"random", AGENT_RANDOM}, {"scripted", AGENT_SCRIPTED},
+        {"heuristic", AGENT_HEURISTIC}, {"greedy", AGENT_GREEDY_CRATE},
+        {"greedy_crate", AGENT_GREEDY_CRATE}, {"enemy", AGENT_ENEMY_BOT},
+        {"enemy-bot", AGENT_ENEMY_BOT}, {"enemy_bot", AGENT_ENEMY_BOT},
+        {"external", AGENT_EXTERNAL}, {"alphabeta", AGENT_ALPHABETA},
+        {"alpha-beta", AGENT_ALPHABETA}, {"mcts", AGENT_MCTS},
+        {"evasive", AGENT_EVASIVE}, {"survivor", AGENT_EVASIVE},
+    };
+    for (const auto& [candidate, type] : known)
+        if (candidate == name) return type;
+    throw std::runtime_error(
+        "unknown --gates-agent '" + name + "'; known names: random, scripted, heuristic, "
+        "greedy (or greedy_crate), enemy-bot (or enemy/enemy_bot), external, alpha-beta (or "
+        "alphabeta), mcts, evasive (or survivor)");
+}
+
+/* Defensive sanity check on a hand-built scenario, run immediately after construction (before
+   any search/agent decision touches it) - catches a mis-keyed tile coordinate or an agent
+   accidentally parked on a wall/crate loudly and immediately, rather than producing a
+   confusing downstream rejected-move/invalid-action symptom many steps later. This IS the
+   "construction-validity assertion" doc 13 section 2 calls for. */
+void validate_gate_scenario_construction(const BomberEnv& env, const std::string& name) {
+    const BomberState& state = env.state;
+    if (state.agent_count != 2)
+        throw std::runtime_error("gates scenario '" + name + "': expected agent_count==2");
+    for (int seat = 0; seat < 2; ++seat) {
+        const auto& agent = state.agents[seat];
+        if (!agent.alive)
+            throw std::runtime_error("gates scenario '" + name + "': seat " +
+                                     std::to_string(seat) + " is not alive at construction");
+        if (agent.x < 1 || agent.x >= state.width - 1 || agent.y < 1 ||
+            agent.y >= state.height - 1)
+            throw std::runtime_error("gates scenario '" + name + "': seat " +
+                                     std::to_string(seat) + " position out of interior bounds");
+        if (!map_is_walkable(&state, agent.x, agent.y))
+            throw std::runtime_error("gates scenario '" + name + "': seat " +
+                                     std::to_string(seat) +
+                                     " is standing on a non-walkable tile");
+    }
+    if (state.agents[0].x == state.agents[1].x && state.agents[0].y == state.agents[1].y)
+        throw std::runtime_error("gates scenario '" + name + "': both seats on the same tile");
+    for (int index = 0; index < MAX_BOMBS; ++index) {
+        if (!state.bombs[index].active) continue;
+        const auto& bomb = state.bombs[index];
+        if (bomb.x < 1 || bomb.x >= state.width - 1 || bomb.y < 1 || bomb.y >= state.height - 1)
+            throw std::runtime_error("gates scenario '" + name + "': active bomb out of bounds");
+        if (state.tiles[bomb.y][bomb.x] == TILE_SOLID_WALL ||
+            state.tiles[bomb.y][bomb.x] == TILE_CRATE)
+            throw std::runtime_error("gates scenario '" + name +
+                                     "': active bomb sits on a wall/crate tile");
+    }
+}
+
+/* -------------------------------------------------------------------------------------------
+   Scenario 1: bomb-and-escape. Learner beside a 3-crate cluster with clear floor to retreat
+   into; opponent parked idle in the far corner. Pass = destroy at least one crate and survive
+   the learner's own blast.
+
+       y\x 0 1 2 3 4 5 6 7 8 9 10 11 12
+        0  # # # # # # # # # # #  #  #
+        1  # . . . . L C C . . .  .  #
+        2  # . # . # . # C # . #  .  #
+        3  # . . . . . . . . . .  .  #
+        4  # . # . # . # . # . #  .  #
+       ...            (unchanged interior lattice)
+        9  # . . . . . . . . . .  O  #
+       10  # # # # # # # # # # #  #  #
+
+   L=(5,1) learner. Crates at (6,1),(7,1),(7,2) - the "3-crate cluster" beside L; a bomb
+   dropped at (5,1) reaches and destroys (6,1) (blast range 2 stops at the first crate hit, so
+   (7,1)/(7,2) are never reached by that single bomb - fine, the pass predicate only needs
+   >=1 crate destroyed). West of L, (4,1)/(3,1)/(2,1)/(1,1) are open floor - verified escape:
+   bombing from (5,1) blasts {(5,1),(6,1),(4,1),(3,1),(5,2),(5,3)}; (2,1) is reachable in 3
+   hops (west three times) and is outside that blast mask, matching the 3 free movement ticks
+   available before the bomb's 4-tick fuse (danger_would_trap_agent, src/env/bomber_danger.c,
+   independently confirms this position is not a trap). O=(11,9), fed ACTION_WAIT every step
+   (NONE opponent mode) - present but irrelevant. */
+void build_gate_scenario_bomb_and_escape(BomberEnv& env) {
+    BomberState& state = env.state;
+    state.agents[0].x = 5; state.agents[0].y = 1;
+    state.agents[1].x = 11; state.agents[1].y = 9;
+    state.tiles[1][6] = TILE_CRATE;
+    state.tiles[1][7] = TILE_CRATE;
+    state.tiles[2][7] = TILE_CRATE;
+}
+
+/* -------------------------------------------------------------------------------------------
+   Scenario 2: corridor-clear. Learner starts deep inside a hand-built L-shaped dead-end pocket
+   whose only connection to the rest of the board is a single crate-sealed mouth. Opponent
+   parked idle in the far corner. Pass = learner reaches open floor outside the pocket, alive.
+
+       y\x 0 1 2 3 4 5 ...       11 12
+        0  # # # # # # ...       #  #
+        1  # . . C . . ...       .  #
+        2  # L # . # . ...       .  #
+        3  # # . . . . ...       .  #
+        4  # . # . # . ...       .  #
+       ...
+        9  # . . . . . ...       O  #
+       10  # # # # # # ...       #  #
+
+   Pocket = {(1,1),(2,1),(1,2)}, an L-tromino hugging the top-left corner: border walls close
+   3 of its outer sides and the natural pillar at (2,2) closes a 4th. Two extra tiles close the
+   two boundary gaps the natural lattice otherwise leaves open: (1,3) becomes a permanent
+   SOLID_WALL (closes the south exit of the (1,2) arm) and (3,1) becomes a CRATE - THE seal,
+   closing the east exit of the (2,1) arm; this is the one crate the learner must clear.
+   Verified escape: bombing from (2,1) blasts only {(2,1),(3,1),(1,1)} (west arm hits the elbow
+   then the border; east arm hits the crate and stops) - (1,2) is off both the bomb's row and
+   its column, so retreating (2,1)->(1,1)->(1,2) (2 moves, inside the 3-tick fuse window) is
+   safe. The engine's own tactical-safety BFS agrees, and also correctly flags the OTHER
+   plausible firing spot as unsafe: bombing from the elbow (1,1) instead blasts all three
+   pocket cells simultaneously (no safe retreat exists inside the pocket), and
+   danger_would_trap_agent (src/env/bomber_danger.c) masks PLACE_BOMB unsafe there - this
+   scenario exercises finding the one safe firing position, not just "bomb from wherever you
+   are." L starts at (1,2), the far arm - genuinely "inside" the corridor. */
+void build_gate_scenario_corridor_clear(BomberEnv& env) {
+    BomberState& state = env.state;
+    state.agents[0].x = 1; state.agents[0].y = 2;
+    state.agents[1].x = 11; state.agents[1].y = 9;
+    state.tiles[3][1] = TILE_SOLID_WALL;
+    state.tiles[1][3] = TILE_CRATE;
+}
+
+/* -------------------------------------------------------------------------------------------
+   Scenario 3: trap. A static opponent (NONE mode - fed ACTION_WAIT every step, never resists)
+   sits in a 1-tile dead end; the learner starts at the mouth with its spawn bomb_ammo (1,
+   unmodified). Pass = the opponent is dead and death_owner is the learner's own seat (a
+   demonstrated kill, not attrition) - the doc's literal predicate does not additionally
+   require the learner to survive, though the constructed position makes a clean survivable
+   kill straightforwardly reachable too.
+
+       y\x 0 1 2 3 4 5 6 7 8 9 10 11 12
+        8  # . . . . . . . . . #  #  #
+        9  # . . . . . . . . L .  O  #
+       10  # # # # # # # # # # #  #  #
+
+   O=(11,9). Its two naturally-open sides are north (11,8) and west (10,9); north is converted
+   to a permanent SOLID_WALL (extra, beyond the lattice) so the only connection is the west
+   mouth - "opponent in a dead-end." L=(9,9), two tiles west along the open row. Bombing from
+   (10,9) (one step toward O) reaches O's cell directly (east arm, range 2, unobstructed)
+   while the learner's own retreat (west along the row, then off-axis once clear of the
+   blast's row/column) is unobstructed. */
+void build_gate_scenario_trap(BomberEnv& env) {
+    BomberState& state = env.state;
+    state.agents[0].x = 9; state.agents[0].y = 9;
+    state.agents[1].x = 11; state.agents[1].y = 9;
+    state.tiles[8][11] = TILE_SOLID_WALL;
+}
+
+/* -------------------------------------------------------------------------------------------
+   Scenario 4: chase. Pure pursuit on the untouched natural lattice - no hand-placed crates or
+   walls. Learner starts at its usual spawn corner; the opponent is AGENT_EVASIVE, a real
+   scripted agent that actively scores candidate moves for exits + distance from the nearest
+   enemy + safety (src/agents/evasive_agent.c) - it will actually try to run. Pass = the
+   learner ever gets within Manhattan distance <=2 of the opponent while both are alive.
+
+       y\x 0 1 2 3 4 5 6 7 8 9 10 11 12
+        0  # # # # # # # # # # #  #  #
+        1  # L . . . . . . . . .  .  #
+       ...            (open lattice, unchanged)
+        9  # . . . . . . . . . .  O  #
+       10  # # # # # # # # # # #  #  #
+
+   L=(1,1) (natural seat-0 spawn), O=(11,9) (natural seat-1 spawn) - "across the board." */
+void build_gate_scenario_chase(BomberEnv& env) {
+    BomberState& state = env.state;
+    state.agents[0].x = 1; state.agents[0].y = 1;
+    state.agents[1].x = 11; state.agents[1].y = 9;
+}
+
+/* -------------------------------------------------------------------------------------------
+   Scenario 5: flame-timing. Row y=5 is converted to a solid wall for its entire width except
+   one gap at x=5 - the only corridor forward between the north and south halves of the board.
+   An opponent-owned bomb (timer=2, already ticking) sits exactly in that gap tile, physically
+   blocking passage before it detonates and lethally flaming it for flame_duration ticks after.
+   The opponent agent itself (NONE mode, parked south) never acts - the bomb is placed directly
+   into env.state, not via agent_act. Pass = learner alive AND south of the wall line (past the
+   blast tile) once the flame has cleared.
+
+       y\x 0 1 2 3 4 5 6 7 8 9 10 11 12
+        1  # . . . . L . . . . .  .  #
+       ...            (open north half, unchanged lattice)
+        5  # # # # # b # # # # #  #  #   b = opponent bomb, timer=2, in the one gap (x=5)
+        6  # . . . . . . . . . .  .  #
+       ...            (open south half, unchanged lattice)
+        7  # . . . . . . . . O .  .  #
+       10  # # # # # # # # # # #  #  #
+
+   L=(5,1), four tiles north of the gap along the fully-open column x=5 (x odd => that column
+   never has a pillar). The gap tile (5,5)'s east/west neighbors (6,5)/(4,5) are themselves
+   part of the new row-5 wall, so a bomb dropped at (5,5) is blocked immediately in both
+   directions; only the north/south arms (open column x=5) propagate, so the blast (range 2)
+   stays confined to {(5,3),(5,4),(5,5),(5,6),(5,7)} - it does not breach the wall row
+   anywhere else. O=(9,7), safely outside that blast, uninvolved. */
+void build_gate_scenario_flame_timing(BomberEnv& env) {
+    BomberState& state = env.state;
+    for (int x = 1; x <= 11; ++x)
+        if (x != 5) state.tiles[5][x] = TILE_SOLID_WALL;
+    state.agents[0].x = 5; state.agents[0].y = 1;
+    state.agents[1].x = 9; state.agents[1].y = 7;
+    BombState& bomb = state.bombs[0];
+    bomb.x = 5; bomb.y = 5;
+    bomb.owner_id = 1;
+    bomb.timer = 2;
+    bomb.range = state.agents[1].blast_range;
+    bomb.active = 1;
+    state.agents[1].bomb_ammo = 0;
+    state.agents[1].bombs_active = 1;
+}
+
+/* -------------------------------------------------------------------------------------------
+   Scenario 6: stall-break. Same row-5 wall technique as flame-timing, but with TWO gaps: x=5
+   (gap A, the contested chokepoint - learner and opponent start adjacent to it on opposite
+   sides) and x=7 (gap B, sealed by one crate - the alternate route). Opponent action is
+   CONSTANT(ACTION_UP): every step it blindly tries to move north through gap A regardless of
+   outcome, reproducing the mutual-rejection stall (simultaneous-move collision resolution
+   rejects both movers when they contest the same destination tile - env_step_joint,
+   src/env/bomber_env.c) if the learner naively contests the same tile back every step. Pass =
+   learner alive AND (past the wall line at gap A OR the gap-B crate destroyed) - either
+   demonstrates the learner did not just freeze against the stalemate - OR the opponent is dead
+   with death_owner == learner (a demonstrated bomb kill, same standard as the trap gate).
+   The kill path was added at planner review after the executor flagged that both the heuristic
+   and MCTS reference agents independently bomb the defenseless CONSTANT blocker, which under
+   the original two-condition predicate registered as terminal learner_win with passed=false:
+   killing the thing blocking the chokepoint is decisive aggression - emphatically NOT the
+   passive-stall failure mode this gate exists to probe - so it counts as breaking the stall,
+   not as a miss. Crush/self-kill deaths still don't count (death_owner check), and the
+   learner-alive requirement applies to the movement/crate paths but deliberately not the kill
+   path (mirroring the trap gate's literal predicate).
+
+       y\x 0 1 2 3 4 5 6 7 8 9 10 11 12
+        4  # . . . . L . . . . .  .  #
+        5  # # # # # . # C # # #  #  #   gap A (x=5, contested) | gap B (x=7, crated)
+        6  # . . . . O . . . . .  .  #
+       ...
+       10  # # # # # # # # # # #  #  #
+
+   L=(5,4) (one tile north of gap A), O=(5,6) (one tile south of gap A), CONSTANT=ACTION_UP.
+   Crate at (7,5) (gap B); bombing it from (7,4) blasts only {(7,2),(7,3),(7,4),(7,5)} (north
+   arm open, south arm stops at the crate, east/west blocked by the natural pillars at
+   (8,4)/(6,4)) - a 2-move retreat off that line (e.g. (7,4)->(7,3)->(6,3)) is safe, mirroring
+   scenario 2's verified pattern. */
+void build_gate_scenario_stall_break(BomberEnv& env) {
+    BomberState& state = env.state;
+    for (int x = 1; x <= 11; ++x)
+        if (x != 5 && x != 7) state.tiles[5][x] = TILE_SOLID_WALL;
+    state.tiles[5][7] = TILE_CRATE;
+    state.agents[0].x = 5; state.agents[0].y = 4;
+    state.agents[1].x = 5; state.agents[1].y = 6;
+}
+
+std::vector<GateScenarioSpec> build_gate_scenarios() {
+    std::vector<GateScenarioSpec> specs;
+
+    GateScenarioSpec bomb_and_escape;
+    bomb_and_escape.name = "bomb-and-escape";
+    bomb_and_escape.k_steps = 20;
+    bomb_and_escape.build = build_gate_scenario_bomb_and_escape;
+    bomb_and_escape.opponent_mode = GateOpponentMode::kNone;
+    bomb_and_escape.pass_predicate = [](const BomberEnv& env) {
+        return env.state.agents[0].alive != 0 && env.state.agents[0].crates_destroyed > 0;
+    };
+    specs.push_back(std::move(bomb_and_escape));
+
+    GateScenarioSpec corridor_clear;
+    corridor_clear.name = "corridor-clear";
+    corridor_clear.k_steps = 30;
+    corridor_clear.build = build_gate_scenario_corridor_clear;
+    corridor_clear.opponent_mode = GateOpponentMode::kNone;
+    corridor_clear.pass_predicate = [](const BomberEnv& env) {
+        if (env.state.agents[0].alive == 0) return false;
+        const int x = env.state.agents[0].x;
+        const int y = env.state.agents[0].y;
+        const bool inside_pocket =
+            (x == 1 && y == 1) || (x == 2 && y == 1) || (x == 1 && y == 2);
+        return !inside_pocket;
+    };
+    specs.push_back(std::move(corridor_clear));
+
+    GateScenarioSpec trap;
+    trap.name = "trap";
+    trap.k_steps = 20;
+    trap.build = build_gate_scenario_trap;
+    trap.opponent_mode = GateOpponentMode::kNone;
+    trap.pass_predicate = [](const BomberEnv& env) {
+        return env.state.death_owner[1] == 0;
+    };
+    specs.push_back(std::move(trap));
+
+    GateScenarioSpec chase;
+    chase.name = "chase";
+    chase.k_steps = 30;
+    chase.build = build_gate_scenario_chase;
+    chase.opponent_mode = GateOpponentMode::kAgent;
+    chase.opponent_agent_type = AGENT_EVASIVE;
+    chase.pass_predicate = [](const BomberEnv& env) {
+        if (env.state.agents[0].alive == 0 || env.state.agents[1].alive == 0) return false;
+        const int dx = env.state.agents[0].x - env.state.agents[1].x;
+        const int dy = env.state.agents[0].y - env.state.agents[1].y;
+        const int manhattan = (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy);
+        return manhattan <= 2;
+    };
+    specs.push_back(std::move(chase));
+
+    GateScenarioSpec flame_timing;
+    flame_timing.name = "flame-timing";
+    flame_timing.k_steps = 15;
+    flame_timing.build = build_gate_scenario_flame_timing;
+    flame_timing.opponent_mode = GateOpponentMode::kNone;
+    flame_timing.pass_predicate = [](const BomberEnv& env) {
+        return env.state.agents[0].alive != 0 && env.state.agents[0].y > 5;
+    };
+    specs.push_back(std::move(flame_timing));
+
+    GateScenarioSpec stall_break;
+    stall_break.name = "stall-break";
+    stall_break.k_steps = 25;
+    stall_break.build = build_gate_scenario_stall_break;
+    stall_break.opponent_mode = GateOpponentMode::kConstant;
+    stall_break.opponent_constant_action = ACTION_UP;
+    stall_break.pass_predicate = [](const BomberEnv& env) {
+        if (env.state.death_owner[1] == 0) return true;
+        if (env.state.agents[0].alive == 0) return false;
+        const bool reached_far_side = env.state.agents[0].y > 5;
+        const bool alt_path_opened = env.state.tiles[5][7] != TILE_CRATE;
+        return reached_far_side || alt_path_opened;
+    };
+    specs.push_back(std::move(stall_break));
+
+    return specs;
 }
 
 }  // namespace
@@ -3263,6 +3659,363 @@ struct Trainer::Impl {
             atomic_replace(temporary, config.evaluation_output);
         }
     }
+
+    /* KL-105 Phase 2b: step one already-constructed gate scenario env for up to k_steps ticks.
+       Learner (seat 0) decision procedure is selected by learner_mode: kSearch runs the exact
+       deployed decision procedure (BatchedMcts, root noise off, greedy marginal_action -
+       identical machinery to evaluate_baseline's own search loop, same simulations budget as
+       --eval-simulations); kRaw takes the unmasked policy-head argmax with NO search at all
+       (diagnostic only - recorded but never gates pass/fail, per doc 13 section 2); kAgent
+       substitutes a scripted Agent for the network entirely (the --gates-agent achievability
+       reference). Opponent (seat 1) is one of: kNone (ACTION_WAIT every step), kConstant
+       (opponent_constant_action every step regardless of outcome - this is what produces the
+       "mutual rejection" stall pattern when contested), kAgent (a real scripted Agent via
+       env_observe/env_get_debug_snapshot/agent_act, the same pattern evaluate_baseline uses
+       for its opponents). Stops at the first step whose POST-step state satisfies
+       pass_predicate, at the first env_step_joint terminal, or after k_steps ticks - whichever
+       comes first. Takes env BY VALUE deliberately: the caller passes the constructed scenario
+       directly and this parameter's own copy is what gets mutated, so calling this two or
+       three times (search/raw/agent) against the same constructed env never shares or mutates
+       state across those runs. */
+    GateResult run_gate_scenario(BomberEnv env, int k_steps, GateOpponentMode opponent_mode,
+                                 Action opponent_constant_action, AgentType opponent_agent_type,
+                                 uint64_t seed,
+                                 const std::function<bool(const BomberEnv&)>& pass_predicate,
+                                 GateLearnerMode learner_mode,
+                                 AgentType learner_agent_type = AGENT_RANDOM) {
+        GateResult result;
+        Agent opponent_scripted;
+        if (opponent_mode == GateOpponentMode::kAgent) {
+            agent_init(&opponent_scripted, opponent_agent_type);
+            agent_reset(&opponent_scripted, seed * 2 + 1);
+            if (opponent_agent_type == AGENT_MCTS &&
+                !mcts_agent_configure(&opponent_scripted, config.baseline_mcts_simulations,
+                                      config.baseline_mcts_depth))
+                throw std::runtime_error("invalid native MCTS baseline configuration "
+                                         "(gates opponent)");
+        }
+        Agent learner_scripted;
+        if (learner_mode == GateLearnerMode::kAgent) {
+            agent_init(&learner_scripted, learner_agent_type);
+            agent_reset(&learner_scripted, seed * 2);
+            if (learner_agent_type == AGENT_MCTS &&
+                !mcts_agent_configure(&learner_scripted, config.baseline_mcts_simulations,
+                                      config.baseline_mcts_depth))
+                throw std::runtime_error("invalid native MCTS baseline configuration "
+                                         "(gates learner)");
+        }
+        std::unique_ptr<BatchedMcts> search;
+        if (learner_mode == GateLearnerMode::kSearch)
+            search = std::make_unique<BatchedMcts>(model, device, config, rng, iteration, false);
+
+        const int initial_x = env.state.agents[0].x;
+        const int initial_y = env.state.agents[0].y;
+        /* doc 13 section 2's stall-break fail note: "track whether the learner ever changed
+           position or destroyed a crate or placed a bomb." crates_destroyed can only increase
+           via the learner's OWN bomb exploding on a crate, which necessarily means
+           bombs_active was >0 for that bomb first - so "placed a bomb" (bombs_active>0 at any
+           point) already subsumes "destroyed a crate" as a signal; checking both anyway costs
+           nothing and keeps this obviously traceable to the doc's three conditions. */
+        bool learner_ever_acted = false;
+
+        for (int step = 0; step < k_steps; ++step) {
+            int learner_action;
+            if (learner_mode == GateLearnerMode::kSearch) {
+                std::vector<BomberEnv*> active{&env};
+                /* fixed_opponent_seat=-1: the search's OWN internal lookahead always models
+                   both seats with the network (self-play), uniformly across all six scenarios,
+                   regardless of what the outer loop's actual opponent_mode is this step
+                   (evaluate_baseline instead fixes fixed_opponent_seat to the real baseline
+                   type for non-MCTS opponents - see its `modeled_seat` - but gates deliberately
+                   does not: kNone/kConstant opponents have no AgentType to model in the first
+                   place, and keeping this uniform means all six gates exercise the exact same
+                   search configuration, not six different ones. This IS the "opponent_modeled_
+                   as" mismatch KL-107's trace already tracks - here it is simply constant
+                   ("self") rather than scenario-dependent). */
+                std::vector<SearchConstraint> constraints{{-1, AGENT_RANDOM, seed}};
+                const auto results = search->search(active, constraints, false,
+                                                     config.evaluation_simulations);
+                learner_action = marginal_action(results[0].visits, 0);
+            } else if (learner_mode == GateLearnerMode::kRaw) {
+                /* Diagnostic-only decision procedure: unmasked policy-head argmax, no search -
+                   mirrors the v3 raw-recomputation single-position forward pass used for
+                   KL-107 trace capture above. Deliberately NOT run through
+                   safe_action_mask_for; that omission is the entire point of recording this
+                   mode separately from search mode. */
+                std::array<float, kObservationSize> encoded{};
+                if (bomber_training_encode_env(&env, 0, encoded.data(), kObservationSize) !=
+                    kObservationSize)
+                    throw std::runtime_error(
+                        "C observation encoder failed during gates raw-mode step");
+                auto input = torch::from_blob(encoded.data(),
+                    {1, BOMBER_TRAINING_CHANNELS, BOMBER_TRAINING_VIEW_SIZE,
+                     BOMBER_TRAINING_VIEW_SIZE}, torch::kFloat32).to(device);
+                torch::Tensor logits, value_tensor;
+                model->eval();
+                {
+                    torch::InferenceMode inference;
+                    AutocastGuard autocast;
+                    std::tie(logits, value_tensor) = model->forward(input);
+                }
+                const auto policy =
+                    torch::softmax(logits.to(torch::kFloat32), 1).to(torch::kCPU);
+                const auto accessor = policy.accessor<float, 2>();
+                int best_action = 0;
+                float best_probability = accessor[0][0];
+                for (int action = 1; action < kActions; ++action) {
+                    if (accessor[0][action] > best_probability) {
+                        best_probability = accessor[0][action];
+                        best_action = action;
+                    }
+                }
+                learner_action = best_action;
+            } else {
+                Observation obs;
+                DebugSnapshot snap;
+                env_observe(&env, 0, &obs);
+                env_get_debug_snapshot(&env, &snap);
+                learner_action = static_cast<int>(agent_act(&learner_scripted, &obs, &snap));
+            }
+
+            int opponent_action = static_cast<int>(ACTION_WAIT);
+            if (opponent_mode == GateOpponentMode::kConstant) {
+                opponent_action = static_cast<int>(opponent_constant_action);
+            } else if (opponent_mode == GateOpponentMode::kAgent) {
+                Observation obs;
+                DebugSnapshot snap;
+                env_observe(&env, 1, &obs);
+                env_get_debug_snapshot(&env, &snap);
+                opponent_action = static_cast<int>(agent_act(&opponent_scripted, &obs, &snap));
+            }
+
+            if (learner_action == static_cast<int>(ACTION_PLACE_BOMB)) learner_ever_acted = true;
+            const Action actions[2] = {static_cast<Action>(learner_action),
+                                       static_cast<Action>(opponent_action)};
+            const StepResult step_result = env_step_joint(&env, actions, 2);
+            if (env.state.agents[0].x != initial_x || env.state.agents[0].y != initial_y ||
+                env.state.agents[0].bombs_active > 0)
+                learner_ever_acted = true;
+
+            result.steps_used = step + 1;
+            if (pass_predicate(env)) {
+                result.passed = true;
+                result.terminal = "pass";
+                break;
+            }
+            if (step_result.done) {
+                result.terminal = gate_terminal_label(step_result.terminal_reason);
+                break;
+            }
+        }
+        if (result.terminal.empty()) result.terminal = "step_budget_exhausted";
+        result.note = learner_ever_acted ? "" :
+            "learner never changed position, destroyed a crate, or placed a bomb "
+            "(combined-idle every step)";
+        return result;
+    }
+
+    /* KL-105 Phase 2b: the `gates` subcommand entry point. Read-only, like evaluate_only() -
+       loads the checkpoint exactly the same way (manifest semantics inheritance happens in the
+       constructor above; --legacy-accept-unverified-semantics supported the same way), reuses
+       --output/--overwrite-evidence for a write-once JSON evidence file, and reuses
+       --eval-simulations for the search budget. Runs each of the six scenarios twice (search
+       mode + raw mode) against the loaded network, or once against a scripted Agent if
+       --gates-agent was given. */
+    void gates() {
+        if (!std::filesystem::exists(requested_checkpoint_path))
+            throw std::runtime_error("checkpoint not found: " +
+                                     requested_checkpoint_path.string());
+        require_available_evidence_path(config.evaluation_output, "gates evidence output");
+        std::cout << "resolved semantics: " << semantic_manifest_string(config) << '\n';
+
+        const bool agent_mode = !config.gates_agent.empty();
+        const AgentType gates_agent_type =
+            agent_mode ? parse_gate_agent_name(config.gates_agent) : AGENT_RANDOM;
+
+        BomberConfig base = game_config(config);
+        base.crate_density = 0;
+        /* --max-steps is part of the checkpoint ABI (config_signature(), checked once at
+           load_checkpoint() time using the CLI's original --max-steps) but is NOT a semantic
+           field (not in semantic_field_flags()/the manifest) and this `base` is a fresh local
+           BomberConfig, not a reference back into `config` - overriding it here cannot affect
+           or re-trigger that already-completed ABI check. It matters because CI's tiny fixture
+           checkpoints are trained at --max-steps 8 for speed (see tests/CMakeLists.txt's
+           native-alphazero-semantic-smoke fixture), and gates must be run against that exact
+           checkpoint (matching --max-steps 8 to load it at all) - without this override every
+           scenario's env would hit TERMINAL_TIMEOUT at state.step==8 regardless of its own
+           k_steps budget (empirically confirmed: every scenario reported "8 steps, timeout"
+           before this fix), silently capping every scenario's real step budget to 8 and making
+           the --gates-agent achievability check meaningless. The largest k_steps below is 30
+           (corridor-clear/chase); 64 leaves generous headroom for all of them regardless of
+           what --max-steps the loaded checkpoint's own training run used. */
+        base.max_steps = std::max(base.max_steps, 64);
+        /* KL-105: seed block dedicated to gates, disjoint from evaluation (900001+), promotion
+           (1100001+), and MCTS-eval (1300001+) seed blocks validate_config guards against
+           overlapping - gates never shares a process invocation with those, so no explicit
+           overlap check is needed here, but the block is kept disjoint anyway on principle.
+           env_reset's seed barely matters at crate_density=0 (map_generate's wall/pillar
+           layout is a pure function of width/height only, no RNG involved; only crate
+           placement -disabled here via crate_density=0- and later in-scenario gameplay RNG,
+           e.g. powerup drops from a destroyed crate, consume it, and none of the pass
+           predicates below depend on powerup RNG) - fixed purely for reproducibility. */
+        constexpr uint64_t kGateSeedBase = 5'000'001ULL;
+        const auto specs = build_gate_scenarios();
+
+        struct ScenarioRecord {
+            std::string name;
+            GateResult search;
+            GateResult raw;
+            GateResult agent;
+        };
+        std::vector<ScenarioRecord> records;
+        records.reserve(specs.size());
+
+        for (size_t index = 0; index < specs.size(); ++index) {
+            const auto& spec = specs[index];
+            const uint64_t seed = kGateSeedBase + static_cast<uint64_t>(index);
+            BomberEnv constructed{};
+            env_init(&constructed, &base);
+            env_reset(&constructed, seed);
+            spec.build(constructed);
+            /* The scenario builder just overwrote env.state directly; env.danger was computed
+               for the PRE-overwrite (freshly-generated, un-modified) layout by env_reset above
+               and is now stale relative to the hand-placed tiles/bombs. env_step_joint
+               recomputes danger_compute/danger_compute_escape internally after every step
+               (verified: src/env/bomber_env.c, both calls unconditionally run right before
+               state->step++), so staleness only matters for the very first decision - but it
+               matters: bomber_training_encode_env's channel 8 (current_blast) reads
+               env->danger.current_blast directly rather than recomputing it fresh
+               (src/training/encoding.c), so a stale danger map would show the network a false
+               "no danger" read on step 0 of e.g. flame-timing/stall-break, where real danger is
+               present from construction. Recompute before anything touches this env, mirroring
+               exactly what env_reset itself does for a freshly generated map. */
+            danger_compute(&constructed.danger, &constructed.state);
+            danger_compute_escape(&constructed.danger, &constructed.state, 0);
+            validate_gate_scenario_construction(constructed, spec.name);
+
+            ScenarioRecord record;
+            record.name = spec.name;
+            if (agent_mode) {
+                /* run_gate_scenario takes its env BY VALUE - passing `constructed` directly
+                   lets that parameter copy do the "give each run its own independent env"
+                   work; `constructed` itself is untouched and reusable for the next mode. */
+                record.agent = run_gate_scenario(constructed, spec.k_steps, spec.opponent_mode,
+                                                 spec.opponent_constant_action,
+                                                 spec.opponent_agent_type, seed,
+                                                 spec.pass_predicate, GateLearnerMode::kAgent,
+                                                 gates_agent_type);
+            } else {
+                record.search = run_gate_scenario(constructed, spec.k_steps, spec.opponent_mode,
+                                                  spec.opponent_constant_action,
+                                                  spec.opponent_agent_type, seed,
+                                                  spec.pass_predicate, GateLearnerMode::kSearch);
+                record.raw = run_gate_scenario(constructed, spec.k_steps, spec.opponent_mode,
+                                               spec.opponent_constant_action,
+                                               spec.opponent_agent_type, seed,
+                                               spec.pass_predicate, GateLearnerMode::kRaw);
+            }
+            records.push_back(std::move(record));
+        }
+
+        std::cout << "\nTactical gates (" << (agent_mode ? config.gates_agent + " agent"
+                                                          : std::string("network"))
+                  << ", " << config.evaluation_simulations << " simulations):\n";
+        if (agent_mode) {
+            std::cout << std::left << std::setw(20) << "scenario" << std::setw(10) << "result"
+                      << std::setw(8) << "steps" << "terminal\n";
+            for (const auto& record : records)
+                std::cout << std::left << std::setw(20) << record.name
+                          << std::setw(10) << (record.agent.passed ? "PASS" : "FAIL")
+                          << std::setw(8) << record.agent.steps_used
+                          << record.agent.terminal << '\n';
+        } else {
+            std::cout << std::left << std::setw(20) << "scenario"
+                      << std::setw(45) << "search (authoritative)" << "raw (diagnostic)\n";
+            for (const auto& record : records) {
+                std::ostringstream search_cell;
+                std::ostringstream raw_cell;
+                search_cell << (record.search.passed ? "PASS" : "FAIL") << " ("
+                           << record.search.steps_used << " steps, " << record.search.terminal
+                           << ")";
+                raw_cell << (record.raw.passed ? "PASS" : "FAIL") << " ("
+                        << record.raw.steps_used << " steps, " << record.raw.terminal << ")";
+                std::cout << std::left << std::setw(20) << record.name
+                          << std::setw(45) << search_cell.str() << raw_cell.str() << '\n';
+            }
+        }
+
+        if (!config.evaluation_output.empty()) {
+            const auto temporary = config.evaluation_output.string() + ".tmp";
+            if (!config.evaluation_output.parent_path().empty())
+                std::filesystem::create_directories(config.evaluation_output.parent_path());
+            std::ofstream output(temporary, std::ios::trunc);
+            if (!output)
+                throw std::runtime_error("could not open gates evidence output: " + temporary);
+            auto write_result = [&output](const GateResult& value) {
+                output << "{\"passed\": " << (value.passed ? "true" : "false")
+                       << ", \"steps_used\": " << value.steps_used
+                       << ", \"terminal\": \"" << json_escape(value.terminal) << "\""
+                       << ", \"note\": \"" << json_escape(value.note) << "\"}";
+            };
+            output << "{\n"
+                   << "  \"gates_format_version\": 1,\n"
+                   << "  \"generated_at_utc\": \"" << utc_timestamp() << "\",\n"
+                   << "  \"invocation_argv\": [";
+            for (size_t index = 0; index < config.invocation_argv.size(); ++index) {
+                if (index) output << ',';
+                output << '"' << json_escape(config.invocation_argv[index]) << '"';
+            }
+            output << "],\n"
+                   << "  \"working_directory\": \""
+                   << json_escape(std::filesystem::current_path().string()) << "\",\n"
+                   << "  \"checkpoint\": \"" << json_escape(config.checkpoint.string())
+                   << "\",\n"
+                   << "  \"checkpoint_path\": \""
+                   << json_escape(std::filesystem::absolute(requested_checkpoint_path)
+                                      .lexically_normal().string()) << "\",\n"
+                   << "  \"checkpoint_sha256\": \"" << sha256_file(requested_checkpoint_path)
+                   << "\",\n"
+                   << "  \"executable_path\": \""
+                   << json_escape(current_executable_path().string()) << "\",\n"
+                   << "  \"executable_sha256\": \"" << sha256_file(current_executable_path())
+                   << "\",\n"
+                   << "  \"git_commit\": \"" << AI_BOMBER_GIT_SHA << "\",\n"
+                   << "  \"runtime_config_signature\": \""
+                   << json_escape(runtime_config_signature(config)) << "\",\n"
+                   << "  \"checkpoint_semantics_verified\": "
+                   << (loaded_legacy_checkpoint ? "false" : "true") << ",\n"
+                   << "  \"checkpoint_semantics_source\": \""
+                   << (loaded_legacy_checkpoint ? "legacy_cli_unverified" : "checkpoint_manifest")
+                   << "\",\n"
+                   << "  \"checkpoint_iteration\": " << iteration << ",\n"
+                   << "  \"resolved_semantics\": \""
+                   << json_escape(semantic_manifest_string(config)) << "\",\n"
+                   << "  \"mode\": \""
+                   << json_escape(agent_mode ? config.gates_agent : std::string("network"))
+                   << "\",\n"
+                   << "  \"simulations\": " << config.evaluation_simulations << ",\n"
+                   << "  \"scenarios\": [\n";
+            for (size_t index = 0; index < records.size(); ++index) {
+                const auto& record = records[index];
+                output << "    {\"name\": \"" << json_escape(record.name) << "\", ";
+                if (agent_mode) {
+                    output << "\"result\": ";
+                    write_result(record.agent);
+                } else {
+                    output << "\"search\": ";
+                    write_result(record.search);
+                    output << ", \"raw\": ";
+                    write_result(record.raw);
+                }
+                output << "}" << (index + 1 < records.size() ? "," : "") << "\n";
+            }
+            output << "  ]\n"
+                   << "}\n";
+            output.close();
+            atomic_replace(temporary, config.evaluation_output);
+            std::cout << "\nwrote " << config.evaluation_output.string() << '\n';
+        }
+    }
 };
 
 TrainConfig parse_train_config(int argc, char** argv, int first) {
@@ -3346,6 +4099,7 @@ TrainConfig parse_train_config(int argc, char** argv, int first) {
     config.random_score_floor = parse_number(argc, argv, first, "--random-score-floor", config.random_score_floor);
     config.heuristic_score_floor = parse_number(argc, argv, first, "--heuristic-score-floor", config.heuristic_score_floor);
     config.heuristic_regression_margin = parse_number(argc, argv, first, "--heuristic-regression-margin", config.heuristic_regression_margin);
+    config.gates_agent = parse_string(argc, argv, first, "--gates-agent", config.gates_agent);
     config.fork_from = parse_string(argc, argv, first, "--fork-from", config.fork_from.string());
     config.dirty_diff_digest = parse_string(argc, argv, first, "--dirty-diff-digest",
                                             config.dirty_diff_digest);
@@ -3369,6 +4123,7 @@ Trainer::Trainer(TrainConfig config) : impl_(std::make_unique<Impl>(std::move(co
 Trainer::~Trainer() = default;
 void Trainer::run() { impl_->run(); }
 void Trainer::evaluate_only() { impl_->evaluate_only(); }
+void Trainer::gates() { impl_->gates(); }
 
 void print_native_help() {
     std::cout <<
@@ -3376,11 +4131,13 @@ void print_native_help() {
         "Usage:\n"
         "  bomber_alphazero_native train [options]\n"
         "  bomber_alphazero_native evaluate [options]\n"
+        "  bomber_alphazero_native gates [options]\n"
         "  bomber_alphazero_native benchmark [options]\n\n"
         "Key training options:\n"
         "  --run-dir PATH            Checkpoint/result directory\n"
         "  --checkpoint FILE         Checkpoint to load (default latest.pt)\n"
-        "  --output PATH             Write evaluation results as JSON\n"
+        "  --output PATH             Write evaluation results as JSON (gates: write the\n"
+        "                            tactical-gates evidence file - see below)\n"
         "  --per-match-output PATH   (evaluate --eval-mcts) Write one JSON line per\n"
         "                            completed MCTS-baseline match: seed, seat, outcome, cause,\n"
         "                            steps, WAIT - rows for paired/seat-delta descriptive\n"
@@ -3427,6 +4184,19 @@ void print_native_help() {
         "  --replay-incumbent FILE   (evaluate) Record/evaluate checkpoint-vs-checkpoint; with\n"
         "                            --incumbent-eval-games N>1, run a full N-game mirror-match\n"
         "                            with win-cause/WAIT behavior stats instead of just 1 replay\n"
+        "  gates: runs 6 pre-registered, deterministic tactical scenarios (bomb-and-escape,\n"
+        "         corridor-clear, trap, chase, flame-timing, stall-break) against the loaded\n"
+        "         checkpoint, twice each - search mode (BatchedMcts, noise off, greedy,\n"
+        "         --eval-simulations budget - the deployed decision procedure and the only\n"
+        "         mode pass/fail is scored on) and raw mode (unmasked policy-head argmax, no\n"
+        "         search - diagnostic only). Writes write-once JSON evidence via --output,\n"
+        "         same --overwrite-evidence/--legacy-accept-unverified-semantics rules as\n"
+        "         evaluate. Read-only: acquires the system lock, not a run-dir lock.\n"
+        "  --gates-agent NAME        (gates) Substitute a scripted Agent for the network\n"
+        "                            entirely - random, scripted, heuristic, greedy, enemy-bot,\n"
+        "                            external, alpha-beta, mcts, evasive - the achievability\n"
+        "                            reference proving a gate is solvable by something, not\n"
+        "                            just an aspirational target no policy could ever pass\n"
         "  --iterations N            Total iteration target (resume-safe)\n"
         "  --games N                 Concurrent self-play games\n"
         "  --simulations N           PUCT simulations per move\n"

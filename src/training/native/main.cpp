@@ -48,12 +48,16 @@ int main(int argc, char** argv) {
             bomber::az::benchmark_model(argc, argv, 2);
             return EXIT_SUCCESS;
         }
-        if (command == "train" || command == "evaluate") {
+        if (command == "train" || command == "evaluate" || command == "gates") {
             auto config = bomber::az::parse_train_config(argc, argv, 2);
-            config.evaluation_only = command == "evaluate";
+            /* gates is read-only like evaluate: same checkpoint-loading/manifest-inheritance
+               path, no run-dir lock (see the ProcessLock comment in trainer.cpp's Impl
+               constructor). */
+            config.evaluation_only = command == "evaluate" || command == "gates";
             bomber::az::Trainer trainer(std::move(config));
             if (command == "train") trainer.run();
-            else trainer.evaluate_only();
+            else if (command == "evaluate") trainer.evaluate_only();
+            else trainer.gates();
             return EXIT_SUCCESS;
         }
         std::cerr << "Unknown command: " << command << "\n\n";

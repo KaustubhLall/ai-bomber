@@ -229,6 +229,62 @@ if(TARGET bomber_alphazero_native)
       DEPENDS test_native_alphazero_trace_raw_evaluate TIMEOUT 20)
   endif()
 
+  # KL-105 Phase 2b: deterministic tactical gates. Reuses the same tiny fixture checkpoint as
+  # the semantic/trace tests above (native-alphazero-semantic-smoke) rather than training a
+  # dedicated one - gates is read-only and channel/blocks/max-steps must match that checkpoint's
+  # config_signature exactly to load it at all, same requirement the trace/semantic tests above
+  # already satisfy with this identical flag set.
+  add_test(NAME test_native_alphazero_gates_run
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> gates
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke
+      --checkpoint latest.pt
+      --channels 16 --blocks 1 --max-steps 8 --replay-capacity 128
+      --eval-simulations 8
+      --output ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke/gates-network-1.json
+      --overwrite-evidence --no-progress)
+  set_tests_properties(test_native_alphazero_gates_run PROPERTIES
+    DEPENDS test_native_alphazero_semantic_evaluate TIMEOUT 120)
+  # Run again to a second output path, same checkpoint/flags/seeds - the determinism check
+  # (test_native_alphazero_gates_check.py) diffs the two scenarios arrays byte-for-byte.
+  add_test(NAME test_native_alphazero_gates_rerun
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> gates
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke
+      --checkpoint latest.pt
+      --channels 16 --blocks 1 --max-steps 8 --replay-capacity 128
+      --eval-simulations 8
+      --output ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke/gates-network-2.json
+      --overwrite-evidence --no-progress)
+  set_tests_properties(test_native_alphazero_gates_rerun PROPERTIES
+    DEPENDS test_native_alphazero_gates_run TIMEOUT 120)
+  # Achievability reference: substitutes the heuristic agent for the network entirely. Proves
+  # the gates are solvable by something, not just an aspirational target no policy could ever
+  # pass. See test_native_alphazero_gates_check.py for exactly which scenarios are pinned and
+  # why (empirically determined - not all six; see that file's header comment).
+  add_test(NAME test_native_alphazero_gates_agent_run
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> gates
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke
+      --checkpoint latest.pt
+      --channels 16 --blocks 1 --max-steps 8 --replay-capacity 128
+      --eval-simulations 8 --gates-agent heuristic
+      --output ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke/gates-heuristic.json
+      --overwrite-evidence --no-progress)
+  set_tests_properties(test_native_alphazero_gates_agent_run PROPERTIES
+    DEPENDS test_native_alphazero_gates_rerun TIMEOUT 60)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME test_native_alphazero_gates_check
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_alphazero_gates_check.py
+        ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke)
+    set_tests_properties(test_native_alphazero_gates_check PROPERTIES
+      DEPENDS test_native_alphazero_gates_agent_run TIMEOUT 20)
+  endif()
+
   add_test(NAME test_native_alphazero_unknown_option_fails
     COMMAND ${CMAKE_COMMAND} -E env
       "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"

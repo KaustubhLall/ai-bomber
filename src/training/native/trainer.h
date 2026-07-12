@@ -42,6 +42,14 @@ struct TrainConfig {
        set replay_incumbent to instead record checkpoint-vs-checkpoint. */
     std::filesystem::path replay_output{};
     std::filesystem::path replay_incumbent{};
+    /* KL-105 Phase 2b: `gates` subcommand only. Empty (default) = the loaded checkpoint's
+       network (search mode + raw mode, both run and recorded). Non-empty = substitute a
+       scripted Agent (agent_parse_type name: random/scripted/heuristic/greedy/enemy-bot/
+       external/alpha-beta/mcts/evasive) for the learner entirely - the achievability
+       reference that proves a gate is solvable by *something*, not just an aspirational
+       target no policy could ever pass. CLI --gates-agent NAME. Reuses --output (write-once
+       evidence, same as evaluate) rather than a dedicated gates output flag. */
+    std::string gates_agent{};
     /* If > 0 and replay_incumbent is set, run a full N-game statistical mirror-match
        (checkpoint vs replay_incumbent, both seats, with the same win-cause/WAIT behavior
        instrumentation as the baseline evals) instead of just the single replay-recording
@@ -194,6 +202,7 @@ public:
 
     void run();
     void evaluate_only();
+    void gates();
 
 private:
     struct Impl;

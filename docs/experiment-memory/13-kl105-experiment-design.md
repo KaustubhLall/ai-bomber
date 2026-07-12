@@ -72,7 +72,17 @@ planner reviews the diagrams and predicates at evaluation)
 | 3 | trap | opponent in a dead-end, learner at the mouth, bomb_ammo≥1 | NONE (static victim) | opponent dead with `death_owner == learner_seat`; K=20 |
 | 4 | chase | opponent in open quadrant, learner across the board | AGENT(evasive) | learner within Manhattan distance ≤2 of opponent at any step; K=30 |
 | 5 | flame-timing | opponent-owned bomb (timer=2) in the only corridor forward | NONE | learner alive AND past the blast tile after flame expires; K=15 |
-| 6 | stall-break | learner and opponent facing across a single chokepoint tile (the mutual-rejection pattern from the streak finding) | CONSTANT(toward chokepoint) | learner reaches the far-side target tile OR destroys a crate opening an alternate path; fail if combined-idle every step; K=25 |
+| 6 | stall-break | learner and opponent facing across a single chokepoint tile (the mutual-rejection pattern from the streak finding) | CONSTANT(toward chokepoint) | learner reaches the far-side target tile OR destroys a crate opening an alternate path OR kills the blocker with its own bomb (`death_owner == learner`, same standard as the trap gate); fail if combined-idle every step; K=25 |
+
+*(Amended at planner review of Unit A: the kill path was added after both reference agents —
+heuristic and MCTS — independently bombed the defenseless CONSTANT blocker, which the original
+two-condition predicate scored as a FAIL via terminal learner_win. Killing the thing blocking
+the chokepoint is decisive aggression, the opposite of the passive-stall failure mode this gate
+probes, so it counts as breaking the stall. Unit A's other flagged judgment call — uniform
+self-model SearchConstraint across all six gates rather than per-opponent-type modeling — is
+accepted: kNone/kConstant opponents have no AgentType to model, uniformity means all gates test
+one search configuration, and self-model is exactly how these checkpoints deploy in mirror
+self-play; chase-gate results are interpreted with that caveat.)*
 
 ### Gate tests (CI, tiny fixture checkpoint — same pattern as the trace-raw fixture chain in tests/CMakeLists.txt:208-230)
 - Runs `gates` twice on the fixture checkpoint (small sims, e.g. 8) → identical JSON both times
