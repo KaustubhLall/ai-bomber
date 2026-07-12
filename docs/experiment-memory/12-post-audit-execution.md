@@ -132,3 +132,26 @@ evidence generation (Phase 1's clean-binary re-run) will use this freshly-reconf
 configure-time staleness caveat is documented in `trainer.h`. The optional CMake custom-target
 work (auto-refreshing the SHA at build time) was explicitly skipped as out of scope for this
 phase's acceptance bar - noted as a possible future improvement, not implemented.
+
+## Phase 0c: evidence archive (F5)
+
+Created `docs/experiment-memory/evidence/kl107-wait-diagnostic-2026-07-11/` (committed) with:
+
+- the three `*-agg.json` aggregate evaluation files (already write-once evidence per KL-101 -
+  embeds exact invocation argv, checkpoint/executable SHA-256, timestamp, git commit stamp,
+  resolved runtime semantics - copied verbatim, not regenerated);
+- `SHA256SUMS`, listing the three committed aggs, the three (uncommitted, local-only) trace
+  JSONLs, the three evaluated checkpoints, and both relevant binaries - the stale-stamped one
+  that actually produced this evidence and the corrected clean-HEAD one from Phase 0b, both
+  labeled clearly so neither is mistaken for the other;
+- `README.md`, restating the Phase 0a stats table for reference without needing the local trace
+  files, and explaining exactly why the raw traces themselves aren't committed (git-ignored
+  `results/` convention, multi-MB files) and how to regenerate them (each agg's own
+  `invocation_argv` field is the exact reproducing command).
+
+Per the user's decision #3 (evidence preservation: commit agg JSONs + SHA-256 manifest; raw
+traces stay local) - implemented exactly as specified, no raw trace JSONL committed.
+
+**Accept criteria met:** committed; manifest lists every artifact with a hash, and every
+committed artifact's producing argv is already embedded in the artifact itself (the agg JSON
+files were KL-101 write-once evidence to begin with).
