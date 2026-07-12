@@ -14,15 +14,21 @@
 param(
     [Parameter(Mandatory = $true)][ValidateSet("treatment", "control")][string]$Arm,
     [int]$Iteration = 154,
+    # The arms end at --iterations 154 with latest.pt as the only iteration-154 artifact
+    # (iteration_XXXXXX.pt snapshots land on the snapshot-interval grid: 140, 150). latest.pt
+    # IS the 154 checkpoint; every evidence file this script produces embeds
+    # checkpoint_iteration, which the post-run verification checks against -Iteration - a
+    # wrong checkpoint fails loudly there rather than silently evaluating the wrong weights.
+    [string]$Checkpoint = "latest.pt",
     [string]$OutDir = "results/kl105-arm-eval-2026-07-12"
 )
 . "$PSScriptRoot\_env.ps1"
 Use-Torch
 
 $runDir = "results/kl105-arm-$Arm-from-control03-130"
-$checkpoint = "iteration_{0:d6}.pt" -f $Iteration
+$checkpoint = $Checkpoint
 if (-not (Test-Path (Join-Path $runDir $checkpoint))) {
-    throw "$runDir/$checkpoint not found - has the arm reached iteration $Iteration?"
+    throw "$runDir/$checkpoint not found - has the arm finished training?"
 }
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 $tag = "$Arm-iter$Iteration"
