@@ -57,6 +57,13 @@ constexpr int kActions = BOMBER_TRAINING_ACTIONS;
 constexpr int kJointActions = kActions * kActions;
 constexpr int kObservationSize = BOMBER_TRAINING_OBSERVATION_SIZE;
 constexpr int kFormatVersion = 1;
+/* KL-105 Phase 3: bounds ReplayBuffer::batch()'s effective oversampling factor for pool-A
+   (bomb_win_side==1) samples. f = min(cap, kBoostMax * n_A / N) - even when pool A is a tiny
+   sliver of the buffer, no single pool-A sample is expected to be drawn more than kBoostMax
+   times per batch on average (max expected repeats per pool-A sample per batch =
+   f*batch/n_A <= kBoostMax*batch/N, independent of how small n_A actually is), so a handful of
+   early bomb kills cannot dominate the gradient before the pool has grown. */
+constexpr double kBoostMax = 16.0;
 
 std::atomic<bool> stop_requested{false};
 
@@ -301,10 +308,37 @@ private:
     bool previous_{};
 };
 
+/* KL-105 Phase 3: game-level outcome cause, the same taxonomy at every tagging site (mirror
+   collect_self_play, league collect_league_play) - "how the game ended", not "who won".
+   0=unknown/legacy (never classified - either a pre-KL-105 checkpoint's inherited samples, or
+   a collection path this experiment deliberately leaves untagged, e.g. collect_teacher's
+   imitation-learning bootstrap), 1=bomb (loser died to the OTHER side's bomb - a real tactical
+   kill), 2=selfkill (loser died to its own bomb), 3=arena_crush (loser died to the closing
+   sudden-death arena, death_owner==-1), 4=mutual_death (both dead, draw), 5=timeout_draw (ran
+   out the clock, at least one side alive, draw). */
+enum class OutcomeCause : uint8_t {
+    kUnknown = 0,
+    kBomb = 1,
+    kSelfkill = 2,
+    kArenaCrush = 3,
+    kMutualDeath = 4,
+    kTimeoutDraw = 5,
+};
+constexpr size_t kOutcomeCauseCount = 6;
+
 struct Sample {
     std::array<at::Half, kObservationSize> state{};
     std::array<float, kActions> policy{};
     float value{};
+    /* KL-105 Phase 3 sample tags (docs/experiment-memory/13-kl105-experiment-design.md section
+       3). Both default to 0 so a default-constructed or legacy-loaded Sample lands in the
+       "unknown"/not-pool-A bucket without any special-casing at the call sites. */
+    uint8_t outcome_cause{static_cast<uint8_t>(OutcomeCause::kUnknown)};
+    /* 1 iff outcome_cause==bomb AND this sample's seat is the WINNING seat of that bomb-decisive
+       game (ReplayBuffer::batch()'s pool A - see kBoostMax above). Loser-seat samples of a bomb
+       game get the cause tag but bomb_win_side stays 0: they show a death, not a demonstrated
+       kill, from that seat's perspective. */
+    uint8_t bomb_win_side{0};
 };
 
 class ReplayBuffer {
@@ -330,21 +364,56 @@ public:
         samples.clear();
     }
 
-    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> batch(
-            int requested, std::mt19937_64& rng) const {
+    /* cause_balance_cap<=0 (default) takes the FIRST branch below with pool_a left empty, which
+       is byte-for-byte the pre-KL-105 code: same std::uniform_int_distribution constructed the
+       same way, same choose(rng) call per row, nothing else touches rng - this is the "cap=0 is
+       exactly current behavior" contract the whole feature is gated on. Returns the realized
+       pool-A fraction of this batch (0.0 whenever the uniform path was taken) so callers can
+       report what the sampler actually did, not just what it was asked to do. */
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, double> batch(
+            int requested, std::mt19937_64& rng, double cause_balance_cap = 0.0) const {
         const int count = std::min<int>(requested, static_cast<int>(samples_.size()));
         std::vector<float> states(static_cast<size_t>(count) * kObservationSize);
         std::vector<float> policies(static_cast<size_t>(count) * kActions);
         std::vector<float> values(count);
-        std::uniform_int_distribution<size_t> choose(0, samples_.size() - 1);
-        for (int row = 0; row < count; ++row) {
-            const auto& sample = samples_[choose(rng)];
+        double realized_pool_a_fraction = 0.0;
+        /* One linear pass over uint8 tags per batch (~200k samples) is sub-millisecond; the
+           optimization phase this feeds is ~7.6s/iteration total (KL-105 design doc section 3),
+           so this scan is noise relative to a forward/backward pass - measured, not assumed. */
+        std::vector<size_t> pool_a;
+        if (cause_balance_cap > 0.0) {
+            pool_a.reserve(samples_.size());
+            for (size_t index = 0; index < samples_.size(); ++index)
+                if (samples_[index].bomb_win_side) pool_a.push_back(index);
+        }
+        int pool_a_draws = 0;
+        if (!pool_a.empty()) {
+            const double n_a = static_cast<double>(pool_a.size());
+            const double n = static_cast<double>(samples_.size());
+            const double fraction = std::min(cause_balance_cap, kBoostMax * n_a / n);
+            pool_a_draws = std::clamp(static_cast<int>(std::lround(fraction * count)), 0, count);
+        }
+        auto fill_row = [&](int row, const Sample& sample) {
             for (int cell = 0; cell < kObservationSize; ++cell)
                 states[static_cast<size_t>(row) * kObservationSize + cell] =
                     static_cast<float>(sample.state[cell]);
             std::copy(sample.policy.begin(), sample.policy.end(),
                       policies.begin() + static_cast<size_t>(row) * kActions);
             values[row] = sample.value;
+        };
+        if (pool_a_draws > 0) {
+            std::uniform_int_distribution<size_t> choose_pool_a(0, pool_a.size() - 1);
+            std::uniform_int_distribution<size_t> choose_any(0, samples_.size() - 1);
+            for (int row = 0; row < count; ++row) {
+                const size_t index = row < pool_a_draws ? pool_a[choose_pool_a(rng)]
+                                                         : choose_any(rng);
+                fill_row(row, samples_[index]);
+            }
+            realized_pool_a_fraction = static_cast<double>(pool_a_draws) /
+                                       static_cast<double>(count);
+        } else {
+            std::uniform_int_distribution<size_t> choose(0, samples_.size() - 1);
+            for (int row = 0; row < count; ++row) fill_row(row, samples_[choose(rng)]);
         }
         auto state_tensor = torch::from_blob(states.data(),
             {count, BOMBER_TRAINING_CHANNELS, BOMBER_TRAINING_VIEW_SIZE,
@@ -352,31 +421,61 @@ public:
         auto policy_tensor = torch::from_blob(policies.data(), {count, kActions},
                                                torch::kFloat32).clone();
         auto value_tensor = torch::from_blob(values.data(), {count}, torch::kFloat32).clone();
-        return {state_tensor, policy_tensor, value_tensor};
+        return {state_tensor, policy_tensor, value_tensor, realized_pool_a_fraction};
     }
 
-    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> tensors() const {
+    /* Per-cause sample counts (index = OutcomeCause value) plus the pool-A (bomb_win_side==1)
+       size, snapshotted on demand for metrics reporting - O(replay size) linear scan, called
+       once per iteration (append_metrics), not per batch. */
+    struct CausePools {
+        std::array<int64_t, kOutcomeCauseCount> cause_counts{};
+        int64_t bomb_win_side_pool{};
+    };
+    CausePools cause_pool_snapshot() const {
+        CausePools result;
+        for (const auto& sample : samples_) {
+            result.cause_counts[sample.outcome_cause]++;
+            if (sample.bomb_win_side) result.bomb_win_side_pool++;
+        }
+        return result;
+    }
+
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> tensors() const {
         const auto count = static_cast<int64_t>(samples_.size());
         auto states = torch::empty({count, BOMBER_TRAINING_CHANNELS,
                                     BOMBER_TRAINING_VIEW_SIZE,
                                     BOMBER_TRAINING_VIEW_SIZE}, torch::kFloat16);
         auto policies = torch::empty({count, kActions}, torch::kFloat32);
         auto values = torch::empty({count}, torch::kFloat32);
+        /* [count, 2] uint8: column 0 = outcome_cause, column 1 = bomb_win_side. Row-aligned
+           with states/policies/values by construction (same loop, same index). */
+        auto tags = torch::empty({count, 2}, torch::kUInt8);
         auto* state_data = states.data_ptr<at::Half>();
         auto* policy_data = policies.data_ptr<float>();
         auto* value_data = values.data_ptr<float>();
+        auto* tag_data = tags.data_ptr<uint8_t>();
         for (int64_t row = 0; row < count; ++row) {
             std::memcpy(state_data + row * kObservationSize, samples_[row].state.data(),
                         sizeof(at::Half) * kObservationSize);
             std::memcpy(policy_data + row * kActions, samples_[row].policy.data(),
                         sizeof(float) * kActions);
             value_data[row] = samples_[row].value;
+            tag_data[row * 2] = samples_[row].outcome_cause;
+            tag_data[row * 2 + 1] = samples_[row].bomb_win_side;
         }
-        return {states, policies, values};
+        return {states, policies, values, tags};
     }
 
+    /* `tags` may be an UNDEFINED tensor (torch::Tensor{}, .defined()==false): the caller passes
+       that when the checkpoint archive has no "replay_tags" key, which is every checkpoint
+       saved before KL-105 Phase 3. Every Sample in samples_ is freshly default-constructed by
+       resize() just above, so outcome_cause/bomb_win_side already read 0 (unknown/legacy) -
+       skipping the tag copy loop in that case is not a missing feature, it is the correct,
+       semantically faithful default: a legacy checkpoint was trained entirely under cap=0 (the
+       concept did not exist yet), so treating all of its samples as "not pool A" reproduces
+       exactly the sampling behavior it actually trained under, not a silent substitution. */
     void load(const torch::Tensor& states, const torch::Tensor& policies,
-              const torch::Tensor& values, size_t next) {
+              const torch::Tensor& values, const torch::Tensor& tags, size_t next) {
         auto state_cpu = states.to(torch::kCPU, torch::kFloat16).contiguous();
         auto policy_cpu = policies.to(torch::kCPU, torch::kFloat32).contiguous();
         auto value_cpu = values.to(torch::kCPU, torch::kFloat32).contiguous();
@@ -386,12 +485,29 @@ public:
         const auto* state_data = state_cpu.data_ptr<at::Half>();
         const auto* policy_data = policy_cpu.data_ptr<float>();
         const auto* value_data = value_cpu.data_ptr<float>();
+        const bool has_tags = tags.defined() &&
+            static_cast<size_t>(tags.size(0)) == state_cpu.size(0);
+        torch::Tensor tag_cpu;
+        const uint8_t* tag_data = nullptr;
+        if (has_tags) {
+            tag_cpu = tags.to(torch::kCPU, torch::kUInt8).contiguous();
+            tag_data = tag_cpu.data_ptr<uint8_t>();
+        }
         for (size_t row = 0; row < count; ++row) {
             std::memcpy(samples_[row].state.data(), state_data + row * kObservationSize,
                         sizeof(at::Half) * kObservationSize);
             std::memcpy(samples_[row].policy.data(), policy_data + row * kActions,
                         sizeof(float) * kActions);
             samples_[row].value = value_data[row];
+            if (tag_data == nullptr) continue;
+            /* Defensive clamp, not a trust boundary this project otherwise has (it's the
+               user's own checkpoint file): a foreign/corrupted tag byte outside the known
+               enum range must not become an out-of-bounds index into CausePools::cause_counts
+               later - fold anything unrecognized into kUnknown rather than propagate it. */
+            const uint8_t cause = tag_data[row * 2];
+            samples_[row].outcome_cause = cause < kOutcomeCauseCount ? cause
+                : static_cast<uint8_t>(OutcomeCause::kUnknown);
+            samples_[row].bomb_win_side = tag_data[row * 2 + 1] ? 1 : 0;
         }
         next_ = count == capacity_ ? next % capacity_ : 0;
     }
@@ -1051,7 +1167,8 @@ std::string runtime_config_signature(const TrainConfig& config) {
            << ";promotion_simulations=" << config.promotion_simulations
            << ";baseline_mcts_simulations=" << config.baseline_mcts_simulations
            << ";baseline_mcts_depth=" << config.baseline_mcts_depth
-           << ";seed=" << config.seed;
+           << ";seed=" << config.seed
+           << ";replay_cause_balance_cap=" << config.replay_cause_balance_cap;
     return output.str();
 }
 
@@ -1083,6 +1200,7 @@ const std::vector<std::pair<std::string, std::string>>& semantic_field_flags() {
         {"learning_rate_schedule_start_update", "--lr-schedule-start-update"},
         {"learning_rate_schedule_updates", "--lr-schedule-updates"},
         {"seed", "--seed"},
+        {"replay_cause_balance_cap", "--replay-cause-balance-cap"},
     };
     return fields;
 }
@@ -1107,7 +1225,8 @@ std::string semantic_manifest_string(const TrainConfig& config) {
            << ";learning_rate_schedule_start_update="
            << config.learning_rate_schedule_start_update
            << ";learning_rate_schedule_updates=" << config.learning_rate_schedule_updates
-           << ";seed=" << config.seed;
+           << ";seed=" << config.seed
+           << ";replay_cause_balance_cap=" << config.replay_cause_balance_cap;
     return output.str();
 }
 
@@ -1199,6 +1318,24 @@ std::vector<std::string> apply_semantic_manifest(TrainConfig& config,
     reconcile_int64("learning_rate_schedule_updates",
                     &TrainConfig::learning_rate_schedule_updates);
     reconcile_int("seed", &TrainConfig::seed);
+    /* KL-105 Phase 3: replay_cause_balance_cap did not exist before this manifest schema
+       addition, so a checkpoint saved earlier has a fully valid, modern (post-KL-101) manifest
+       string that simply lacks this one key - a different situation from "predates the whole
+       manifest" (legacy_accept_unverified_semantics, handled entirely separately and much
+       louder) and from every other field's absent-key case (which, for fields that have
+       existed since KL-101, would mean a corrupt/truncated manifest, not an expected event).
+       reconcile_double's generic absent-key handling already does the right thing behaviorally
+       (config.replay_cause_balance_cap is left at whatever CLI parsing already resolved -
+       0.0 unless explicitly overridden), but stays silent; this is exactly the field where
+       "absent" is the COMMON case for a long transition period (every checkpoint saved before
+       this change), so it gets its own one-line note instead of reconcile_double's silence -
+       inheriting 0.0 is faithful, not a substitution, because cap=0.0 is the only sampling
+       behavior that has ever existed for such a checkpoint. */
+    if (!stored.count("replay_cause_balance_cap"))
+        std::cerr << "NOTE - checkpoint manifest predates replay_cause_balance_cap (KL-105 "
+                     "Phase 3); inheriting the compiled default 0.0 (off), which is exactly "
+                     "the sampling behavior this checkpoint was trained under.\n";
+    reconcile_double("replay_cause_balance_cap", &TrainConfig::replay_cause_balance_cap);
     return forks;
 }
 
@@ -1285,7 +1422,7 @@ void validate_train_cli_options(int argc, char** argv, int first) {
         "--selfkill-win-value", "--league-heuristic-fraction", "--promotion-margin",
         "--promotion-confidence-z", "--random-score-floor", "--heuristic-score-floor",
         "--heuristic-regression-margin", "--fork-from", "--dirty-diff-digest",
-        "--gates-agent",
+        "--gates-agent", "--replay-cause-balance-cap",
     };
     static const std::set<std::string_view> flag_options = {
         "--fresh", "--no-progress", "--eval-mcts", "--overwrite-evidence",
@@ -1328,6 +1465,8 @@ void validate_config(const TrainConfig& config) {
         throw std::invalid_argument("arena crush / selfkill win values must lie in (0, 1]");
     if (config.league_heuristic_fraction < 0.0 || config.league_heuristic_fraction > 1.0)
         throw std::invalid_argument("league heuristic fraction must lie in [0, 1]");
+    if (config.replay_cause_balance_cap < 0.0 || config.replay_cause_balance_cap > 0.9)
+        throw std::invalid_argument("replay cause-balance cap must lie in [0, 0.9]");
     if (config.learning_rate <= 0.0 || config.min_learning_rate <= 0.0 ||
         config.min_learning_rate > config.learning_rate)
         throw std::invalid_argument("learning rates are invalid");
@@ -1880,6 +2019,12 @@ struct Trainer::Impl {
         double value_loss{};
         double entropy{};
         double learning_rate{};
+        /* KL-105 Phase 3: mean, over this iteration's train_steps batches, of the actual
+           pool-A (bomb_win_side==1) fraction ReplayBuffer::batch() drew - what the sampler
+           DID, not just what --replay-cause-balance-cap asked for. 0 whenever the cap is 0 or
+           pool A was empty for the whole iteration (the batch() cap<=0/empty-pool path always
+           reports 0.0). */
+        double realized_pool_a_batch_fraction{};
     };
 
     struct SelfPlayMetrics {
@@ -2034,6 +2179,7 @@ struct Trainer::Impl {
                << "  \"arena_crush_win_value\": " << config.arena_crush_win_value << ",\n"
                << "  \"selfkill_win_value\": " << config.selfkill_win_value << ",\n"
                << "  \"league_heuristic_fraction\": " << config.league_heuristic_fraction << ",\n"
+               << "  \"replay_cause_balance_cap\": " << config.replay_cause_balance_cap << ",\n"
                << "  \"evaluation_interval\": " << config.evaluation_interval << ",\n"
                << "  \"evaluation_games\": " << config.evaluation_games << ",\n"
                << "  \"evaluation_simulations\": " << config.evaluation_simulations << ",\n"
@@ -2196,24 +2342,48 @@ struct Trainer::Impl {
                     last_self_play.losses += game_outcome < 0;
                     last_self_play.draws += game_outcome == 0;
                     /* Classify HOW the game was decided, either seat, same convention as
-                       Evaluation's win_by_bomb/selfkill/crush. */
+                       Evaluation's win_by_bomb/selfkill/crush. KL-105 Phase 3: outcome_cause
+                       mirrors that same classification onto every sample of this game
+                       (game-level tag, both seats); bomb_winner_seat stays -1 unless the game
+                       was bomb-decisive, in which case only that seat's samples get
+                       bomb_win_side=1 below - the loser seat of a bomb game gets the cause tag
+                       but is not pool A. */
+                    auto outcome_cause = static_cast<uint8_t>(OutcomeCause::kTimeoutDraw);
+                    int bomb_winner_seat = -1;
                     if (game_outcome != 0) {
                         const int winner_seat = game_outcome > 0 ? 0 : 1;
                         const int loser_seat = 1 - winner_seat;
                         const int died_owner = game.env.state.death_owner[loser_seat];
-                        if (died_owner == loser_seat) last_self_play.win_by_selfkill++;
-                        else if (died_owner == winner_seat) last_self_play.win_by_bomb++;
-                        else last_self_play.win_by_crush++;
+                        if (died_owner == loser_seat) {
+                            last_self_play.win_by_selfkill++;
+                            outcome_cause = static_cast<uint8_t>(OutcomeCause::kSelfkill);
+                        } else if (died_owner == winner_seat) {
+                            last_self_play.win_by_bomb++;
+                            outcome_cause = static_cast<uint8_t>(OutcomeCause::kBomb);
+                            bomb_winner_seat = winner_seat;
+                        } else {
+                            last_self_play.win_by_crush++;
+                            outcome_cause = static_cast<uint8_t>(OutcomeCause::kArenaCrush);
+                        }
                     } else {
                         const bool seat0_alive = game.env.state.agents[0].alive != 0;
                         const bool seat1_alive = game.env.state.agents[1].alive != 0;
-                        if (!seat0_alive && !seat1_alive) last_self_play.draw_mutual_death++;
-                        else last_self_play.draw_timeout_alive++;
+                        if (!seat0_alive && !seat1_alive) {
+                            last_self_play.draw_mutual_death++;
+                            outcome_cause = static_cast<uint8_t>(OutcomeCause::kMutualDeath);
+                        } else {
+                            last_self_play.draw_timeout_alive++;
+                            outcome_cause = static_cast<uint8_t>(OutcomeCause::kTimeoutDraw);
+                        }
                     }
                     total_game_steps += game.env.state.step;
                     for (size_t sample_index = 0; sample_index < game.trajectory.size(); ++sample_index) {
+                        const int sample_seat = static_cast<int>(sample_index % 2);
                         game.trajectory[sample_index].value =
                             sample_index % 2 == 0 ? value_seat0 : value_seat1;
+                        game.trajectory[sample_index].outcome_cause = outcome_cause;
+                        game.trajectory[sample_index].bomb_win_side =
+                            bomb_winner_seat == sample_seat ? 1 : 0;
                         result.push_back(std::move(game.trajectory[sample_index]));
                     }
                     ++completed;
@@ -2332,24 +2502,53 @@ struct Trainer::Impl {
                     last_league_play.draws += game_outcome == 0;
                     const bool learner_alive = game.env.state.agents[learner_seat].alive != 0;
                     const bool opp_alive = game.env.state.agents[opponent_seat].alive != 0;
+                    /* KL-105 Phase 3: same cause taxonomy as the mirror site above - "how the
+                       game ended", not "who won" - so a learner LOSS to the opponent's bomb
+                       still classifies as kBomb (the enum tracks the decisive death, whichever
+                       seat it belongs to), just with bomb_win_side left 0 since the learner
+                       (the only seat this trajectory samples) was not the winner. The whole
+                       trajectory is the learner seat, so unlike the mirror site there is no
+                       per-sample seat split - one cause/bomb_win_side pair applies to every
+                       sample of this game. */
+                    auto outcome_cause = static_cast<uint8_t>(OutcomeCause::kTimeoutDraw);
+                    uint8_t bomb_win_side = 0;
                     if (game_outcome > 0) {
                         const int died_owner = game.env.state.death_owner[opponent_seat];
-                        if (died_owner == opponent_seat) last_league_play.win_by_selfkill++;
-                        else if (died_owner == learner_seat) last_league_play.win_by_bomb++;
-                        else last_league_play.win_by_crush++;
+                        if (died_owner == opponent_seat) {
+                            last_league_play.win_by_selfkill++;
+                            outcome_cause = static_cast<uint8_t>(OutcomeCause::kSelfkill);
+                        } else if (died_owner == learner_seat) {
+                            last_league_play.win_by_bomb++;
+                            outcome_cause = static_cast<uint8_t>(OutcomeCause::kBomb);
+                            bomb_win_side = 1;
+                        } else {
+                            last_league_play.win_by_crush++;
+                            outcome_cause = static_cast<uint8_t>(OutcomeCause::kArenaCrush);
+                        }
                     } else if (game_outcome < 0) {
                         const int died_owner = game.env.state.death_owner[learner_seat];
-                        if (died_owner == learner_seat) last_league_play.loss_by_selfkill++;
-                        else if (died_owner == opponent_seat) last_league_play.loss_by_bomb++;
-                        else last_league_play.loss_by_crush++;
+                        if (died_owner == learner_seat) {
+                            last_league_play.loss_by_selfkill++;
+                            outcome_cause = static_cast<uint8_t>(OutcomeCause::kSelfkill);
+                        } else if (died_owner == opponent_seat) {
+                            last_league_play.loss_by_bomb++;
+                            outcome_cause = static_cast<uint8_t>(OutcomeCause::kBomb);
+                        } else {
+                            last_league_play.loss_by_crush++;
+                            outcome_cause = static_cast<uint8_t>(OutcomeCause::kArenaCrush);
+                        }
                     } else if (!learner_alive && !opp_alive) {
                         last_league_play.draw_mutual_death++;
+                        outcome_cause = static_cast<uint8_t>(OutcomeCause::kMutualDeath);
                     } else {
                         last_league_play.draw_timeout_alive++;
+                        outcome_cause = static_cast<uint8_t>(OutcomeCause::kTimeoutDraw);
                     }
                     total_game_steps += game.env.state.step;
                     for (auto& s : game.trajectory) {
                         s.value = value;
+                        s.outcome_cause = outcome_cause;
+                        s.bomb_win_side = bomb_win_side;
                         result.push_back(std::move(s));
                     }
                     ++completed;
@@ -2389,8 +2588,9 @@ struct Trainer::Impl {
             const double rate = learning_rate();
             for (auto& group : optimizer.param_groups())
                 static_cast<torch::optim::AdamWOptions&>(group.options()).lr(rate);
-            auto [states_cpu, target_policy_cpu, target_value_cpu] =
-                replay.batch(config.batch_size, rng);
+            auto [states_cpu, target_policy_cpu, target_value_cpu, pool_a_fraction] =
+                replay.batch(config.batch_size, rng, config.replay_cause_balance_cap);
+            metrics.realized_pool_a_batch_fraction += pool_a_fraction;
             auto states = states_cpu.to(device);
             auto target_policy = target_policy_cpu.to(device);
             auto target_value = target_value_cpu.to(device);
@@ -2427,6 +2627,7 @@ struct Trainer::Impl {
             metrics.policy_loss /= steps_completed;
             metrics.value_loss /= steps_completed;
             metrics.entropy /= steps_completed;
+            metrics.realized_pool_a_batch_fraction /= steps_completed;
         }
         return metrics;
     }
@@ -3026,14 +3227,19 @@ struct Trainer::Impl {
         torch::serialize::OutputArchive optimizer_archive;
         optimizer.save(optimizer_archive);
         archive.write("optimizer", optimizer_archive);
-        torch::Tensor states, policies, values;
+        torch::Tensor states, policies, values, tags;
         {
             ScopedTimer timer(last_phase_timings.replay_serialization_seconds);
-            std::tie(states, policies, values) = replay.tensors();
+            std::tie(states, policies, values, tags) = replay.tensors();
         }
         archive.write("replay_states", states);
         archive.write("replay_policies", policies);
         archive.write("replay_values", values);
+        /* KL-105 Phase 3: new archive key, always written (even count=0 buffers serialize a
+           valid [0,2] tensor, never an undefined one) - old binaries that don't know this key
+           exists simply never call archive.read("replay_tags", ...), so its presence is inert
+           to them (the archive is a named key-value store, not a fixed positional format). */
+        archive.write("replay_tags", tags);
         archive.write("meta", torch::tensor({static_cast<int64_t>(kFormatVersion),
                                                static_cast<int64_t>(iteration), global_updates,
                                                static_cast<int64_t>(replay.next())},
@@ -3130,10 +3336,15 @@ struct Trainer::Impl {
         torch::serialize::InputArchive optimizer_archive;
         archive.read("optimizer", optimizer_archive);
         optimizer.load(optimizer_archive);
-        torch::Tensor states, policies, values, meta, stored_best, stored_rng;
+        torch::Tensor states, policies, values, meta, stored_best, stored_rng, tags;
         archive.read("replay_states", states);
         archive.read("replay_policies", policies);
         archive.read("replay_values", values);
+        /* KL-105 Phase 3: try_read, not read - every checkpoint saved before this change has
+           no "replay_tags" key at all. `tags` stays an undefined tensor in that case; see
+           ReplayBuffer::load()'s handling (defaults every sample's tags to 0/unknown, which is
+           semantically faithful for a checkpoint that trained entirely under cap=0). */
+        archive.try_read("replay_tags", tags);
         archive.read("meta", meta);
         archive.read("best_score", stored_best);
         archive.read("rng_state", stored_rng);
@@ -3143,7 +3354,7 @@ struct Trainer::Impl {
             throw std::runtime_error("unsupported native checkpoint format");
         iteration = static_cast<int>(meta_values[1]);
         global_updates = meta_values[2];
-        replay.load(states, policies, values, static_cast<size_t>(meta_values[3]));
+        replay.load(states, policies, values, tags, static_cast<size_t>(meta_values[3]));
         best_score = stored_best.to(torch::kCPU).item<double>();
         torch::Tensor selection_meta;
         if (archive.try_read("selection_meta", selection_meta)) {
@@ -3163,11 +3374,33 @@ struct Trainer::Impl {
                         double elapsed, size_t new_samples, bool promoted,
                         std::string_view promotion_reason) const {
         std::ofstream output(metrics_path, std::ios::app);
+        /* KL-105 Phase 3: snapshotted AFTER this iteration's replay.add(collected) (run()'s
+           call order is add() -> optimize() -> append_metrics()), so this row's pools include
+           this iteration's own new samples - "what the buffer looked like going into this
+           iteration's training", the same buffer state optimize()'s batches were actually
+           drawn from. Persistence note for round-trip checks: a resumed run's FIRST row is
+           therefore >= the prior run's LAST row (loaded buffer plus one more iteration's
+           samples), never a reset to zero, as long as replay_capacity has not evicted anything
+           in between. */
+        const auto cause_pools = replay.cause_pool_snapshot();
         output << std::setprecision(9)
                << "{\"schema_version\":2,\"iteration\":" << iteration
                << ",\"global_updates\":" << global_updates
                << ",\"replay_size\":" << replay.size()
                << ",\"new_samples\":" << new_samples
+               << ",\"replay_cause_pools\":{\"unknown\":"
+               << cause_pools.cause_counts[static_cast<uint8_t>(OutcomeCause::kUnknown)]
+               << ",\"bomb\":"
+               << cause_pools.cause_counts[static_cast<uint8_t>(OutcomeCause::kBomb)]
+               << ",\"selfkill\":"
+               << cause_pools.cause_counts[static_cast<uint8_t>(OutcomeCause::kSelfkill)]
+               << ",\"arena_crush\":"
+               << cause_pools.cause_counts[static_cast<uint8_t>(OutcomeCause::kArenaCrush)]
+               << ",\"mutual_death\":"
+               << cause_pools.cause_counts[static_cast<uint8_t>(OutcomeCause::kMutualDeath)]
+               << ",\"timeout_draw\":"
+               << cause_pools.cause_counts[static_cast<uint8_t>(OutcomeCause::kTimeoutDraw)]
+               << ",\"bomb_win_side_pool\":" << cause_pools.bomb_win_side_pool << '}'
                << ",\"elapsed_seconds\":" << elapsed
                << ",\"self_play\":{\"wins\":" << last_self_play.wins
                << ",\"draws\":" << last_self_play.draws
@@ -3177,7 +3410,9 @@ struct Trainer::Impl {
                << ",\"policy_loss\":" << optimization.policy_loss
                << ",\"value_loss\":" << optimization.value_loss
                << ",\"entropy\":" << optimization.entropy
-               << ",\"learning_rate\":" << optimization.learning_rate << '}'
+               << ",\"learning_rate\":" << optimization.learning_rate
+               << ",\"realized_pool_a_batch_fraction\":"
+               << optimization.realized_pool_a_batch_fraction << '}'
                /* KL-101 Part E: this iteration's phase timings (all 7 phases KL-101/KL-102
                   ask for) - the "same-machine/same-config baseline" KL-102's throughput work
                   needs as its own first step, captured here instead of duplicated there. */
@@ -3631,6 +3866,7 @@ struct Trainer::Impl {
                    << ", \"arena_crush_win_value\": " << config.arena_crush_win_value
                    << ", \"selfkill_win_value\": " << config.selfkill_win_value
                    << ", \"league_heuristic_fraction\": " << config.league_heuristic_fraction
+                   << ", \"replay_cause_balance_cap\": " << config.replay_cause_balance_cap
                    << ", \"c_puct\": " << config.c_puct
                    << ", \"learning_rate_schedule_updates\": ";
             if (loaded_legacy_checkpoint && config.learning_rate_schedule_updates <= 0)
@@ -4094,6 +4330,8 @@ TrainConfig parse_train_config(int argc, char** argv, int first) {
     config.selfkill_win_value = parse_number(argc, argv, first, "--selfkill-win-value", config.selfkill_win_value);
     config.league_heuristic_fraction = parse_number(argc, argv, first, "--league-heuristic-fraction",
                                                      config.league_heuristic_fraction);
+    config.replay_cause_balance_cap = parse_number(argc, argv, first, "--replay-cause-balance-cap",
+                                                    config.replay_cause_balance_cap);
     config.promotion_margin = parse_number(argc, argv, first, "--promotion-margin", config.promotion_margin);
     config.promotion_confidence_z = parse_number(argc, argv, first, "--promotion-confidence-z", config.promotion_confidence_z);
     config.random_score_floor = parse_number(argc, argv, first, "--random-score-floor", config.random_score_floor);
@@ -4165,6 +4403,11 @@ void print_native_help() {
         "                            played vs the heuristic agent instead of a network mirror;\n"
         "                            mirrors structurally suppress clean kills (both seats share\n"
         "                            dodge skill) - a non-mirror opponent creates reachable ones\n"
+        "  --replay-cause-balance-cap X  Bias training batches toward bomb-kill winning-side\n"
+        "                            replay samples (in [0,0.9], default 0 = off = current\n"
+        "                            uniform sampling, bit-for-bit); tagging always runs, only\n"
+        "                            the sampler bias is gated by this cap - see docs/\n"
+        "                            experiment-memory/13-kl105-experiment-design.md section 3\n"
         "  --legacy-accept-unverified-semantics\n"
         "                            Required to resume/evaluate a checkpoint saved before the\n"
         "                            semantic manifest (KL-101) - its trained reward/mechanics/\n"

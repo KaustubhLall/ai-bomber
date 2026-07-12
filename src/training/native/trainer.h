@@ -132,6 +132,18 @@ struct TrainConfig {
        corrected reward to reinforce. 0 (default) = pure self-play, unchanged behavior. CLI
        --league-heuristic-fraction. */
     double league_heuristic_fraction{0.0};
+    /* KL-105 Phase 3 (docs/experiment-memory/13-kl105-experiment-design.md section 3): every
+       replay sample is tagged at collection with the finished game's outcome cause and whether
+       the sample's seat was the bomb-kill WINNING side (see Sample::outcome_cause/bomb_win_side
+       in trainer.cpp). This cap biases training batches toward that winning-side pool, capped
+       both by this fraction of the batch and by ReplayBuffer's kBoostMax oversampling bound.
+       0 (default) = off = the pre-KL-105 uniform sampler, bit-for-bit unchanged (tagging still
+       happens - tags are inert bookkeeping until cap>0 makes the sampler read them). A SEMANTIC
+       field (persisted/inherited/logged as a fork exactly like arena_crush_win_value) because
+       it changes what the trained weights actually saw reinforced during optimization, not
+       just a search/eval budget. Must lie in [0, 0.9] - see kBoostMax in trainer.cpp for why
+       the cap itself is bounded well under 1.0. CLI --replay-cause-balance-cap. */
+    double replay_cause_balance_cap{0.0};
     double promotion_margin{0.0};
     double promotion_confidence_z{1.6448536269514722};
     double random_score_floor{0.95};

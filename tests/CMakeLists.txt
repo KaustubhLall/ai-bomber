@@ -416,6 +416,121 @@ if(TARGET bomber_alphazero_native)
       DEPENDS test_native_alphazero_fork_check RUN_SERIAL TRUE TIMEOUT 30)
   endif()
 
+  # KL-105 Phase 3 (docs/experiment-memory/13-kl105-experiment-design.md section 3): capped
+  # cause-balanced replay sampling. cap=0 (the default, exercised by every test above this
+  # block) must stay bit-for-bit the pre-existing uniform sampler; these tests exercise cap>0.
+  add_test(NAME test_native_alphazero_cause_balance_fresh
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-cause-balance-smoke
+      --fresh --iterations 2 --games 2 --simulations 2
+      --train-steps 4 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 100 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress
+      --replay-cause-balance-cap 0.25)
+  set_tests_properties(test_native_alphazero_cause_balance_fresh PROPERTIES TIMEOUT 60)
+  # Resume with NO --replay-cause-balance-cap override - inherited from the manifest (0.25, not
+  # the compiled default 0) exactly like any other semantic field on an ordinary resume.
+  add_test(NAME test_native_alphazero_cause_balance_resume
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-cause-balance-smoke
+      --iterations 3 --games 2 --simulations 2
+      --train-steps 4 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 100 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress)
+  set_tests_properties(test_native_alphazero_cause_balance_resume PROPERTIES
+    DEPENDS test_native_alphazero_cause_balance_fresh TIMEOUT 60)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME test_native_alphazero_cause_balance_check
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_alphazero_cause_balance_check.py
+        ${CMAKE_BINARY_DIR}/native-alphazero-cause-balance-smoke)
+    set_tests_properties(test_native_alphazero_cause_balance_check PROPERTIES
+      DEPENDS test_native_alphazero_cause_balance_resume TIMEOUT 20)
+  endif()
+
+  # Fork from the shared semantic-smoke fixture (built earlier in this same suite; its cap is
+  # left at the compiled default 0, explicitly present in its manifest since it was built by
+  # THIS binary) with an explicit cap override - exercises the normal semantic-fork path
+  # (present key, value differs) end to end. Do NOT resume/mutate the shared fixture in place -
+  # other tests above depend on it; --fork-from only reads it (load_checkpoint), never writes.
+  # The parent finished at iteration 1 (--iterations 1 from iteration 0), so --iterations 2
+  # here is exactly one new iteration, not zero - fork inherits the parent's iteration counter,
+  # it does not reset to 0 (see fork_child's identical "iterations = parent + 1" pattern above).
+  add_test(NAME test_native_alphazero_cause_balance_fork_legacy
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-cause-balance-fork-legacy
+      --fresh --fork-from ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke/latest.pt
+      --iterations 2 --games 2 --simulations 2
+      --train-steps 1 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 100 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress
+      --replay-cause-balance-cap 0.25)
+  set_tests_properties(test_native_alphazero_cause_balance_fork_legacy PROPERTIES
+    DEPENDS test_native_alphazero_semantic_evaluate TIMEOUT 60)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME test_native_alphazero_cause_balance_fork_legacy_check
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_alphazero_cause_balance_fork_legacy_check.py
+        ${CMAKE_BINARY_DIR}/native-alphazero-cause-balance-fork-legacy)
+    set_tests_properties(test_native_alphazero_cause_balance_fork_legacy_check PROPERTIES
+      DEPENDS test_native_alphazero_cause_balance_fork_legacy TIMEOUT 20)
+  endif()
+
+  # Fork from a checkpoint SNAPSHOTTED before this feature existed (tests/fixtures/native-
+  # alphazero-pre-cause-tag-checkpoint.pt - byte-for-byte the semantic-smoke fixture as it
+  # existed at git commit 58f688bd4f9b, one commit before this feature's own work started, so
+  # its archive genuinely has no "replay_tags" key and its semantic manifest genuinely has no
+  # "replay_cause_balance_cap" key - unlike the shared semantic-smoke fixture above, which is
+  # rebuilt fresh by the CURRENT binary every suite run and therefore always has both). Proves
+  # the actual missing-key load path (load_checkpoint()/ReplayBuffer::load() default every
+  # inherited sample's tags to 0/unknown, no error, no crash), not just the "key present but 0"
+  # path the fork_legacy test above exercises. Same "parent iteration 1 -> --iterations 2 for
+  # exactly one new iteration" accounting as above (identical parent checkpoint, copied before
+  # any KL-105 Phase 3 code existed).
+  add_test(NAME test_native_alphazero_cause_balance_true_legacy_fork
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-cause-balance-true-legacy
+      --fresh --fork-from ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/native-alphazero-pre-cause-tag-checkpoint.pt
+      --iterations 2 --games 2 --simulations 2
+      --train-steps 1 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 100 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress
+      --replay-cause-balance-cap 0.25)
+  set_tests_properties(test_native_alphazero_cause_balance_true_legacy_fork PROPERTIES
+    TIMEOUT 60)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME test_native_alphazero_cause_balance_true_legacy_check
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_alphazero_cause_balance_true_legacy_check.py
+        ${CMAKE_BINARY_DIR}/native-alphazero-cause-balance-true-legacy)
+    set_tests_properties(test_native_alphazero_cause_balance_true_legacy_check PROPERTIES
+      DEPENDS test_native_alphazero_cause_balance_true_legacy_fork TIMEOUT 20)
+  endif()
+
   # KL-101 Part D regression: a second `train` process must be refused while a first is still
   # running, even on a different run-dir - the actual failure mode that crashed training twice
   # earlier in this project's history. Self-contained (manages its own background process),
