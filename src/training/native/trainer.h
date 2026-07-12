@@ -176,6 +176,19 @@ struct TrainConfig {
        (apply_semantic_manifest), and any explicit CLI override at fork time is captured as
        the fork's own config diff, not silently applied. CLI --fork-from PATH. */
     std::filesystem::path fork_from{};
+    /* Only meaningful with --fresh --fork-from (fails closed otherwise): instead of inheriting
+       the parent's champion artifact/lineage, the child's champion history starts at its own
+       fork point - best_iteration = the fork iteration, best.pt = a freshly-saved checkpoint
+       of the just-loaded fork-point weights (self-consistent by construction: artifact
+       iteration == best_iteration, so this is NOT the historical relabel-current-weights-as-
+       an-older-champion bug), best_score/promotion_count reset to 0. Exists for forking a
+       parent whose OWN champion state is historically inconsistent (pre-KL-101 corruption
+       that inherit_champion_artifact correctly refuses) without mutating the parent's run
+       dir, which is retained evidence. Champion state never feeds collection/optimization in
+       this trainer - it only gates promotion telemetry - so a reset is behaviorally inert for
+       training and identical across arms that share it. Recorded as "champion_reset": true in
+       fork-manifest.json. CLI --fork-reset-champion. */
+    bool fork_reset_champion{false};
     /* Optional, opaque to the trainer: a working-tree "dirty diff" digest computed by the
        CALLING script (e.g. `git diff | sha256`) and recorded verbatim in fork-manifest.json.
        The trainer does not shell out to git itself (fragile - needs git on PATH, assumes a

@@ -1426,7 +1426,7 @@ void validate_train_cli_options(int argc, char** argv, int first) {
     };
     static const std::set<std::string_view> flag_options = {
         "--fresh", "--no-progress", "--eval-mcts", "--overwrite-evidence",
-        "--legacy-accept-unverified-semantics",
+        "--legacy-accept-unverified-semantics", "--fork-reset-champion",
     };
     for (int index = first; index < argc; ++index) {
         const std::string_view option(argv[index]);
@@ -1477,6 +1477,11 @@ void validate_config(const TrainConfig& config) {
         throw std::invalid_argument(
             "--fork-from requires --fresh (a fork establishes a new lineage/run-dir, "
             "it is not an ordinary resume)");
+    if (config.fork_reset_champion && config.fork_from.empty())
+        throw std::invalid_argument(
+            "--fork-reset-champion is only meaningful at fork time (--fresh --fork-from); "
+            "on a resume it would mean rewriting an existing lineage's champion history, "
+            "which is exactly what the champion-consistency checks exist to prevent");
     if (config.promotion_margin < 0.0 || config.promotion_margin >= 0.5 ||
         config.promotion_confidence_z < 0.0 || config.random_score_floor < 0.0 ||
         config.random_score_floor > 1.0 || config.heuristic_score_floor < 0.0 ||
@@ -1972,7 +1977,8 @@ struct Trainer::Impl {
                 static_cast<int64_t>(config.iterations) * config.train_steps, 1);
         }
         if (forked) {
-            inherit_champion_artifact(config.fork_from);
+            if (config.fork_reset_champion) reset_champion_to_fork_point();
+            else inherit_champion_artifact(config.fork_from);
             write_fork_manifest();
         } else if (!config.evaluation_only) {
             reconcile_or_restore_champion(requested_checkpoint_path);
@@ -2119,6 +2125,8 @@ struct Trainer::Impl {
                << "  \"dirty_diff_digest\": \""
                << json_escape(config.dirty_diff_digest) << "\",\n"
                << "  \"seed\": " << config.seed << ",\n"
+               << "  \"champion_reset\": " << (config.fork_reset_champion ? "true" : "false")
+               << ",\n"
                << "  \"inherited_champion_lineage\": {\"best_iteration\": " << best_iteration
                << ", \"best_score\": " << best_score
                << ", \"promotion_count\": " << promotion_count << "},\n"
@@ -3167,6 +3175,27 @@ struct Trainer::Impl {
         std::cout << "Inherited exact champion artifact " << candidate.string()
                   << " (iteration " << best_iteration << ") into " << best_path.string()
                   << '\n';
+    }
+
+    /* --fork-reset-champion: the child's champion history starts at its own fork point rather
+       than inheriting the parent's. best.pt is a FRESHLY-SAVED checkpoint of the just-loaded
+       fork-point weights with best_iteration set to the current iteration first - NOT a file
+       copy of the parent checkpoint, whose embedded selection_meta still carries the parent's
+       (possibly historically inconsistent) champion claims and would fail this lineage's own
+       later reconcile_or_restore_champion checks. Self-consistent by construction (artifact
+       iteration == best_iteration == the fork iteration), so this is the honest statement
+       "this lineage's champion so far is its starting point," not the relabel-current-weights-
+       as-an-older-champion bug the consistency checks exist to catch. */
+    void reset_champion_to_fork_point() {
+        best_iteration = iteration;
+        best_score = 0.0;
+        promotion_count = 0;
+        save_checkpoint(best_path);
+        inherited_champion_source.clear();
+        std::cout << "Champion lineage RESET at fork (--fork-reset-champion): best.pt = the "
+                     "fork-point weights at iteration " << iteration
+                  << ", best_score/promotion_count start at 0 - the parent's champion history "
+                     "was deliberately not inherited\n";
     }
 
     void reconcile_or_restore_champion(const std::filesystem::path& loaded_checkpoint) {
@@ -4342,6 +4371,7 @@ TrainConfig parse_train_config(int argc, char** argv, int first) {
     config.dirty_diff_digest = parse_string(argc, argv, first, "--dirty-diff-digest",
                                             config.dirty_diff_digest);
     config.fresh = has_flag(argc, argv, first, "--fresh");
+    config.fork_reset_champion = has_flag(argc, argv, first, "--fork-reset-champion");
     config.progress = !has_flag(argc, argv, first, "--no-progress");
     config.evaluate_mcts = has_flag(argc, argv, first, "--eval-mcts");
     config.overwrite_evidence = has_flag(argc, argv, first, "--overwrite-evidence");
@@ -4419,6 +4449,11 @@ void print_native_help() {
         "                            and record full provenance to fork-manifest.json - the\n"
         "                            explicit, verified alternative to copying a .pt file into\n"
         "                            a new run-dir by hand\n"
+        "  --fork-reset-champion     (train --fresh --fork-from) Start the child's champion\n"
+        "                            history at its own fork point instead of inheriting the\n"
+        "                            parent's - for forking a parent whose champion state is\n"
+        "                            historically inconsistent (fails closed otherwise);\n"
+        "                            recorded as champion_reset in fork-manifest.json\n"
         "  --dirty-diff-digest STR   Opaque working-tree diff digest (e.g. `git diff | sha256`,\n"
         "                            computed by the calling script) recorded verbatim in\n"
         "                            fork-manifest.json alongside the compiled-in git commit\n"

@@ -685,3 +685,29 @@ advisor). Everything below was verified before launch, not assumed:
   both arms' metrics.jsonl, manifest/fork-log diff showing exactly one differing semantic
   field between arms, same executable SHA-256 in both run dirs' evidence, pool-A/realized-
   fraction telemetry live in the treatment arm's metrics from iteration 131 onward.
+
+## Launch attempt 1 failed closed — KL-101's fork validation caught real pre-fix corruption in the wild
+
+The first treatment bootstrap was rejected: `fatal: parent champion artifact does not match
+inherited best_iteration=10 (artifact iteration=102, lineage=10)`. Diagnosis: control03's own
+`best.pt` is v6-league's iteration-102 weights relabeled as its iteration-10 champion — the
+exact pre-d6eeb4e relabeling bug, sitting in the historical parent's run dir all along, and the
+new fail-closed fork validation (KL-101 Part C / d6eeb4e) correctly refused to inherit it. The
+two overrides otherwise behaved exactly as the gate predicted (SEMANTIC FORK line for
+`learning_rate_schedule_updates: 13184 -> 33280`; the faithful-inheritance NOTE for the
+pre-Phase-3 manifest lacking `replay_cause_balance_cap`).
+
+**Resolution — `--fork-reset-champion` (planner-implemented, not a bypass):** an explicit,
+fork-only option where the child's champion history starts at its own fork point: `best.pt` is
+a FRESHLY-SAVED checkpoint of the just-loaded fork-point weights with `best_iteration` set to
+the fork iteration first (self-consistent by construction — deliberately NOT a file copy of
+the parent checkpoint, whose embedded selection metadata still carries the inconsistent
+champion claims and would fail the child's own later reconcile checks), score/promotions
+zeroed, `"champion_reset": true` recorded in fork-manifest.json. The parent's run dir — 
+retained evidence — is not touched. Champion state never feeds collection/optimization in this
+trainer (it only gates promotion telemetry), and both arms get the identical reset, so this is
+behaviorally inert for the comparison. Fails closed outside `--fresh --fork-from`.
+`test_native_alphazero_corrupt_best_check` extended to cover the full lattice: corrupt resume
+rejected, corrupt-parent fork rejected (the exact production failure), reset fork succeeds
+with a self-consistent lineage, and the reset fork's own subsequent resume stays healthy.
+54/54 green.

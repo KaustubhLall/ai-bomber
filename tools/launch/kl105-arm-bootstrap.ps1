@@ -38,6 +38,13 @@ if ((Test-Path -LiteralPath $runDir) -and
 $trainerArgs = @(
     "--run-dir", $runDir,
     "--fresh", "--fork-from", $parentCheckpoint,
+    # control03's own best.pt is historically inconsistent (v6-league iteration-102 weights
+    # relabeled as its iteration-10 champion - the pre-KL-101 bug, caught in the wild by the
+    # fork validation when the first bootstrap attempt failed closed). The arms deliberately
+    # start their champion history at their own fork point instead of inheriting or repairing
+    # the parent's (its run dir is retained evidence, not to be mutated). Champion state never
+    # feeds training in this trainer, and both arms get the identical reset.
+    "--fork-reset-champion",
     "--iterations", "131",
     "--width", "13", "--height", "11", "--max-steps", "200", "--crate-density", "50",
     "--flame-duration", "2", "--sudden-death-start", "120", "--shrink-interval", "4",
