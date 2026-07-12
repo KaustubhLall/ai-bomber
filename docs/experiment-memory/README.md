@@ -27,6 +27,7 @@ the relevant file and bump its "Last updated" line.
 | [07-grokking-campaign.md](07-grokking-campaign.md) | **Active (KL-96):** the draw-collapse diagnosis, sim-fidelity gaps, and the intervention plan to reach superhuman. |
 | [08-sim-fidelity-audit.md](08-sim-fidelity-audit.md) | Findings from the multi-agent audit of the C sim vs canonical Bomberman (fidelity gaps + bugs + fixes). |
 | [10-autonomous-brick-execution.md](10-autonomous-brick-execution.md) | **Active:** narrative log of the ~10-hour autonomous KL-101–KL-109 brick execution — every judgment call and assumption made without asking, for morning review. |
+| [11-kl107-v3-audit-review.md](11-kl107-v3-audit-review.md) | **Start here for the latest audit:** meticulous review doc for everything since correction commit `d6eeb4e` — KL-107 v3 raw-trace code, verification performed, the systematic WAIT-diagnostic pass, and every judgment call made without asking, flagged for review. |
 
 ## One-line status
 
