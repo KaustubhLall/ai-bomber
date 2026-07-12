@@ -29,6 +29,7 @@ the relevant file and bump its "Last updated" line.
 | [10-autonomous-brick-execution.md](10-autonomous-brick-execution.md) | **Active:** narrative log of the ~10-hour autonomous KL-101–KL-109 brick execution — every judgment call and assumption made without asking, for morning review. |
 | [11-kl107-v3-audit-review.md](11-kl107-v3-audit-review.md) | Meticulous review doc for everything since correction commit `d6eeb4e` — KL-107 v3 raw-trace code, verification performed, the systematic WAIT-diagnostic pass, and every judgment call made without asking, flagged for review. |
 | [12-post-audit-execution.md](12-post-audit-execution.md) | **Active:** narrative log of the phased post-audit plan (Phase 0 audit remediation → Phase 1 KL-107 completion → Phase 2 KL-105 design → Phase 3 first bounded intervention), including advisor-checkpoint outcomes per the plan's protocol. |
+| [13-kl105-experiment-design.md](13-kl105-experiment-design.md) | **Active:** KL-105 experiment design + orchestrator handoff — the six tactical gates, the capped cause-balanced replay intervention, arm definitions with the explicit schedule override, and DRAFT success criteria (frozen at the launch gate). |
 
 ## One-line status
 
