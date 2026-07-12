@@ -564,3 +564,24 @@ inspectable, and surfacing two candidate hypotheses (search-overrides cluster ne
 moments; raw value head can lag search's own danger detection by at least one step) that a
 designed experiment, not three cherry-picked-for-legibility examples, would be needed to actually
 test.
+
+---
+
+## Phase 1 complete — summary and handoff to the Phase 2 gate
+
+Phase 1 (1a v4 trace fields, 1b clean-binary re-run + effective-idle table, 1c representative
+writeups, 1d overhead benchmark, 1e Linear hygiene) is done. KL-107 and KL-105 updated in Linear
+with the full detail; this doc has the complete narrative including two self-caught mistakes
+(the Phase 1b provenance stamp issue, fixed before any evidence was archived) and their fixes.
+Every commit in this phase is pushed to `polish/viz-and-policy-clarity`
+(`57f48dc`..`b6b8f5f`, plus the Linear-only updates that don't have a corresponding commit).
+
+**The plan's checkpoint 3 now applies: Phase 2 design review (the KL-105 design doc +
+tactical-gate mechanism) requires either advisor sign-off or a direct user check-in before any
+of it starts** - the plan's own fallback clause is explicit that this specific checkpoint hard-
+stops when advisor is unavailable, unlike checkpoints 1/2/6 which may proceed on documented
+self-review. Advisor was attempted once at the start of this session's work (session-start
+checkpoint 1) and errored, matching the prior session's identical experience - two independent
+sessions now, both unable to reach it. Per the plan: **stopping here, surfacing this to the user
+directly, not proceeding into Phase 2 on my own judgment.** No code changes, design decisions, or
+further Linear updates for KL-105's design are planned until that happens.
