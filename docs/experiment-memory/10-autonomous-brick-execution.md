@@ -720,3 +720,56 @@ and a legacy evaluation smoke proving `checkpoint_semantics_verified=false` with
 unknown LR horizon serialized as `null`. The historical generic
 `crush01/gate-eval-iter130.json` remains invalid
 legacy evidence; use the later semantics-resolved result and do not cite the old file.
+
+## KL-107 v3, 2026-07-11 (later same session, after direct user review and correction)
+
+Following the correction above, picked the next step directly from this doc's own
+"Recommended next" line rather than jumping to KL-105: finish genuine (pre-mask)
+KL-107 tracing on existing checkpoints before choosing a curriculum experiment from
+it. No training/evaluation GPU launch was authorized for this increment (the user
+had explicitly declined a re-run) - this work reads existing checkpoints only,
+read-only, and is reversible/test-covered like the rest of tonight's code changes.
+
+Added `policy_head_raw_recomputed`/`value_head_raw_recomputed` (a genuinely unmasked
+policy/value head evaluation, via a dedicated single-position forward pass on the
+untouched pre-step root position - `expand_and_backup` masks every node it expands,
+root or interior alike, so there was no existing hook inside the search itself to
+recover the pre-mask values), `safe_action_mask`/`safe_action_count` (refactored out
+of `expand_and_backup` into a shared helper so the trace mask can't silently drift
+from what the search actually enforced), `wait_forced` (idling forced by the mask
+vs genuinely chosen with alternatives available), and `search_root_q_values`
+(per-action root Q, reusing the existing seat-aware `marginal_distribution` helper
+rather than hand-rolling the seat-dependent joint-index layout that trips up a naive
+implementation). `trace_format_version` 2→3.
+
+**Verified faithful, not just asserted:** recomputing outside the search only proves
+useful if it actually reproduces what the search's own root evaluation saw. Cross-
+checked the recomputed raw policy (masked and renormalized with the same
+`safe_action_mask`) against the search's own `policy_prior_after_safety_mask` across
+a real trace run (crush01 iteration 130 vs MCTS-256, 492 steps): max divergence
+0.0072, mean 0.0011 - consistent with BF16/CUDA batched-vs-single-position
+tolerance, not a bug. Regression test asserts this stays under 0.05.
+
+**The new regression test checks properties, not well-formedness** - deliberately,
+because a well-formedness-only test (arrays are the right length, distributions sum
+to 1) would have passed on the original v1 mislabeled data too. It asserts the raw
+policy retains real nonzero mass on masked-out actions specifically (proving it
+isn't secretly derived from the masked prior again - checked on a small fixture and
+confirmed 60/60, then 48/48, traced rows all show this), and that `wait_forced`
+never fires with more than one safe action.
+
+**First real finding, small-sample and not yet load-bearing:** on the same 492-step
+crush01-vs-MCTS trace, only 2 steps (0.4%) had `wait_forced=true`; 318 steps (64.6%)
+chose WAIT with real alternatives available. Consistent with, but not yet a
+statistical confirmation of, the earlier masked-prior-vs-search finding - most
+idling looks like a genuine preference, not an environment-forced artifact. Worth a
+systematic pass (not a spot-check on one checkpoint) before this becomes load-
+bearing for a KL-105 decision.
+
+`tools/analyze_neural_trace.py` updated to report the new fields (raw-vs-masked
+argmax agreement, forced-vs-chosen WAIT split) when present, falls back cleanly on
+older v1/v2 trace files. 43/43 native CTest, 22/22 dependency-free, all still
+passing. Committed and pushed (`54a2a42`). Linear KL-107 updated with the same
+detail. KL-105 curriculum work remains the next decision point, not yet started -
+this increment was diagnostic-only, deliberately scoped smaller than a full
+curriculum change per the advisor consultation that preceded it.
