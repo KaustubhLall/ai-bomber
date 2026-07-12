@@ -50,6 +50,24 @@ struct TrainConfig {
        target no policy could ever pass. CLI --gates-agent NAME. Reuses --output (write-once
        evidence, same as evaluate) rather than a dedicated gates output flag. */
     std::string gates_agent{};
+    /* KL-110 Phase B: `gates` subcommand only, search mode. "self" (default) = today's
+       behavior, unchanged - search's own internal lookahead always models BOTH seats with the
+       network, uniformly across all six scenarios, regardless of what the outer loop's actual
+       opponent_mode is that step. "aligned" = search's internal opponent model instead matches
+       the scenario's REAL opponent this step (NONE -> fixed WAIT, CONSTANT -> the scenario's
+       fixed action, AGENT(type) -> that type via the existing baseline_action() path) - see
+       gate_search_constraint() in trainer.cpp. Purpose: a raw-pass/search-fail inversion (see
+       docs/experiment-memory/12-post-audit-execution.md's "Load-bearing new observation" on the
+       trap gate) that disappears under "aligned" implicates opponent-model mismatch
+       specifically, not generic value suppression - the two are otherwise confounded because
+       "self" always searches against a full-strength mirror even when the real opponent that
+       step is a WAIT-only or CONSTANT-action stub. Validated to be exactly "self" or "aligned"
+       (validate_config) - any other value fails closed rather than silently falling back to a
+       default. Not a semantic field (unlike replay_cause_balance_cap): it changes what a
+       read-only diagnostic probe measures, never what a checkpoint is trained under, so it is
+       deliberately NOT in the manifest/runtime_config_signature/semantic-fork machinery - same
+       treatment as --gates-agent. CLI --gates-opponent-model NAME. */
+    std::string gates_opponent_model{"self"};
     /* If > 0 and replay_incumbent is set, run a full N-game statistical mirror-match
        (checkpoint vs replay_incumbent, both seats, with the same win-cause/WAIT behavior
        instrumentation as the baseline evals) instead of just the single replay-recording

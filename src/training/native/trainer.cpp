@@ -658,6 +658,19 @@ struct SearchConstraint {
     int fixed_opponent_seat{-1};
     AgentType fixed_opponent_type{AGENT_RANDOM};
     uint64_t opponent_seed{};
+    /* KL-110 Phase B: appended LAST, with a default member initializer, so every existing
+       3-field aggregate initializer ({modeled_seat, type, seed} at self-play/league/evaluate's
+       three constraint-construction sites) still compiles unchanged and still means "no fixed
+       action" (aggregate init leaves a trailing unlisted field at its default). -1 (default) =
+       the fixed seat's action comes from baseline_action() as before (a real scripted-agent
+       decision, possibly stateful/RNG-driven). [0, kActions) = expand_and_backup one-hots that
+       EXACT action for the fixed seat at every expanded node instead of calling
+       baseline_action() - used by the gates "aligned" opponent model to pin search's internal
+       lookahead to a NONE/CONSTANT scenario's actual (stateless, deterministic) opponent
+       action. Only ever set outside [-1, kActions) by a bug; validated at the gates
+       construction site (gate_search_constraint()), not here - self-play/league/evaluate never
+       set it, so re-validating on every leaf expansion would be pure overhead on the hot path. */
+    int fixed_opponent_action{-1};
 };
 
 struct SearchResult {
@@ -683,9 +696,20 @@ public:
         : model_(std::move(model)), device_(device), config_(config), rng_(rng),
           iteration_(iteration), bootstrap_enabled_(bootstrap_enabled) {}
 
+    /* fixed_opponent_violation_count: KL-110 Phase B internal-node enforcement proof. Appended
+       LAST with a default (nullptr), so every existing call site (self-play, league, evaluate,
+       promotion arena - none of which fix an opponent action) compiles unchanged and pays no
+       cost. When non-null AND a root's constraint has fixed_opponent_action >= 0, traverses
+       that root's ENTIRE built tree (not just the root marginals SearchResult already exposes -
+       a root-only check cannot rule out the constraint silently not applying a few plies down)
+       before the tree is freed at function return, and ADDS the count of violating expanded
+       nodes onto *fixed_opponent_violation_count (accumulates across the whole vector of roots,
+       and across repeated calls if the caller reuses the same pointer - see
+       count_fixed_opponent_violations() below and its call site near the end of this method). */
     std::vector<SearchResult> search(const std::vector<BomberEnv*>& environments,
                                      const std::vector<SearchConstraint>& constraints,
-                                     bool root_noise, int simulations = -1) {
+                                     bool root_noise, int simulations = -1,
+                                     int* fixed_opponent_violation_count = nullptr) {
         if (environments.empty()) return {};
         if (constraints.size() != environments.size())
             throw std::runtime_error("MCTS constraint count mismatch");
@@ -751,6 +775,16 @@ public:
             expand_and_backup(leaves);
         }
 
+        if (fixed_opponent_violation_count) {
+            for (size_t index = 0; index < roots.size(); ++index) {
+                const auto& constraint = constraints[index];
+                if (constraint.fixed_opponent_action >= 0)
+                    count_fixed_opponent_violations(
+                        *roots[index], constraint.fixed_opponent_seat,
+                        constraint.fixed_opponent_action, *fixed_opponent_violation_count);
+            }
+        }
+
         std::vector<SearchResult> results(roots.size());
         for (size_t index = 0; index < roots.size(); ++index) {
             results[index].visits = roots[index]->visits;
@@ -811,6 +845,39 @@ private:
             it->first->value_sum0[it->second] += value0;
             it->first->value_sum1[it->second] += value1;
         }
+    }
+
+    /* KL-110 Phase B: recursive proof that a fixed-opponent constraint held at EVERY expanded
+       node in the tree, not just the root - expand_and_backup one-hots the fixed seat's policy
+       on every node it expands (root batch and every later leaf batch alike, since LeafJob
+       carries the same constraint unchanged for a whole root's subtree), so this is expected to
+       find zero violations structurally; it exists to catch a future regression (e.g. a leaf
+       job losing its constraint) rather than to detect an expected failure mode. A node
+       "violates" if ANY joint cell puts nonzero prior or visit mass on a fixed-seat action other
+       than fixed_action - counted once per violating NODE (not once per violating cell), mirrors
+       "count any expanded node whose joint visits or priors put mass on..." Terminal/unexpanded
+       nodes are skipped (expand_and_backup never ran on them, so they carry no policy at all)
+       but their children (if any) are still visited - recursion, not early return, so a
+       violation several plies down is never masked by an unexpanded node above it. */
+    static void count_fixed_opponent_violations(const Node& node, int fixed_seat, int fixed_action,
+                                                int& count) {
+        if (node.expanded) {
+            bool violated = false;
+            for (int zero = 0; zero < kActions && !violated; ++zero) {
+                for (int one = 0; one < kActions; ++one) {
+                    const int fixed_component = fixed_seat == 0 ? zero : one;
+                    if (fixed_component == fixed_action) continue;
+                    const int joint = zero * kActions + one;
+                    if (node.priors[joint] > 0.0f || node.visits[joint] > 0) {
+                        violated = true;
+                        break;
+                    }
+                }
+            }
+            if (violated) ++count;
+        }
+        for (const auto& child : node.children)
+            if (child) count_fixed_opponent_violations(*child, fixed_seat, fixed_action, count);
     }
 
     void add_root_noise(Node& root) {
@@ -883,9 +950,21 @@ private:
                 }
                 if (jobs[index].constraint.fixed_opponent_seat == seat) {
                     seat_policy[seat].fill(0.0f);
-                    const int action = baseline_action(
-                        jobs[index].constraint.fixed_opponent_type, node.env, seat,
-                        jobs[index].constraint.opponent_seed ^ env_state_hash(&node.env));
+                    /* KL-110 Phase B: fixed_opponent_action >= 0 (gates "aligned" opponent
+                       model, NONE/CONSTANT scenarios) one-hots that EXACT action instead of
+                       asking a scripted Agent - the scenario's real opponent this step is
+                       already known and deterministic (fed ACTION_WAIT or a fixed CONSTANT
+                       action by run_gate_scenario's outer loop), so there is no agent decision
+                       to reproduce, and baseline_action() would need to be a real stateful
+                       agent_act() call to match a general opponent - fine for AGENT(type), not
+                       meaningful for NONE/CONSTANT. -1 (everything else: self-play/league/
+                       evaluate, and gates AGENT-mode alignment) keeps the existing
+                       baseline_action() path unchanged. */
+                    const int action = jobs[index].constraint.fixed_opponent_action >= 0
+                        ? jobs[index].constraint.fixed_opponent_action
+                        : baseline_action(
+                              jobs[index].constraint.fixed_opponent_type, node.env, seat,
+                              jobs[index].constraint.opponent_seed ^ env_state_hash(&node.env));
                     seat_policy[seat][action] = 1.0f;
                 } else if (total > 0.0f) {
                     for (auto& probability : seat_policy[seat]) probability /= total;
@@ -1422,7 +1501,7 @@ void validate_train_cli_options(int argc, char** argv, int first) {
         "--selfkill-win-value", "--league-heuristic-fraction", "--promotion-margin",
         "--promotion-confidence-z", "--random-score-floor", "--heuristic-score-floor",
         "--heuristic-regression-margin", "--fork-from", "--dirty-diff-digest",
-        "--gates-agent", "--replay-cause-balance-cap",
+        "--gates-agent", "--gates-opponent-model", "--replay-cause-balance-cap",
     };
     static const std::set<std::string_view> flag_options = {
         "--fresh", "--no-progress", "--eval-mcts", "--overwrite-evidence",
@@ -1467,6 +1546,10 @@ void validate_config(const TrainConfig& config) {
         throw std::invalid_argument("league heuristic fraction must lie in [0, 1]");
     if (config.replay_cause_balance_cap < 0.0 || config.replay_cause_balance_cap > 0.9)
         throw std::invalid_argument("replay cause-balance cap must lie in [0, 0.9]");
+    if (config.gates_opponent_model != "self" && config.gates_opponent_model != "aligned")
+        throw std::invalid_argument(
+            "--gates-opponent-model must be 'self' or 'aligned', got '" +
+            config.gates_opponent_model + "'");
     if (config.learning_rate <= 0.0 || config.min_learning_rate <= 0.0 ||
         config.min_learning_rate > config.learning_rate)
         throw std::invalid_argument("learning rates are invalid");
@@ -1531,11 +1614,37 @@ struct GateScenarioSpec {
     std::function<bool(const BomberEnv&)> pass_predicate;
 };
 
+/* KL-110 Phase B: per-step search telemetry recorded in gates evidence, search modes only (both
+   "self" and "aligned" opponent models - never raw or agent mode, which never call
+   BatchedMcts::search at all). prior_after_safety_mask_marginal/visit_marginal/root_q are the
+   LEARNER seat's (seat 0 - the gates learner is always seat 0) marginals via
+   marginal_distribution() - same "already safety-masked, not the raw policy head; a search
+   backup average, not raw value head output" caveat the KL-107 evaluate trace already carries
+   for its own identically-derived fields, hence the identical field name
+   prior_after_safety_mask_marginal (this project has a history of mislabeled "raw" priors - see
+   the Trace-language rule). opp_visit_marginal is the OPPONENT seat's (seat 1) visit marginal -
+   in "aligned" mode with fixed_opponent_action>=0 this must be a one-hot spike on that action
+   (asserted by the gates CI check); in "self" mode it is the search's ordinary unconstrained
+   marginal for whatever the network would do as seat 1. */
+struct GateStepRecord {
+    int step{};
+    int chosen{};
+    int opponent_executed_action{};
+    std::array<double, kActions> prior_after_safety_mask_marginal{};
+    std::array<double, kActions> visit_marginal{};
+    std::array<double, kActions> root_q{};
+    std::array<double, kActions> opp_visit_marginal{};
+};
+
 struct GateResult {
     bool passed{};
     int steps_used{};
     std::string terminal{};
     std::string note{};
+    /* Populated only for GateLearnerMode::kSearch (both opponent models); stays empty/0 for
+       kRaw and kAgent, neither of which ever calls BatchedMcts::search. */
+    std::vector<GateStepRecord> steps{};
+    int fixed_opponent_internal_violations{};
 };
 
 /* Human-readable label for env_step_joint's own terminal classification. rules_check_terminal
@@ -1578,6 +1687,65 @@ AgentType parse_gate_agent_name(const std::string& name) {
         "unknown --gates-agent '" + name + "'; known names: random, scripted, heuristic, "
         "greedy (or greedy_crate), enemy-bot (or enemy/enemy_bot), external, alpha-beta (or "
         "alphabeta), mcts, evasive (or survivor)");
+}
+
+/* KL-110 Phase B: builds the SearchConstraint run_gate_scenario's kSearch branch hands to
+   BatchedMcts::search for one step of one scenario. "self" (config.gates_opponent_model, the
+   default) reproduces exactly today's uniform self-model - {-1, AGENT_RANDOM, seed} - unchanged
+   regardless of the scenario's real opponent_mode. "aligned" instead fixes seat 1 (the fixed
+   seat; the gates learner is ALWAYS seat 0) to match the scenario's real opponent this step:
+     - kNone:     the real opponent is fed ACTION_WAIT every step (see run_gate_scenario) -
+                  fixed_opponent_action pins that EXACT action, action-exact alignment.
+     - kConstant: the real opponent is fed opponent_constant_action every step - same
+                  action-exact treatment, just a different fixed action.
+     - kAgent:    the real opponent is a live, possibly-stateful/RNG-driven scripted Agent
+                  (agent_act via env_observe/env_get_debug_snapshot) - there is no single fixed
+                  action to pin in advance, so this only aligns the search's per-node baseline
+                  TYPE (fixed_opponent_type = the scenario's real AgentType, fixed_opponent_action
+                  stays -1, existing baseline_action() path) - a stateless per-node
+                  recomputation, not a reproduction of the rollout agent's own state/RNG
+                  trajectory. This asymmetry is exactly why doc 13's alignment-kind label
+                  distinguishes "action_exact" (kNone/kConstant) from "type_aligned" (kAgent) -
+                  see gate_opponent_alignment_kind() below. */
+SearchConstraint gate_search_constraint(const std::string& gates_opponent_model,
+                                        GateOpponentMode opponent_mode,
+                                        Action opponent_constant_action,
+                                        AgentType opponent_agent_type, uint64_t seed) {
+    if (gates_opponent_model != "aligned") return SearchConstraint{-1, AGENT_RANDOM, seed};
+    SearchConstraint constraint;
+    constraint.fixed_opponent_seat = 1;
+    constraint.opponent_seed = seed;
+    switch (opponent_mode) {
+        case GateOpponentMode::kNone:
+            constraint.fixed_opponent_type = AGENT_RANDOM;
+            constraint.fixed_opponent_action = static_cast<int>(ACTION_WAIT);
+            break;
+        case GateOpponentMode::kConstant:
+            constraint.fixed_opponent_type = AGENT_RANDOM;
+            constraint.fixed_opponent_action = static_cast<int>(opponent_constant_action);
+            break;
+        case GateOpponentMode::kAgent:
+            constraint.fixed_opponent_type = opponent_agent_type;
+            constraint.fixed_opponent_action = -1;
+            break;
+    }
+    if (constraint.fixed_opponent_action < -1 || constraint.fixed_opponent_action >= kActions)
+        throw std::runtime_error("gates: aligned fixed_opponent_action out of range");
+    return constraint;
+}
+
+/* KL-110 Phase B, reviewer-mandated distinction (doc 13 amendment): NONE/CONSTANT aligned
+   modeling pins the search's opponent to the EXACT action the scenario actually feeds it
+   ("action_exact") - a genuine reproduction, not an approximation. AGENT aligned modeling can
+   only match the opponent's TYPE ("type_aligned") - search recomputes a stateless per-node
+   baseline_action() call, while the real rollout agent carries its own persistent state/RNG
+   across steps (agent_reset once, then agent_act repeatedly) - so it is aligned in kind, not in
+   the exact action a stateful agent might take from accumulated history. "self" mode is neither -
+   the search does not attempt to match the real opponent at all. */
+const char* gate_opponent_alignment_kind(const std::string& gates_opponent_model,
+                                         GateOpponentMode opponent_mode) {
+    if (gates_opponent_model != "aligned") return "self";
+    return opponent_mode == GateOpponentMode::kAgent ? "type_aligned" : "action_exact";
 }
 
 /* Defensive sanity check on a hand-built scenario, run immediately after construction (before
@@ -3929,8 +4097,9 @@ struct Trainer::Impl {
        Learner (seat 0) decision procedure is selected by learner_mode: kSearch runs the exact
        deployed decision procedure (BatchedMcts, root noise off, greedy marginal_action -
        identical machinery to evaluate_baseline's own search loop, same simulations budget as
-       --eval-simulations); kRaw takes the unmasked policy-head argmax with NO search at all
-       (diagnostic only - recorded but never gates pass/fail, per doc 13 section 2); kAgent
+       --eval-simulations, opponent model per config.gates_opponent_model - see
+       gate_search_constraint()); kRaw takes the unmasked policy-head argmax with NO search at
+       all (diagnostic only - recorded but never gates pass/fail, per doc 13 section 2); kAgent
        substitutes a scripted Agent for the network entirely (the --gates-agent achievability
        reference). Opponent (seat 1) is one of: kNone (ACTION_WAIT every step), kConstant
        (opponent_constant_action every step regardless of outcome - this is what produces the
@@ -3949,6 +4118,12 @@ struct Trainer::Impl {
                                  GateLearnerMode learner_mode,
                                  AgentType learner_agent_type = AGENT_RANDOM) {
         GateResult result;
+        /* KL-110 Phase B: accumulates across every kSearch step of this whole scenario (one
+           BatchedMcts::search call per step) via count_fixed_opponent_violations() - see the
+           per-step search call below and the doc comment on BatchedMcts::search itself. Stays 0
+           for kRaw/kAgent (never passed to a search call) and for "self" mode (constraint's
+           fixed_opponent_action is always -1 there, so the traversal never fires). */
+        int fixed_opponent_violations = 0;
         Agent opponent_scripted;
         if (opponent_mode == GateOpponentMode::kAgent) {
             agent_init(&opponent_scripted, opponent_agent_type);
@@ -3985,22 +4160,57 @@ struct Trainer::Impl {
 
         for (int step = 0; step < k_steps; ++step) {
             int learner_action;
+            std::optional<GateStepRecord> step_record;
             if (learner_mode == GateLearnerMode::kSearch) {
                 std::vector<BomberEnv*> active{&env};
-                /* fixed_opponent_seat=-1: the search's OWN internal lookahead always models
-                   both seats with the network (self-play), uniformly across all six scenarios,
-                   regardless of what the outer loop's actual opponent_mode is this step
-                   (evaluate_baseline instead fixes fixed_opponent_seat to the real baseline
-                   type for non-MCTS opponents - see its `modeled_seat` - but gates deliberately
-                   does not: kNone/kConstant opponents have no AgentType to model in the first
-                   place, and keeping this uniform means all six gates exercise the exact same
-                   search configuration, not six different ones. This IS the "opponent_modeled_
-                   as" mismatch KL-107's trace already tracks - here it is simply constant
-                   ("self") rather than scenario-dependent). */
-                std::vector<SearchConstraint> constraints{{-1, AGENT_RANDOM, seed}};
+                /* config.gates_opponent_model selects what search's OWN internal lookahead
+                   assumes for the opposing seat this step. "self" (default, and the sole
+                   behavior before KL-110 Phase B) always models both seats with the network,
+                   uniformly across all six scenarios, regardless of what the outer loop's
+                   actual opponent_mode is (evaluate_baseline instead fixes fixed_opponent_seat
+                   to the real baseline type for non-MCTS opponents - see its `modeled_seat` -
+                   but gates historically did not: kNone/kConstant opponents have no AgentType
+                   to model in the first place, and uniformity meant all six gates exercised the
+                   exact same search configuration. This IS the "opponent_modeled_as" mismatch
+                   KL-107's trace already tracks - "self" mode keeps it constant rather than
+                   scenario-dependent). "aligned" instead fixes seat 1 (the opponent; the gates
+                   learner is always seat 0) to match the scenario's actual opponent this step -
+                   see gate_search_constraint(). Purpose: a raw-pass/search-fail inversion under
+                   "self" that disappears under "aligned" implicates opponent-model mismatch
+                   specifically, not generic value suppression - the two are otherwise
+                   confounded because "self" always searches against a full-strength mirror even
+                   when the real opponent that step is a WAIT-only or CONSTANT-action stub. */
+                const SearchConstraint constraint = gate_search_constraint(
+                    config.gates_opponent_model, opponent_mode, opponent_constant_action,
+                    opponent_agent_type, seed);
+                std::vector<SearchConstraint> constraints{constraint};
                 const auto results = search->search(active, constraints, false,
-                                                     config.evaluation_simulations);
+                                                     config.evaluation_simulations,
+                                                     &fixed_opponent_violations);
                 learner_action = marginal_action(results[0].visits, 0);
+
+                /* KL-110 Phase B per-step telemetry (search modes only). Learner-seat (0)
+                   marginals reuse marginal_distribution() exactly like the KL-107 evaluate
+                   trace above; opp_visit_marginal is the opponent seat's (1) visit marginal -
+                   in aligned mode with a fixed action this must come out one-hot (CI-checked).
+                   root_q mirrors the existing search_root_q_values derivation: value_sum0 is
+                   the correct per-seat accumulator here because the gates learner is always
+                   seat 0 (unlike evaluate_baseline, whose learner_seat varies, this needs no
+                   seat-conditional value_sum selection). opponent_executed_action is filled in
+                   below, once the outer loop actually computes what seat 1 was fed this step. */
+                GateStepRecord record;
+                record.step = step;
+                record.chosen = learner_action;
+                record.prior_after_safety_mask_marginal =
+                    marginal_distribution(results[0].priors, 0);
+                record.visit_marginal = marginal_distribution(results[0].visits, 0);
+                record.opp_visit_marginal = marginal_distribution(results[0].visits, 1);
+                const auto q_visits = record.visit_marginal;
+                const auto q_value_sums = marginal_distribution(results[0].value_sum0, 0);
+                for (int action = 0; action < kActions; ++action)
+                    record.root_q[action] = q_visits[action] > 0.0
+                        ? q_value_sums[action] / q_visits[action] : 0.0;
+                step_record = std::move(record);
             } else if (learner_mode == GateLearnerMode::kRaw) {
                 /* Diagnostic-only decision procedure: unmasked policy-head argmax, no search -
                    mirrors the v3 raw-recomputation single-position forward pass used for
@@ -4052,6 +4262,12 @@ struct Trainer::Impl {
                 env_get_debug_snapshot(&env, &snap);
                 opponent_action = static_cast<int>(agent_act(&opponent_scripted, &obs, &snap));
             }
+            if (step_record) {
+                /* What the outer loop actually fed seat 1 this step - computed just above,
+                   after the search call that produced everything else in step_record. */
+                step_record->opponent_executed_action = opponent_action;
+                result.steps.push_back(*step_record);
+            }
 
             if (learner_action == static_cast<int>(ACTION_PLACE_BOMB)) learner_ever_acted = true;
             const Action actions[2] = {static_cast<Action>(learner_action),
@@ -4076,6 +4292,7 @@ struct Trainer::Impl {
         result.note = learner_ever_acted ? "" :
             "learner never changed position, destroyed a crate, or placed a bomb "
             "(combined-idle every step)";
+        result.fixed_opponent_internal_violations = fixed_opponent_violations;
         return result;
     }
 
@@ -4184,7 +4401,10 @@ struct Trainer::Impl {
 
         std::cout << "\nTactical gates (" << (agent_mode ? config.gates_agent + " agent"
                                                           : std::string("network"))
-                  << ", " << config.evaluation_simulations << " simulations):\n";
+                  << ", " << config.evaluation_simulations << " simulations"
+                  << (agent_mode ? std::string() : ", " + config.gates_opponent_model +
+                                                   "-opponent search")
+                  << "):\n";
         if (agent_mode) {
             std::cout << std::left << std::setw(20) << "scenario" << std::setw(10) << "result"
                       << std::setw(8) << "steps" << "terminal\n";
@@ -4222,8 +4442,46 @@ struct Trainer::Impl {
                        << ", \"terminal\": \"" << json_escape(value.terminal) << "\""
                        << ", \"note\": \"" << json_escape(value.note) << "\"}";
             };
-            output << "{\n"
-                   << "  \"gates_format_version\": 1,\n"
+            /* KL-110 Phase B: search-mode-only extension of write_result - per-step search
+               telemetry (steps[]) and the internal-node enforcement count. A SEPARATE lambda
+               rather than adding these fields unconditionally to write_result, so raw/agent-mode
+               evidence objects (which never populate GateResult::steps or
+               fixed_opponent_internal_violations - see run_gate_scenario) never carry a
+               misleadingly-present-but-empty "steps": [] implying a search that never ran.
+               std::setprecision(9), set once below on `output` (KL-101 fork-manifest
+               precedent), governs every double this lambda writes too. */
+            auto write_search_result = [&output](const GateResult& value) {
+                output << "{\"passed\": " << (value.passed ? "true" : "false")
+                       << ", \"steps_used\": " << value.steps_used
+                       << ", \"terminal\": \"" << json_escape(value.terminal) << "\""
+                       << ", \"note\": \"" << json_escape(value.note) << "\""
+                       << ", \"fixed_opponent_internal_violations\": "
+                       << value.fixed_opponent_internal_violations
+                       << ", \"steps\": [";
+                for (size_t index = 0; index < value.steps.size(); ++index) {
+                    const auto& step = value.steps[index];
+                    output << (index ? "," : "") << "{\"step\": " << step.step
+                           << ", \"chosen\": " << step.chosen
+                           << ", \"opponent_executed_action\": " << step.opponent_executed_action
+                           << ", \"prior_after_safety_mask_marginal\": [";
+                    for (int action = 0; action < kActions; ++action)
+                        output << (action ? "," : "")
+                               << step.prior_after_safety_mask_marginal[action];
+                    output << "], \"visit_marginal\": [";
+                    for (int action = 0; action < kActions; ++action)
+                        output << (action ? "," : "") << step.visit_marginal[action];
+                    output << "], \"root_q\": [";
+                    for (int action = 0; action < kActions; ++action)
+                        output << (action ? "," : "") << step.root_q[action];
+                    output << "], \"opp_visit_marginal\": [";
+                    for (int action = 0; action < kActions; ++action)
+                        output << (action ? "," : "") << step.opp_visit_marginal[action];
+                    output << "]}";
+                }
+                output << "]}";
+            };
+            output << std::setprecision(9) << "{\n"
+                   << "  \"gates_format_version\": 2,\n"
                    << "  \"generated_at_utc\": \"" << utc_timestamp() << "\",\n"
                    << "  \"invocation_argv\": [";
             for (size_t index = 0; index < config.invocation_argv.size(); ++index) {
@@ -4259,6 +4517,8 @@ struct Trainer::Impl {
                    << json_escape(agent_mode ? config.gates_agent : std::string("network"))
                    << "\",\n"
                    << "  \"simulations\": " << config.evaluation_simulations << ",\n"
+                   << "  \"search_opponent_model\": \""
+                   << json_escape(config.gates_opponent_model) << "\",\n"
                    << "  \"scenarios\": [\n";
             for (size_t index = 0; index < records.size(); ++index) {
                 const auto& record = records[index];
@@ -4267,8 +4527,18 @@ struct Trainer::Impl {
                     output << "\"result\": ";
                     write_result(record.agent);
                 } else {
-                    output << "\"search\": ";
-                    write_result(record.search);
+                    /* opponent_model_alignment is scenario-level metadata about what search's
+                       opponent modeling would be for THIS scenario under the current
+                       --gates-opponent-model - see gate_opponent_alignment_kind(). Only
+                       meaningful in network mode (agent_mode substitutes a scripted Agent for
+                       the whole learner decision procedure - no BatchedMcts search runs at all,
+                       so there is nothing to label as aligned/self here), matching how
+                       "search"/"raw" are themselves absent from agent-mode scenario records. */
+                    output << "\"opponent_model_alignment\": \""
+                           << gate_opponent_alignment_kind(config.gates_opponent_model,
+                                                            specs[index].opponent_mode)
+                           << "\", \"search\": ";
+                    write_search_result(record.search);
                     output << ", \"raw\": ";
                     write_result(record.raw);
                 }
@@ -4367,6 +4637,8 @@ TrainConfig parse_train_config(int argc, char** argv, int first) {
     config.heuristic_score_floor = parse_number(argc, argv, first, "--heuristic-score-floor", config.heuristic_score_floor);
     config.heuristic_regression_margin = parse_number(argc, argv, first, "--heuristic-regression-margin", config.heuristic_regression_margin);
     config.gates_agent = parse_string(argc, argv, first, "--gates-agent", config.gates_agent);
+    config.gates_opponent_model = parse_string(argc, argv, first, "--gates-opponent-model",
+                                               config.gates_opponent_model);
     config.fork_from = parse_string(argc, argv, first, "--fork-from", config.fork_from.string());
     config.dirty_diff_digest = parse_string(argc, argv, first, "--dirty-diff-digest",
                                             config.dirty_diff_digest);
@@ -4475,6 +4747,20 @@ void print_native_help() {
         "                            external, alpha-beta, mcts, evasive - the achievability\n"
         "                            reference proving a gate is solvable by something, not\n"
         "                            just an aspirational target no policy could ever pass\n"
+        "  --gates-opponent-model NAME  (gates, search mode) self (default) or aligned. self:\n"
+        "                            search always models both seats with the network, uniform\n"
+        "                            across all six scenarios. aligned: search's internal\n"
+        "                            opponent model instead matches the scenario's real\n"
+        "                            opponent (NONE->fixed WAIT, CONSTANT->the scenario's fixed\n"
+        "                            action, AGENT(type)->that type) - isolates opponent-model\n"
+        "                            mismatch from value suppression when a raw-pass/search-\n"
+        "                            fail inversion is observed. Evidence gains per-step search\n"
+        "                            telemetry (chosen/opponent_executed_action/prior_after_\n"
+        "                            safety_mask_marginal/visit_marginal/root_q/\n"
+        "                            opp_visit_marginal), an opponent_model_alignment label per\n"
+        "                            scenario (action_exact/type_aligned/self), and a\n"
+        "                            fixed_opponent_internal_violations structural check\n"
+        "                            (gates_format_version 2)\n"
         "  --iterations N            Total iteration target (resume-safe)\n"
         "  --games N                 Concurrent self-play games\n"
         "  --simulations N           PUCT simulations per move\n"

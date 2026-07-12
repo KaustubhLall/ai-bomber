@@ -276,13 +276,67 @@ if(TARGET bomber_alphazero_native)
       --overwrite-evidence --no-progress)
   set_tests_properties(test_native_alphazero_gates_agent_run PROPERTIES
     DEPENDS test_native_alphazero_gates_rerun TIMEOUT 60)
+
+  # KL-110 Phase B: aligned-opponent gate ablation. --gates-opponent-model self, run explicitly,
+  # must byte-match the no-flag default run above (gates-network-1.json) on the scenarios array -
+  # this, not rerun-determinism (already covered by gates_rerun above), is what proves "self" is
+  # really the unchanged default and not a second, subtly different code path.
+  add_test(NAME test_native_alphazero_gates_self_explicit_run
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> gates
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke
+      --checkpoint latest.pt
+      --channels 16 --blocks 1 --max-steps 8 --replay-capacity 128
+      --eval-simulations 8 --gates-opponent-model self
+      --output ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke/gates-self-explicit.json
+      --overwrite-evidence --no-progress)
+  set_tests_properties(test_native_alphazero_gates_self_explicit_run PROPERTIES
+    DEPENDS test_native_alphazero_gates_agent_run TIMEOUT 60)
+  # Two independent --gates-opponent-model aligned runs - determinism must hold in aligned mode
+  # exactly like it does in self mode (gates_run/gates_rerun above), checked the same way (diff
+  # the scenarios arrays byte-for-byte in the python check, not just "both exit 0").
+  add_test(NAME test_native_alphazero_gates_aligned_run
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> gates
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke
+      --checkpoint latest.pt
+      --channels 16 --blocks 1 --max-steps 8 --replay-capacity 128
+      --eval-simulations 8 --gates-opponent-model aligned
+      --output ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke/gates-aligned-1.json
+      --overwrite-evidence --no-progress)
+  set_tests_properties(test_native_alphazero_gates_aligned_run PROPERTIES
+    DEPENDS test_native_alphazero_gates_self_explicit_run TIMEOUT 60)
+  add_test(NAME test_native_alphazero_gates_aligned_rerun
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> gates
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke
+      --checkpoint latest.pt
+      --channels 16 --blocks 1 --max-steps 8 --replay-capacity 128
+      --eval-simulations 8 --gates-opponent-model aligned
+      --output ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke/gates-aligned-2.json
+      --overwrite-evidence --no-progress)
+  set_tests_properties(test_native_alphazero_gates_aligned_rerun PROPERTIES
+    DEPENDS test_native_alphazero_gates_aligned_run TIMEOUT 60)
+
   if(Python3_Interpreter_FOUND)
     add_test(NAME test_native_alphazero_gates_check
       COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/test_native_alphazero_gates_check.py
         ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke)
     set_tests_properties(test_native_alphazero_gates_check PROPERTIES
-      DEPENDS test_native_alphazero_gates_agent_run TIMEOUT 20)
+      DEPENDS test_native_alphazero_gates_aligned_rerun TIMEOUT 20)
+
+    # KL-110 Phase B verdict tool: pure-Python logic, no native binary/GPU dependency at
+    # runtime, but deliberately kept INSIDE this TARGET-guarded block (not the dependency-free
+    # Python block near the top of this file) so the non-GPU "build" tree's test count stays
+    # untouched - this tool exists specifically to consume gates_format_version 2 evidence,
+    # which only the native alphazero target can produce.
+    add_test(NAME test_analyze_h3a_verdict
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_analyze_h3a_verdict.py)
+    set_tests_properties(test_analyze_h3a_verdict PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   endif()
 
   add_test(NAME test_native_alphazero_unknown_option_fails
