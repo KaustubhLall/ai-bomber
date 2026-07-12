@@ -807,3 +807,29 @@ fork-manifest/semantic-fork-log/watchdog/train-console) are now archived under t
 directory with a normalized repo-root-relative SHA256SUMS, so the LR-equality and
 single-attempt claims no longer depend on git-ignored local run dirs. Next: KL-110 Phase B,
 the aligned-opponent gates ablation (no training in any branch).
+
+## KL-110 Phase B result: `mixed` — H3a's mechanism confirmed, prior starvation gates it
+
+The 8-run aligned-opponent ablation (4 checkpoints x self|aligned, one binary `1e734ba`,
+frozen discriminator applied machine-readably by `tools/analyze_h3a_verdict.py`) returned
+**mixed**: exactly one counted restoration (control03-130 — trap self-FAIL -> aligned-PASS in
+4 steps with the BOMB root-visit lead, 37/96 at step 0) among the three required checkpoints;
+lever2-160 (descriptive) also restored (53/96); neither 154 arm places a bomb at all even
+action-exact-aligned; zero corridor regressions (treatment-154's corridor actually improves
+under aligned). Per the pre-registered ladder: traces inspected, NO training launched.
+
+The per-step records decompose the mechanism exactly (full table in
+`evidence/kl110-h3a-ablation-2026-07-12/README.md`): step-0 priors are mode-identical, so the
+whole effect is visit allocation — aligned value flips BOMB into the visit lead wherever the
+prior leaves search room (0.105/0.149 on the pre-drift checkpoints) and cannot where drift
+pushed it below ~0.08 (0.084 control-154, 0.071 treatment-154 — the kill-enriched arm has the
+LOWEST bomb prior). Findings: (1) the original raw-pass/search-fail trap inversion WAS
+opponent-model mismatch on the checkpoints where it was observed; (2) continued v6-league
+training erodes exactly the prior that opponent-aware search needs, so search-side and
+generation-side fixes are complementary, not alternatives. Scope note per the verdict JSON:
+this does not kill H3 globally — leaf values remain self-play-conditioned everywhere.
+
+Executor note for the record: Unit B caught a miscount in the KL-110 issue text ("four"
+NONE/CONSTANT scenarios; the table has five — 4 NONE + 1 CONSTANT), implemented the rule
+rather than the count, and flagged it. Internal-node enforcement was mutation-tested (inverted
+comparison fires on all five action_exact scenarios; reverted; CI pins zero violations).

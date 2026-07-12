@@ -1,0 +1,106 @@
+{
+  "verdict": "mixed",
+  "scope_note": "a rescue supports scenario-aligned constrained search and also benefits from reduced opponent branching - it does not by itself separate those two mechanisms; a no-rescue does NOT kill H3 (opponent-model mismatch) globally, since leaf values remain self-play-conditioned regardless of what search's root-level opponent model assumes - this ablation only tests search-time opponent modeling, not the value head's own training-time conditioning",
+  "required_checkpoints": [
+    "control03-130",
+    "control-154",
+    "treatment-154"
+  ],
+  "counted_restorations": [
+    "control03-130"
+  ],
+  "restoration_candidates_without_visit_lead": [],
+  "corridor_regressions": [],
+  "checkpoints": {
+    "control03-130": {
+      "required": true,
+      "trap": {
+        "checkpoint": "control03-130",
+        "self_pass": false,
+        "aligned_pass": true,
+        "restoration_candidate": true,
+        "bomb_step": 0,
+        "visit_lead": true,
+        "root_q_at_bomb_step": [
+          0.858570772,
+          0,
+          0.621981534,
+          0.54128196,
+          0.924282074,
+          0.296549479
+        ],
+        "counted": true
+      },
+      "corridor-clear": {
+        "checkpoint": "control03-130",
+        "self_pass": true,
+        "aligned_pass": true,
+        "regression": false
+      }
+    },
+    "control-154": {
+      "required": true,
+      "trap": {
+        "checkpoint": "control-154",
+        "self_pass": false,
+        "aligned_pass": false,
+        "restoration_candidate": false,
+        "bomb_step": null,
+        "visit_lead": false,
+        "root_q_at_bomb_step": null,
+        "counted": false
+      },
+      "corridor-clear": {
+        "checkpoint": "control-154",
+        "self_pass": true,
+        "aligned_pass": true,
+        "regression": false
+      }
+    },
+    "treatment-154": {
+      "required": true,
+      "trap": {
+        "checkpoint": "treatment-154",
+        "self_pass": false,
+        "aligned_pass": false,
+        "restoration_candidate": false,
+        "bomb_step": null,
+        "visit_lead": false,
+        "root_q_at_bomb_step": null,
+        "counted": false
+      },
+      "corridor-clear": {
+        "checkpoint": "treatment-154",
+        "self_pass": false,
+        "aligned_pass": true,
+        "regression": false
+      }
+    },
+    "lever2-160": {
+      "required": false,
+      "trap": {
+        "checkpoint": "lever2-160",
+        "self_pass": false,
+        "aligned_pass": true,
+        "restoration_candidate": true,
+        "bomb_step": 0,
+        "visit_lead": true,
+        "root_q_at_bomb_step": [
+          0.925274884,
+          0,
+          0.278727214,
+          0.53848544,
+          0.958269443,
+          0.142333984
+        ],
+        "counted": true
+      },
+      "corridor-clear": {
+        "checkpoint": "lever2-160",
+        "self_pass": true,
+        "aligned_pass": true,
+        "regression": false
+      }
+    }
+  }
+}
