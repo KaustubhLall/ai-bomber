@@ -585,3 +585,52 @@ checkpoint 1) and errored, matching the prior session's identical experience - t
 sessions now, both unable to reach it. Per the plan: **stopping here, surfacing this to the user
 directly, not proceeding into Phase 2 on my own judgment.** No code changes, design decisions, or
 further Linear updates for KL-105's design are planned until that happens.
+
+## Checkpoint 3 resolved: the user invoked the orchestrator pattern with Fable at the helm
+
+The user's response to the hard stop above was to switch the session model to Fable and invoke
+the `/orchestrator` skill (Planner → Executor → Evaluator): Fable plans and reviews in the main
+session, Sonnet subagents execute the code units. This resolves the advisor-unavailable
+deadlock structurally — the planner/evaluator role in the main session IS the design-review and
+launch-gate authority the plan's checkpoints 3/4/5 called "advisor," per the user's standing
+decision that advisor sign-off suffices for bounded training launches. Recorded here as the
+authorization chain for everything below.
+
+## Phase 2a: experiment design (doc 13, planner-written)
+
+`docs/experiment-memory/13-kl105-experiment-design.md` (commit `851db37`): six tactical gates,
+the capped cause-balanced replay intervention (single-variable treatment vs cap=0 control),
+both arms forked from control03-130 with an identical explicit `--lr-schedule-updates 33280`
+override (both would otherwise inherit the floor-LR bug's 1e-5, muting any treatment effect),
+24 iterations/arm at measured ~8min/iter throughput, and DRAFT success/failure criteria to be
+frozen at the launch gate.
+
+## Phase 2b: tactical gates (Unit A, Sonnet executor + planner review) — commit `58f688b`
+
+Executor delivered the `gates` subcommand per spec (six scenarios with ASCII-diagrammed
+layouts and blast-arm math cross-checked against `danger_would_trap_agent`, search+raw modes,
+`--gates-agent` achievability reference, write-once KL-101 evidence, 4 CI tests incl.
+byte-identical-rerun determinism; found and fixed a real fixture-truncation bug — CI fixture's
+`max_steps=8` silently capped every scenario — and used a strict whitelist for `--gates-agent`
+instead of `agent_parse_type`'s silent fallback-to-random). Planner review verified the diff
+directly (not the self-report), found one cosmetic diagram error (fixed), and made one
+substantive ruling the executor had correctly flagged instead of deciding: **stall-break gains
+a demonstrated-kill pass path** (`death_owner == learner`, the trap-gate standard) — both
+reference agents independently bombed the defenseless CONSTANT blocker, and killing the thing
+blocking the chokepoint is decisive aggression, the opposite of the passive-stall failure mode
+the gate probes. Heuristic reference: 5/6 (fails only flame-timing, an identified
+priority-order gap; MCTS-32 solves it, so the gate is achievable). 47/47 + 22/22 green.
+
+## Gates baseline (pre-intervention "before" numbers) — evidence archived
+
+`docs/experiment-memory/evidence/kl105-gates-baseline-2026-07-12/` (clean stamp `58f688b`,
+`--eval-simulations 96`): **all three checkpoints pass exactly 1/6 deployed** (corridor-clear —
+crate clearing, the one constantly-rewarded skill; zero pass any gate requiring opponent
+engagement). References: heuristic 5/6, MCTS-256 4/6; every gate achievable by at least one.
+
+**Load-bearing new observation:** on control03-130 AND lever2-160, raw-argmax passes the trap
+gate in 5 steps while 96-sim search FAILS it — the bare policy head takes the kill; adding
+search removes it. This inverts the aggregate "search is net slightly anti-passive" direction
+in at least this constructed kill position and shows the search/value side actively suppressing
+aggression the head would take. It sharpens the intervention mechanism: cause-balanced replay
+retrains both heads (bomb-win-side samples carry +1 value targets), not just the prior.
