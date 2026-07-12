@@ -1,6 +1,9 @@
 # KL-105 experiment design: tactical gates + first bounded intervention (capped cause-balanced replay)
 
-**Status: DESIGN — criteria below are DRAFT until frozen at the launch gate (checkpoint 4).**
+**Status: LAUNCH-GATED — criteria in section 3 were FROZEN at the launch gate (checkpoint 4,
+2026-07-12, planner sign-off per the orchestrator authorization recorded in doc 12). Immutable
+from launch onward; the section retains the original DRAFT wording with the frozen amendments
+marked.**
 Written by the planner (Fable, orchestrator pattern) as Phase 2a of the post-audit execution
 plan (`docs/experiment-memory/12-post-audit-execution.md`). The advisor tool has been
 unavailable across two sessions; the user resolved the plan's checkpoint-3 hard stop by
@@ -159,9 +162,11 @@ no error.
   confound.
 - **Schedule**: both arms fork with explicit `--lr-schedule-updates 33280` (= 260 iterations ×
   128 train_steps). At the fork point (global_updates = 16640 = exactly half the horizon) the
-  cosine gives LR ≈ 1.05e-4 annealing to ≈ 6e-5 over the arm — deliberately mirroring the LR
-  range crush01 actually trained under (1.005e-4 → 6.19e-5 across iters 103-130). This is an
-  explicit, logged semantic fork (the sanctioned override path), identical in both arms.
+  cosine gives LR ≈ 1.05e-4, annealing to ≈ 7.8e-5 by iteration 154 (progress 19712/33280 =
+  0.592) — comparable to the LR range crush01 actually trained under (1.005e-4 → 6.19e-5
+  across iters 103-130; the ≈6e-5 figure in this doc's first draft was that crush01 endpoint,
+  not our arm's — corrected at the launch gate for precision). This is an explicit, logged
+  semantic fork (the sanctioned override path), identical in both arms.
   Rationale: leaving both arms at the inherited 1e-5 floor risks a mute, uninformative flat
   result because *nothing* can move at floor LR — that would test the lever at a learning rate
   chosen by an old bug, not a fair test.
@@ -174,31 +179,35 @@ no error.
   `learning_rate` at matched iterations from both arms' metrics.jsonl, manifest diff showing
   exactly one differing semantic field, same executable SHA-256 in both run dirs.
 
-### Evaluation (paired, both arms at iteration 154)
-1. Tactical gates (search mode), vs. each arm AND vs. the base checkpoint's pre-launch
-   baseline.
-2. Wait/idle diagnostic: `evaluate --eval-mcts --trace-output` on seed block 1300001, 16 games
-   (32 matches), full `analyze_wait_diagnostic.py` table (raw-argmax-WAIT, chosen-WAIT,
-   combined idle, streaks).
-3. SD-on vs MCTS-256, N=32 matches/arm, win-cause classified, both seats.
-4. SD-off control, same N — the collapse check.
+### Evaluation (paired, both arms at iteration 154 — one battery, `tools/launch/kl105-paired-eval.ps1`)
+1. Tactical gates (search mode, 96 sims), vs. each arm AND vs. the base checkpoint's committed
+   pre-launch baseline (control03-130: 1/6, corridor-clear only).
+2. SD-on vs MCTS-256 on seed block 1300001, **32 games (64 matches)/arm** (matches the
+   historical lever-gate N and the criteria's /64 units — amended up from the first draft's
+   16-game diagnostic sizing at the launch gate, before launch), win-cause classified, both
+   seats, with `--trace-output` + `--per-match-output` for the full
+   `analyze_wait_diagnostic.py` table (raw-argmax-WAIT, chosen-WAIT, combined idle, streaks).
+3. SD-off control, same N — the collapse check (explicit `--sudden-death-start 0` eval
+   override, logged).
 Heuristic/random numbers recorded as training-health only. Diagnostic block 1300001
 throughout; burned holdout blocks untouched; no "superhuman"-adjacent language anywhere.
 
-### DRAFT success/failure criteria (frozen verbatim or amended ONLY at the launch gate, then immutable)
-Baselines: bomb-kill ≈ 1-2/64 games SD-on vs MCTS-256; chosen-WAIT 61.9% (control03-130);
-combined idle 62.9%; SD-off ≈ 87.5% draws; gates baseline TBD pre-launch.
-- **SUCCESS (H1 supported)** — all of:
-  (a) treatment bomb-kill ≥ 8% of games (≥6/64) AND ≥ +4 games over control at 154;
-  (b) treatment chosen-WAIT ≤ control − 8pp on the 1300001 diagnostic;
-  (c) SD-off timeout-draw rate not more than +5pp vs control (no survival-collapse regression);
-  (d) both-seat breakdown does not reverse the direction of (a) or (b).
-- **DIRECTIONAL** — (a) or (b) met but not both, no (c) violation → one follow-up decision
+### FROZEN success/failure criteria (launch gate, 2026-07-12 — immutable)
+Baselines (measured): control03-130 bomb-kill 1/32 matches SD-on in the v4 diagnostic (and
+2/64 in the historical lever gate); chosen-WAIT 61.9%; combined idle 62.9%; SD-off 87.5%
+draws; gates 1/6.
+- **SUCCESS (H1 supported)** — all of, at iteration 154 on the 64-match SD-on battery:
+  (a) treatment bomb-kill wins ≥ 6/64 AND ≥ control + 4;
+  (b) treatment chosen-WAIT ≤ control − 8pp (from the SD-on trace, wait-diagnostic table);
+  (c) treatment SD-off timeout-draw rate ≤ control + 5pp (no survival-collapse regression);
+  (d) the per-seat breakdown does not reverse the direction of (a) or (b) on either seat.
+- **DIRECTIONAL** — (a) or (b) met but not both, and no (c) violation → one follow-up decision
   (extend arms OR adjust cap) allowed, once, with the same controls; otherwise treat as flat.
 - **FLAT/NEGATIVE** — anything else → lever killed, retained as the negative result, next
   design pass goes to league diversification or H2/H3. No re-runs to "give it another chance."
-Gate pass-rate movement is reported descriptively, not part of the success definition (six
-scenarios is too few to gate on statistically).
+Gate pass-rate movement and pool-A/realized-fraction telemetry are reported descriptively, not
+part of the success definition (six scenarios / one diagnostic pass are too few to gate on
+statistically).
 
 ## 4. Execution structure (orchestrator)
 

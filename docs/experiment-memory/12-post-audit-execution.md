@@ -634,3 +634,54 @@ search removes it. This inverts the aggregate "search is net slightly anti-passi
 in at least this constructed kill position and shows the search/value side actively suppressing
 aggression the head would take. It sharpens the intervention mechanism: cause-balanced replay
 retrains both heads (bomb-win-side samples carry +1 value targets), not just the prior.
+
+## Phase 3 Unit B: cause-tagged replay + capped cause-balanced sampler — commit `fa72b64`
+
+Executor (Sonnet) delivered per doc 13 section 3; planner verified the load-bearing hunks
+directly (sampler's cap=0 branch is byte-for-byte the pre-existing path; mirror tagging's seat
+parity matches the value-assignment parity exactly; league taxonomy is "how the game ended"
+consistently; legacy-load tag defaulting is faithful-inheritance with an explicit one-line
+note). Executor verified the sampler's two regimes (cap-limited and boost-limited) by exact
+arithmetic on ad-hoc runs, since fixture-scale games produce no bomb kills (expected — CI
+asserts machinery + liveness instead). Planner review added one thing the executor had
+flagged: `replay_cause_balance_cap` in the evaluate-evidence `resolved_semantics` object, so
+arm evidence files carry their treatment/control identity directly. Planner accepted the
+committed 3.6MB pre-tag fixture checkpoint (snapshotted at `58f688b` with a full provenance
+sidecar) as the only durable way to CI-cover the genuine missing-archive-key compat path.
+54/54 native CTest (7 new), 22/22 dependency-free — re-run by the planner, not taken from the
+executor's report. Two small pre-existing issues noted for backlog, not touched: `--fresh`
+does not truncate `semantic-fork-log.jsonl` (unlike metrics/config-history), and no standing
+test exercises the pool_a_draws>0 sampler branch (covered by ad-hoc exact-arithmetic runs and,
+imminently, by the live treatment arm's own metrics).
+
+## Phase 3 launch gate (checkpoint 4) — planner sign-off, 2026-07-12
+
+Authorization: the user's standing decision ("advisor sign-off suffices" for bounded training
+launches, ≤~40 iters/arm) + the orchestrator arrangement recorded above (planner = acting
+advisor). Everything below was verified before launch, not assumed:
+
+- **Arms**: `tools/launch/kl105-arm-bootstrap.ps1` / `kl105-arm-resume.ps1` (Unit C,
+  planner-written — the exact commands are the gate artifact). Fork parent
+  `control03-from102/iteration_000130.pt`, SHA-256 `ab5771d3...` (verified on disk), manifest-
+  verified (no legacy flag — if the fork fails closed on semantics, that is a bug to
+  investigate, not a flag to add). Arm config mirrors the parent's true resume config
+  (`--batch-size 512` — note the 1024 in historical agg signatures is the EVALUATE process's
+  struct default, not what training used; caught at planner review of Unit C).
+- **The two explicit semantic overrides, identical story both arms**:
+  `--lr-schedule-updates 33280` (both arms; expect a SEMANTIC FORK line 13184 → 33280 at
+  bootstrap; LR resumes at ≈1.05e-4 annealing to ≈7.8e-5 by 154) and
+  `--replay-cause-balance-cap` 0.25 (treatment; expect a second fork line 0 → 0.25) vs 0
+  (control; matches the faithful-inherited default — no fork line, still explicit in argv and
+  recorded in the manifest going forward).
+- **Length/budget**: 24 iterations/arm (131 bootstrap + resume to 154), sequential under the
+  process lock, watchdog-wrapped resumes, ~3.3h/arm at measured throughput (~8 min/iter incl.
+  eval spikes) → well inside the authorized bound.
+- **Criteria FROZEN** in doc 13 section 3 before launch (bomb-kill ≥6/64 AND ≥control+4;
+  chosen-WAIT ≤control−8pp; SD-off draws ≤control+5pp; per-seat direction consistency;
+  DIRECTIONAL allows exactly one follow-up; FLAT kills the lever). The paired-eval battery was
+  amended to 32 games (64 matches) at the gate — before launch — to match the criteria's units
+  and the historical lever-gate N.
+- **Post-launch verification planned (KL-100 item 7)**: resolved LR at matched iterations from
+  both arms' metrics.jsonl, manifest/fork-log diff showing exactly one differing semantic
+  field between arms, same executable SHA-256 in both run dirs' evidence, pool-A/realized-
+  fraction telemetry live in the treatment arm's metrics from iteration 131 onward.
