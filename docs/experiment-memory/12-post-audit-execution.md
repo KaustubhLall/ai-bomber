@@ -445,3 +445,122 @@ than the plan's own "within noise" bar); effective-idle quantified with both a r
 streak-structure table - the "explicit WAIT understates passivity" claim from the original audit
 now has real numbers on both counts, with the streak structure being the more informative of the
 two.
+
+## Phase 1c: representative win/loss/draw writeup
+
+The Phase 1b run didn't request `--per-match-output`, only `--trace-output`, so there was no
+direct win/loss/draw/cause label to select from. Rather than re-run the expensive trace capture
+again, ran one additional cheap `evaluate --per-match-output` pass (control03-iter130, identical
+seed base 1300001, identical everything else, no `--trace-output` so it only took as long as a
+normal MCTS eval) and cross-referenced its per-match outcome rows against the **already-captured**
+`control03-iter130-trace.jsonl` by `(seed, learner_seat)`. This is only valid because
+reproducibility was already proven exactly (Phase 1b's attempt-1-vs-attempt-2 comparison, and
+this pass's own aggregate W-D-L/WAIT numbers, which matched the original run identically) - same
+seed base + same checkpoint + same config deterministically produces the same games regardless of
+which optional output flags are set, confirmed rather than assumed.
+
+All three examples below are from `control03-iter130`, seed block `1300010`/`1300005` (part of
+the standing diagnostic block, not a burned holdout), against MCTS-256. Full step-by-step data:
+`tools/analyze_neural_trace.py results/kl107-wait-diagnostic-v4-2026-07-11/control03-iter130-
+trace.jsonl --seed SEED --seat SEAT --steps`.
+
+### Win: seed=1300005, seat=0, bomb-kill, 72 steps
+
+The **only bomb-kill win in this entire 32-game batch** (aggregate: `win_by_bomb: 1` out of 25
+wins) - chosen deliberately over an arena-crush win for exactly that reason. WAIT fraction 29%,
+well below this checkpoint's ~63% average - already a hint that this game looks different from
+the typical pattern.
+
+Value trajectory: deeply negative for the first ~50 steps (-0.86 at step 0, still -0.32 at step
+19) despite placing several bombs early (steps 1, 5, 9-10, 13-14, 18, 22, 26, 30) - these read as
+ordinary crate-clearing, not threats, and didn't move the value needle much individually. The
+turn: step 20 (DOWN) crosses to +0.322 for the first time, then **three explicit search-overrides-
+raw-prior events in a tight window** - step 51 (RIGHT, masked/mcts favor RIGHT 78 visits vs. raw's
+top pick WAIT), step 52 (BOMB, mcts 39 visits vs. WAIT's 36 - search picks the LOWER-prior action
+here specifically because its backed-up value is better), and step 56 (another BOMB, 51 visits vs.
+WAIT's 27). Value locks in at +0.938 by step 55 and +0.996-0.999 from step 57 onward - the window
+of these three overrides is where the game was actually won, not the many earlier bombs.
+
+**Reading:** this is a positive counter-example to the aggregate "prior dominates, search rarely
+overrides it" finding (Phase 0a/1b tables: raw==masked_top ~99.6-99.7% of all steps) - in the
+handful of steps that mattered most for the outcome, search DID override a passive/ambivalent
+prior three separate times, each time toward the eventually-correct aggressive action. This
+doesn't contradict the aggregate finding (it's still true search rarely overrides the prior
+overall - three overrides out of 72 steps is itself only ~4%) but it's suggestive that WHEN search
+does override, it's disproportionately likely to happen at genuinely decisive moments rather than
+uniformly at random - consistent with, but not proof of, PUCT's value-driven exploration doing its
+job correctly on the rare occasions the prior leaves it enough visit budget to matter. One game is
+not enough to generalize this; flagging as a hypothesis for KL-105, not a finding.
+
+### Loss: seed=1300010, seat=0, self-kill, 58 steps
+
+Chosen over the more common arena-crush loss cause (4/5 of this batch's losses; this is the only
+self-kill) because it has a genuinely analyzable tactical structure - an arena-crush loss is a
+diffuse ~120-step mutual stall ended by the closing wall, without a clean single "mistake."
+
+Steps 0-44: comfortably ahead (value +0.5 to +0.85 throughout), including an uninterrupted run of
+**30 consecutive WAIT steps (15-44)** while value gradually drifted down from +0.77 to +0.45 -
+textbook "chosen idling while ahead" from the effective-idle table, in a single continuous streak
+close to this checkpoint's own mean_streak (44.9) for this exact config.
+
+**The most interesting single moment in all three examples:** at step 45, `search_value_estimate`
+(the backed-up search average) crashes from +0.453 to -0.062, while `value_head_raw_recomputed`
+(the raw, pre-search value at the same position) still reads **+0.520** - confidently fine.
+Search's lookahead detected the danger a full move before the raw value head did. Despite this,
+the position **still chose WAIT for four more steps** (45-48, masked_prior favoring WAIT at
+0.52-0.64 throughout) while `search_value_estimate` kept falling (-0.062 -> -0.367 -> -0.423 ->
+-0.401) - a directly observed instance of the aggregate Q-gap finding (Phase 0a: Q(WAIT) loses to
+the best visited alternative on ~55% of comparable rows): search's own value judgment had already
+turned against WAIT, but the prior's visit-count weight kept winning anyway.
+
+Step 49 finally breaks the streak (RIGHT, 71 visits vs. WAIT's 13 - the clearest single override
+in this game), and steps 50-52 look like a real escape attempt (value recovering to +0.65-0.71).
+But steps 53-56 (RIGHT, LEFT, RIGHT, LEFT - all search-overrides, value falling steadily: +0.236,
++0.084, -0.468, -0.968) show the escape running out of room, not finding it: by step 56,
+`safe_action_count` had dropped to 2, and by the final step 57, to exactly **1** - the position
+only had BOMB left as a tactically safe action (`policy_prior_after_safety_mask` = [BOMB: 1.00],
+96/96 visits), which killed the agent. Structurally this final step is "BOMB-forced" in the same
+sense `wait_forced` means "WAIT-forced" (this project's trace format doesn't currently generalize
+`wait_forced` to other actions - a possible small Phase-1-adjacent follow-up, not done here).
+
+**Reading:** the actual failure isn't the final bomb - it's the 8-step gap between when search's
+own value estimate first flagged danger (step 45) and when the position finally moved (step 49),
+during which the WAIT streak's opportunity cost consumed the room needed to actually escape.
+Directly ties the effective-idle streak finding to a real outcome, not just an aggregate rate.
+
+### Draw: seed=1300010, seat=1, mutual death, 137 steps
+
+Same starting seed as the loss above, opposite seat - a genuinely different trajectory (the
+learner occupies the other starting position and the MCTS opponent's internal RNG differs by
+seat), not a duplicate.
+
+Comfortably ahead essentially the whole game (value +0.75 to +0.85 from step 0 through step 121,
+including another long chosen-WAIT stretch around steps 118-120). Then: step 122, a BOMB
+placement that **overrides the raw prior's WAIT preference** (masked/mcts favor BOMB 43 visits vs.
+WAIT's 41, raw itself still preferred WAIT at 0.41) - value immediately crashes to -0.367 and
+never recovers, unlike the win example's analogous overrides. A chaotic 10-step sequence follows
+(123-132, value oscillating -0.10 to -0.25) before the game **locks into `wait_forced=true` for
+the final four traced steps (133-136)**, `search_value_estimate` pinned at **exactly -0.200** -
+which is this checkpoint's configured `mutual_death_value` (visible in the agg JSON's
+`resolved_semantics`). Search had fully converged on "this specific position is a forced mutual
+death" several steps before the game actually ended, with zero remaining safe alternatives to
+WAIT.
+
+**Reading:** a clean, unambiguous example of genuinely *forced* idling (the last four steps)
+immediately preceded by a *chosen* aggressive move (step 122) that made things worse, not better -
+the mirror image of the win example's three overrides, where search's override toward aggression
+was well-timed and correct. Together the win and draw examples show search-overriding-the-prior is
+not uniformly good or bad; it's a real, if infrequent, lever that can cut either way, and this
+single-game evidence doesn't establish which is more common in aggregate (a question for a future,
+purpose-built pass, not this one).
+
+### What these three examples do and don't establish
+
+All three are single-game anecdotes from one checkpoint (control03-130) - illustrative of
+mechanisms already visible in the aggregate tables (chosen-WAIT streaks, search overriding the
+raw prior in both directions, forced-vs-chosen WAIT, the raw-value-vs-search-value divergence),
+not new statistical claims on their own. Their value is making the aggregate numbers concrete and
+inspectable, and surfacing two candidate hypotheses (search-overrides cluster near decisive
+moments; raw value head can lag search's own danger detection by at least one step) that a
+designed experiment, not three cherry-picked-for-legibility examples, would be needed to actually
+test.
