@@ -156,7 +156,13 @@ struct TrainConfig {
        CALLING script (e.g. `git diff | sha256`) and recorded verbatim in fork-manifest.json.
        The trainer does not shell out to git itself (fragile - needs git on PATH, assumes a
        working directory, etc.); AI_BOMBER_GIT_SHA already captures the committed HEAD at
-       compile time, this covers uncommitted changes at fork time. CLI --dirty-diff-digest. */
+       compile time, this covers uncommitted changes at fork time. CAVEAT: AI_BOMBER_GIT_SHA is
+       resolved at CMake CONFIGURE time (CMakeLists.txt, `git rev-parse` in an execute_process),
+       not at every build - a `cmake --build` alone after new commits reuses the stale value from
+       the last configure. Re-run `cmake -S . -B <builddir>` before trusting a binary's stamped
+       git_commit as current; executable_sha256 is the only field that's always accurate, since
+       it hashes the actual bytes regardless of what configure step produced them.
+       CLI --dirty-diff-digest. */
     std::string dirty_diff_digest{};
     /* Exact argv captured at parse time and embedded in evaluation evidence. */
     /* Exact process argv retained as separate strings for evidence JSON. A reconstructed shell

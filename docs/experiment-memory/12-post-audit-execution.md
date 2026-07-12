@@ -87,3 +87,48 @@ framing, Q-gap observation added, Wilson-bound relabeled) and KL-105 (Diagnosis 
 to reference the direct measurement). See both issues for the full text.
 
 **Accept criteria met:** tool output reproduces table A2 exactly; Linear/docs updated; committed.
+
+## Phase 0b: provenance hygiene (F1)
+
+Confirmed F1 directly before fixing it: queried the three saved aggregate JSON files
+(`results/kl107-wait-diagnostic-2026-07-11/*-agg.json`) and found all three stamped
+`git_commit: d6eeb4ea30d3-dirty`, with an identical `executable_sha256` (`32394bed7c83...`)
+across all three - confirming internal consistency (same binary for all three comparisons) even
+though the human-readable commit stamp doesn't reflect the v3 source that actually ran.
+
+**First rebuild attempt exposed the actual bug, not just its symptom.** Rebuilt at clean HEAD
+(`2396258`, `git status` empty) via `cmake --build build-native-gpu --config Release` alone -
+43/43 tests still passed, but a quick trace smoke-test against the cheap CI fixture still showed
+`git_commit: d6eeb4ea30d3-dirty`, unchanged, even at a fully clean, fully-committed tree. This is
+because `AI_BOMBER_GIT_SHA` is resolved by a `git rev-parse`/`git diff` check inside CMake's
+*configure* step (`CMakeLists.txt` lines 4-16), and `cmake --build` alone does not re-run
+configure unless `CMakeLists.txt` itself changed - it reuses whatever value the *last* configure
+captured, however stale. Re-ran `cmake -S . -B build-native-gpu` explicitly (a real reconfigure),
+rebuilt, and the stamp corrected itself to `2396258e40ee` (matching HEAD exactly, no `-dirty`
+suffix) with a new binary hash `37b067c1ac74...` (different from the stale build's hash, since
+the embedded SHA string is itself part of the binary's bytes).
+
+**Practical rule going forward, now documented in `trainer.h` next to `AI_BOMBER_GIT_SHA`'s other
+usage**: a `git_commit` stamp on any evidence file is only trustworthy if `cmake -S . -B
+<builddir>` was explicitly re-run since the last commit, not just `cmake --build`.
+`executable_sha256` is the only field immune to this - it hashes the actual bytes regardless of
+what configure step produced them, which is why it was already treated as the strong anchor in
+`11-kl107-v3-audit-review.md` and `KL-107`'s Linear text.
+
+**Full verification at the corrected, clean-HEAD build:**
+- `cmake --build build-native-gpu --config Release -j 12` — clean, zero errors.
+- `ctest -C Release` in `build-native-gpu` — **43/43 passed**.
+- `ctest -C Release` in `build` (dependency-free) — **22/22 passed**.
+- `bomber_alphazero_native.exe` SHA-256 at commit `2396258`: `37b067c1ac7424adc1be66ce47703c3
+  6106ffa667e08c3aa0f75e0718de9e877`. Recorded here and in the Phase 0c evidence manifest.
+
+This does **not** change the validity of the earlier diagnostic findings (Phase 0a's table, the
+systematic pass) - the *source* that produced them is exactly what's now committed (confirmed by
+`11-kl107-v3-audit-review.md`'s own faithfulness cross-check and this session's Phase 0a
+reproduction), only the evidence's self-description of which commit produced it was stale. Future
+evidence generation (Phase 1's clean-binary re-run) will use this freshly-reconfigured binary.
+
+**Accept criteria met:** clean-HEAD binary exists with a recorded, verified-accurate hash; the
+configure-time staleness caveat is documented in `trainer.h`. The optional CMake custom-target
+work (auto-refreshing the SHA at build time) was explicitly skipped as out of scope for this
+phase's acceptance bar - noted as a possible future improvement, not implemented.
