@@ -498,6 +498,25 @@ int baseline_action(AgentType type, const BomberEnv& env, int perspective, uint6
     return static_cast<int>(agent_act(&agent, &observation, &snapshot));
 }
 
+/* Shared by expand_and_backup's policy masking and KL-107 trace capture, so a trace's
+   safe_action_mask always matches what the search itself actually treated as safe for that
+   seat - duplicating this logic at both call sites would risk silent drift between what the
+   trace reports and what the search enforced. Returns a kActions-sized 0/1 mask indexed by
+   action; count_out receives the number of safe actions (falls back to plain legality when
+   the tactical safe-action check reports none, matching the search's own fallback exactly). */
+std::array<int, kActions> safe_action_mask_for(const BomberEnv& env, int seat, int& count_out) {
+    std::array<int, kActions> safe{};
+    count_out = bomber_training_safe_actions_env(&env, seat, safe.data(), kActions);
+    if (count_out <= 0) {
+        Action legal[kActions];
+        env_legal_actions(&env, seat, legal, &count_out);
+        safe.fill(0);
+        for (int legal_index = 0; legal_index < count_out; ++legal_index)
+            safe[static_cast<int>(legal[legal_index])] = 1;
+    }
+    return safe;
+}
+
 struct Node {
     explicit Node(const BomberEnv& source, bool is_terminal = false) : terminal(is_terminal) {
         env_copy(&env, &source);
@@ -736,15 +755,8 @@ private:
             Node& node = *jobs[index].leaf;
             std::array<std::array<float, kActions>, 2> seat_policy{};
             for (int seat = 0; seat < 2; ++seat) {
-                int safe[kActions]{};
-                int count = bomber_training_safe_actions_env(&node.env, seat, safe, kActions);
-                if (count <= 0) {
-                    Action legal[kActions];
-                    env_legal_actions(&node.env, seat, legal, &count);
-                    for (int action = 0; action < kActions; ++action) safe[action] = 0;
-                    for (int legal_index = 0; legal_index < count; ++legal_index)
-                        safe[static_cast<int>(legal[legal_index])] = 1;
-                }
+                int count = 0;
+                const auto safe = safe_action_mask_for(node.env, seat, count);
                 float total = 0.0f;
                 for (int action = 0; action < kActions; ++action) {
                     seat_policy[seat][action] = safe[action] ?
@@ -2076,7 +2088,12 @@ struct Trainer::Impl {
            separate manifest lookup. Trace-off (trace_output empty, the default) means this
            whole block never executes and nothing about the search or chosen actions changes -
            every value read here (priors, visits, value sums) was already computed by the
-           search regardless of whether anyone is watching. */
+           search regardless of whether anyone is watching.
+           v3 adds a genuinely raw (pre-mask) policy/value head recomputation, the safe-action
+           mask used to derive masked_prior from it, a wait_forced flag (idling forced by the
+           mask vs chosen among alternatives), and root Q per learner action - the raw/value
+           recomputation costs one extra single-position forward pass per traced step, still
+           entirely gated behind trace_output being set. */
         std::unique_ptr<std::ofstream> trace_log;
         if (!trace_output.empty()) {
             if (!trace_output.parent_path().empty())
@@ -2085,7 +2102,7 @@ struct Trainer::Impl {
             if (!*trace_log)
                 throw std::runtime_error("could not open neural trace output: " +
                                          trace_output.string());
-            *trace_log << "{\"trace_format_version\":2,\"checkpoint_sha256\":\""
+            *trace_log << "{\"trace_format_version\":3,\"checkpoint_sha256\":\""
                        << sha256_file(requested_checkpoint_path)
                        << "\",\"executable_sha256\":\""
                        << sha256_file(current_executable_path())
@@ -2146,6 +2163,63 @@ struct Trainer::Impl {
                     double value_estimate = 0.0;
                     for (size_t joint = 0; joint < kJointActions; ++joint) value_estimate += value_sum[joint];
                     value_estimate = root_visits > 0 ? value_estimate / root_visits : 0.0;
+
+                    /* KL-107 v3: genuinely raw (pre-mask) policy/value head output at this exact
+                       root position, via a fresh single-position forward pass. expand_and_backup
+                       masks and renormalizes every node it expands, root or interior alike, so
+                       there is no hook inside the search that ever holds the unmasked values -
+                       they are gone by the time SearchResult exists. match.env here is the same
+                       pre-step position the search evaluated (Node copies the env on construction
+                       and never mutates the original, and no step has been applied to match.env
+                       yet), so this reproduces the root evaluation rather than approximating it.
+                       Recomputed, not captured - name fields accordingly so this cannot be
+                       misread as "the policy the search used" the way v1's raw_policy was. */
+                    std::array<float, kObservationSize> encoded{};
+                    if (bomber_training_encode_env(&match.env, match.learner_seat, encoded.data(),
+                                                    kObservationSize) != kObservationSize)
+                        throw std::runtime_error("C observation encoder failed during KL-107 trace capture");
+                    auto raw_input = torch::from_blob(encoded.data(),
+                        {1, BOMBER_TRAINING_CHANNELS, BOMBER_TRAINING_VIEW_SIZE,
+                         BOMBER_TRAINING_VIEW_SIZE}, torch::kFloat32).to(device);
+                    torch::Tensor raw_logits, raw_value_tensor;
+                    model->eval();
+                    {
+                        torch::InferenceMode inference;
+                        AutocastGuard autocast;
+                        std::tie(raw_logits, raw_value_tensor) = model->forward(raw_input);
+                    }
+                    const auto raw_policy_tensor =
+                        torch::softmax(raw_logits.to(torch::kFloat32), 1).to(torch::kCPU);
+                    const auto raw_policy_accessor = raw_policy_tensor.accessor<float, 2>();
+                    std::array<double, kActions> raw_policy{};
+                    for (int action = 0; action < kActions; ++action)
+                        raw_policy[action] = raw_policy_accessor[0][action];
+                    const double raw_value_head =
+                        raw_value_tensor.to(torch::kFloat32).to(torch::kCPU).item<float>();
+
+                    /* Same safe-action computation the search itself used to build masked_prior
+                       above (shared helper, not a re-derivation) - safe_action_count==1 with
+                       that one action being WAIT means idling was the position's only legal
+                       move, not a policy preference, distinguishing forced from chosen idling. */
+                    int safe_action_count = 0;
+                    const auto safe_mask = safe_action_mask_for(
+                        match.env, match.learner_seat, safe_action_count);
+                    const bool wait_forced = safe_action_count == 1 &&
+                        safe_mask[static_cast<int>(ACTION_WAIT)] == 1;
+
+                    /* Root Q per learner action, marginalized from the same seat-aware
+                       accumulation select_joint uses internally (value_sum / visits) - reusing
+                       marginal_distribution on both arrays instead of hand-rolling the seat-
+                       dependent joint-index layout (a*kActions+opp for seat 0, opp*kActions+a
+                       for seat 1) avoids a transposed-but-plausible Q vector. */
+                    const auto q_visits = marginal_distribution(
+                        search_result.visits, match.learner_seat);
+                    const auto q_value_sums = marginal_distribution(value_sum, match.learner_seat);
+                    std::array<double, kActions> root_q{};
+                    for (int action = 0; action < kActions; ++action)
+                        root_q[action] = q_visits[action] > 0.0
+                            ? q_value_sums[action] / q_visits[action] : 0.0;
+
                     *trace_log << "{\"seed\":" << match.seed
                         << ",\"learner_seat\":" << match.learner_seat
                         << ",\"step\":" << match.env.state.step
@@ -2160,7 +2234,21 @@ struct Trainer::Impl {
                         *trace_log << (action ? "," : "") << mcts_policy[action];
                     *trace_log << "],\"root_visits\":" << root_visits
                         << ",\"search_value_estimate\":" << value_estimate
-                        << ",\"running_wait_fraction\":"
+                        << ",\"policy_head_raw_recomputed\":[";
+                    for (int action = 0; action < kActions; ++action)
+                        *trace_log << (action ? "," : "") << raw_policy[action];
+                    *trace_log << "],\"policy_head_raw_recomputed_entropy\":"
+                        << distribution_entropy(raw_policy)
+                        << ",\"value_head_raw_recomputed\":" << raw_value_head
+                        << ",\"safe_action_mask\":[";
+                    for (int action = 0; action < kActions; ++action)
+                        *trace_log << (action ? "," : "") << safe_mask[action];
+                    *trace_log << "],\"safe_action_count\":" << safe_action_count
+                        << ",\"wait_forced\":" << (wait_forced ? "true" : "false")
+                        << ",\"search_root_q_values\":[";
+                    for (int action = 0; action < kActions; ++action)
+                        *trace_log << (action ? "," : "") << root_q[action];
+                    *trace_log << "],\"running_wait_fraction\":"
                         << (match.total_steps > 0
                                 ? static_cast<double>(match.wait_steps) / match.total_steps
                                 : 0.0)
@@ -3248,7 +3336,10 @@ void print_native_help() {
         "                            lineage, schedule, binary, and non-treatment semantics\n"
         "  --trace-output PATH       (evaluate --eval-mcts) Write one JSON line per LEARNER\n"
         "                            STEP: safety-masked policy prior + entropy, MCTS-refined\n"
-        "                            policy, search backup value, root visits, chosen action\n"
+        "                            policy, search backup value, root visits, chosen action,\n"
+        "                            plus a genuinely raw pre-mask policy/value recomputation,\n"
+        "                            the safe-action mask, a wait_forced flag, and root Q per\n"
+        "                            action (trace_format_version 3)\n"
         "  --overwrite-evidence      Explicitly allow existing output/per-match/trace paths\n"
         "                            to be replaced (default is fail closed)\n"
         "  --draw-value X            Set both per-seat draw values (timeout+mutual death) to X\n"

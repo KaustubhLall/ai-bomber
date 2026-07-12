@@ -200,6 +200,35 @@ if(TARGET bomber_alphazero_native)
       --no-progress)
   set_tests_properties(test_native_alphazero_evidence_refuses_overwrite PROPERTIES
     DEPENDS test_native_alphazero_semantic_evaluate TIMEOUT 20 WILL_FAIL TRUE)
+
+  # KL-107 v3 regression: trace-output must carry a genuinely raw (pre-mask) policy/value
+  # recomputation, not another copy of the search's already-masked prior - the v1/v2 bug this
+  # guards against is exactly the earlier raw_policy mislabeling (see the correction recorded
+  # in Linear KL-98/KL-100 and docs/experiment-memory/10-autonomous-brick-execution.md).
+  add_test(NAME test_native_alphazero_trace_raw_evaluate
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> evaluate
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke
+      --checkpoint latest.pt
+      --channels 16 --blocks 1 --max-steps 8 --replay-capacity 128
+      --eval-games 1 --eval-simulations 2
+      --eval-mcts --mcts-eval-games 4
+      --baseline-mcts-simulations 4 --baseline-mcts-depth 4
+      --trace-output ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke/trace-raw-check.jsonl
+      --output ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke/eval-trace-raw.json
+      --overwrite-evidence --no-progress)
+  set_tests_properties(test_native_alphazero_trace_raw_evaluate PROPERTIES
+    DEPENDS test_native_alphazero_semantic_evaluate TIMEOUT 60)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME test_native_alphazero_trace_raw_check
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_alphazero_trace_raw_check.py
+        ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke/trace-raw-check.jsonl)
+    set_tests_properties(test_native_alphazero_trace_raw_check PROPERTIES
+      DEPENDS test_native_alphazero_trace_raw_evaluate TIMEOUT 20)
+  endif()
+
   add_test(NAME test_native_alphazero_unknown_option_fails
     COMMAND ${CMAKE_COMMAND} -E env
       "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"

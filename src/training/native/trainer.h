@@ -23,11 +23,15 @@ struct TrainConfig {
        result. CLI --per-match-output. */
     std::filesystem::path per_match_output{};
     /* KL-107: if set (evaluate mode with --eval-mcts), write one JSON line per LEARNER STEP
-       across all MCTS-baseline matches. The captured root prior is the network policy AFTER
-       the engine's safe-action mask and renormalization; it is not an unmasked policy-head
-       output. The value is likewise the search backup average, not the raw value head. These
-       names matter because the trace cannot yet isolate policy head vs safety mask vs value
-       backup. CLI --trace-output. */
+       across all MCTS-baseline matches. policy_prior_after_safety_mask/search_value_estimate
+       are the network policy AFTER the engine's safe-action mask and renormalization, and the
+       search backup average, respectively - not an unmasked policy-head output or raw value
+       head. v3 adds a genuinely raw pre-mask recomputation (policy_head_raw_recomputed,
+       value_head_raw_recomputed, via a dedicated single-position forward pass on the same root
+       the search evaluated), the safe_action_mask used to derive the masked prior, a
+       wait_forced flag (idling was the position's only safe action, not a preference), and
+       root Q per action (search_root_q_values, marginalized from existing search backup data).
+       CLI --trace-output. */
     std::filesystem::path trace_output{};
     /* If set (evaluate mode), write a v4 replay of one representative checkpoint game that
        bomber_viz --replay can play back. Opponent = heuristic, or MCTS with --eval-mcts;

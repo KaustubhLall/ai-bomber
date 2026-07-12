@@ -2,9 +2,12 @@
 
 For each traced game, prints the safety-masked root prior, MCTS-refined policy, agreement, and
 search backup trajectory. Important boundary: v1 called the masked prior `raw_policy`, but it
-was already filtered by the safe-action mask; neither v1 nor v2 contains the unmasked policy
-head or raw value head. This tool therefore localizes a failure to the policy+mask path versus
-search refinement, not to the neural head alone.
+was already filtered by the safe-action mask; v1/v2 contain no unmasked policy head or raw value
+head at all. v3 adds a genuinely recomputed pre-mask policy/value (policy_head_raw_recomputed,
+value_head_raw_recomputed), the safe_action_mask used to derive the masked prior, a wait_forced
+flag (idling was the position's only safe action, not a preference), and root Q per action
+(search_root_q_values) - this tool reports all of these when present, and falls back to the v2
+masked-prior-only view on older files.
 
 Usage:
     python tools/analyze_neural_trace.py trace.jsonl                  # summary of every game
@@ -74,16 +77,40 @@ def main() -> None:
         print(f"  value trajectory (first 5 -> last 5): {value_trajectory[:5]} ... "
               f"{value_trajectory[-5:]}")
 
+        has_raw = all("policy_head_raw_recomputed" in r for r in steps) if steps else False
+        if has_raw:
+            raw_agree = sum(1 for r in steps if r["chosen_action"] ==
+                             max(range(6), key=lambda i: r["policy_head_raw_recomputed"][i]))
+            mask_changed_top = sum(
+                1 for r in steps
+                if max(range(6), key=lambda i: r["policy_head_raw_recomputed"][i])
+                != max(range(6), key=lambda i: prior(r)[i]))
+            forced = sum(1 for r in steps if r["wait_forced"])
+            wait_not_forced = sum(1 for r in steps if r["chosen_action"] == 5 and not r["wait_forced"])
+            print(f"  [v3] chosen==argmax(RAW pre-mask policy) in {raw_agree}/{n} steps "
+                  f"({100*raw_agree/n:.0f}%), mask changed the top action in "
+                  f"{mask_changed_top}/{n} steps ({100*mask_changed_top/n:.0f}%)")
+            print(f"  [v3] WAIT forced (only safe action) {forced}/{n} steps "
+                  f"({100*forced/n:.0f}%); WAIT chosen with alternatives available "
+                  f"{wait_not_forced}/{n} steps ({100*wait_not_forced/n:.0f}%) - "
+                  f"the latter is the real passivity signal, the former is not a policy choice")
+
         if args.steps:
             for row in steps:
                 masked_prior = prior(row)
                 argmax_prior = max(range(6), key=lambda i: masked_prior[i])
                 marker = "" if row["chosen_action"] == argmax_prior else "  <- search changed masked prior"
-                print(f"    step={row['step']:>3} chosen={ACTION_NAMES[row['chosen_action']]:>5} "
-                      f"masked_prior=[{top_actions(masked_prior)}] "
-                      f"mcts=[{top_actions(row['mcts_policy'])}] "
-                      f"value={row['search_value_estimate']:+.3f} "
-                      f"root_visits={row['root_visits']}{marker}")
+                line = (f"    step={row['step']:>3} chosen={ACTION_NAMES[row['chosen_action']]:>5} "
+                        f"masked_prior=[{top_actions(masked_prior)}] "
+                        f"mcts=[{top_actions(row['mcts_policy'])}] "
+                        f"value={row['search_value_estimate']:+.3f} "
+                        f"root_visits={row['root_visits']}{marker}")
+                if "policy_head_raw_recomputed" in row:
+                    forced_tag = " FORCED" if row["wait_forced"] else ""
+                    line += (f"\n        raw=[{top_actions(row['policy_head_raw_recomputed'])}] "
+                             f"raw_value={row['value_head_raw_recomputed']:+.3f} "
+                             f"safe={row['safe_action_count']}/6{forced_tag}")
+                print(line)
         print()
 
 
