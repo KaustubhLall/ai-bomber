@@ -284,9 +284,11 @@ lever2-iter160-SD160     5349  64.2%   0.6%     0.5%      63.6%    62.3%       9
 
 Reading, spelled out:
 
-- **"forced"** = WAIT was the position's only legal/safe action. This is under 1%
-  everywhere with a tight LCB — the environment essentially never forces
-  idleness.
+- **"forced"** = WAIT was the position's only *safe* action per the tactical
+  safety model (not merely legal — an action can be legal but tactically unsafe,
+  e.g. walking into an active blast radius; these are not the same check). This
+  is under 1% everywhere with a tight LCB — the environment essentially never
+  forces idleness.
 - **"chosen"** = WAIT picked when real alternatives existed. This is 61-64% of
   **every traced step** (not just WAIT steps), Wilson floor above 59% in all
   three. This is the number that says the passivity is a real, repeated

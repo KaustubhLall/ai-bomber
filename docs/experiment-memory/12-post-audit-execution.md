@@ -155,3 +155,42 @@ traces stay local) - implemented exactly as specified, no raw trace JSONL commit
 **Accept criteria met:** committed; manifest lists every artifact with a hash, and every
 committed artifact's producing argv is already embedded in the artifact itself (the agg JSON
 files were KL-101 write-once evidence to begin with).
+
+## Phase 0d: trace UX edges (F6/F7)
+
+**F6.** Confirmed directly (`trainer.cpp` lines 3059-3063): `trace_output` is only ever passed
+to the MCTS-branch `evaluate_baseline()` call, so `--trace-output` without `--eval-mcts`
+previously produced no trace file at all - silent, not even a header-only one. Added a stderr
+warning in `evaluate_only()`, right after the existing evidence-path checks: *"warning:
+--trace-output was given without --eval-mcts; no rows will be written..."*. Verified against the
+cheap CI fixture: running `evaluate --trace-output PATH` without `--eval-mcts` now prints the
+warning and confirmed `Test-Path PATH` is `False` afterward (matches the documented behavior
+exactly, now loud instead of silent).
+
+**F7.** "Forced" (in `wait_forced` and this session's diagnostic tooling) means WAIT was the
+position's only *safe* action per the tactical safety model (`safe_action_mask_for()`), not the
+only *legal* action per plain game rules - an action can be legal but tactically unsafe (e.g.
+walking into an active blast radius). Found two real instances of this conflation, both fixed:
+`trainer.cpp` line ~2202 (a code comment said "only legal move," corrected to "only SAFE action"
+with the legal-vs-safe distinction spelled out inline) and `11-kl107-v3-audit-review.md` line 287
+("only legal/safe action" softened the distinction into a slash, corrected to state the
+distinction explicitly). Checked the CLI `--help` text and the `trace_output` field's other doc
+comments (`trainer.h`, `trainer.cpp` lines 2093/3350) for the same conflation - both already said
+"safe-action mask" correctly, nothing further to fix there.
+
+**Verification:** `cmake --build` + `ctest -C Release` in `build-native-gpu` after both changes
+(the F6 code change and the F7 comment fix) — **43/43 passed** both times. The F6 warning was
+manually exercised against the cheap fixture and confirmed to fire and to correctly predict the
+no-trace-file outcome.
+
+**Accept criteria met:** warning observable on a `--trace-output`-without-`--eval-mcts` run;
+`ctest` still green.
+
+---
+
+**Phase 0 complete.** All four sub-items (0a direct stats, 0b provenance hygiene, 0c evidence
+archive, 0d trace UX edges) done, each its own commit, narrative log updated per brick as this
+file's own standing constraint requires. Next: Phase 1 (KL-107 to diagnostic-complete: v4 trace
+fields, clean-binary re-run, representative writeups, overhead benchmark) — advisor checkpoint 2
+applies if any test-assertion/threshold change is needed along the way; checkpoint 3 (hard stop
+if advisor is down) applies before Phase 2's design work begins.

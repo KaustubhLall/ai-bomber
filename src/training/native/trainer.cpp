@@ -2199,8 +2199,10 @@ struct Trainer::Impl {
 
                     /* Same safe-action computation the search itself used to build masked_prior
                        above (shared helper, not a re-derivation) - safe_action_count==1 with
-                       that one action being WAIT means idling was the position's only legal
-                       move, not a policy preference, distinguishing forced from chosen idling. */
+                       that one action being WAIT means idling was the position's only SAFE
+                       action (per the tactical safety model, not plain game-rule legality - an
+                       action can be legal but tactically unsafe, e.g. walking into an active
+                       blast), not a policy preference, distinguishing forced from chosen idling. */
                     int safe_action_count = 0;
                     const auto safe_mask = safe_action_mask_for(
                         match.env, match.learner_seat, safe_action_count);
@@ -3037,6 +3039,13 @@ struct Trainer::Impl {
         require_available_evidence_path(config.evaluation_output, "aggregate evaluation output");
         require_available_evidence_path(config.per_match_output, "per-match evaluation output");
         require_available_evidence_path(config.trace_output, "neural trace output");
+        /* KL-107 Phase 0d (F6): trace_output is only ever threaded into the MCTS-baseline
+           evaluate_baseline() call below - --trace-output without --eval-mcts silently produces
+           an empty (header-only) trace file, which previously failed silent rather than loud. */
+        if (!config.trace_output.empty() && !config.evaluate_mcts)
+            std::cerr << "warning: --trace-output was given without --eval-mcts; no rows will be "
+                         "written (trace capture only runs during the MCTS baseline match "
+                         "loop) - pass --eval-mcts too, or drop --trace-output\n";
         /* KL-101: print the RESOLVED semantic config actually in effect for this evaluation
            (after load_checkpoint()'s inheritance in the constructor above ran) - so a strong
            W-D-L score is never read without also seeing whether the reward/mechanics
