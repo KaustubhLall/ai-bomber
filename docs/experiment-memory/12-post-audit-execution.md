@@ -711,3 +711,36 @@ behaviorally inert for the comparison. Fails closed outside `--fresh --fork-from
 rejected, corrupt-parent fork rejected (the exact production failure), reset fork succeeds
 with a self-consistent lineage, and the reset fork's own subsequent resume stays healthy.
 54/54 green.
+
+## Treatment arm launched — bootstrap verified end-to-end (commit `b48838b`, binary `17d02287ef90...`)
+
+Attempt 2 of the treatment bootstrap ran to completion. One operational mistake by the planner,
+recorded honestly: the bootstrap was foregrounded through `... | Tee-Object | Select-Object
+-First 45`, and Select-Object's early pipeline stop broke the output pipe mid-iteration — the
+console capture (and the Tee file) end at league-game 18/64, and it initially looked like the
+process had been killed. It hadn't: the trainer kept running detached from the broken pipe,
+completed iteration 131, checkpointed, and exited cleanly at its target (latest.pt + metrics
+written minutes after the pipe died). Verified from the run dir's own `train-console.log`
+(the KL-101 durable tee — this exact "console was lost, what actually happened" scenario is
+what it exists for) and metrics.jsonl, not from the truncated live capture. Lesson: never put
+`Select-Object -First N` downstream of a long-running native process; long launches go through
+`run_in_background` + the run dir's own durable logs.
+
+**Iteration-131 metrics validate every design prediction at once:**
+- `learning_rate = 1.0386e-4` — the explicit 33,280-update horizon resumed the cosine almost
+  exactly at the predicted ≈1.05e-4 (vs the parent's floor 1e-5).
+- `replay_cause_pools` after one iteration: 20,577 newly-tagged samples (bomb=5,914,
+  arena_crush=9,108, selfkill=1,464, mutual_death=4,091) + 179,423 legacy `unknown` = exactly
+  200,000. Mirror self-play's own console line reported `bomb=0` decisive kills, so every
+  bomb-cause sample came from league wins — which is exactly why `bomb_win_side_pool == bomb
+  count` (5,914): league bomb-wins tag the whole (learner-seat-only) trajectory as winner-side.
+  Internal consistency, not coincidence.
+- `realized_pool_a_batch_fraction = 0.25` — the cap is already binding (pool A ≈3% of the
+  buffer, 16× boost → 0.47 > cap): 25% of every optimization batch is demonstrated-kill
+  winner-side samples vs a ~3% natural rate, ≈8.5× effective reinforcement of exactly the
+  signal H1 says the head never sees.
+- fork-manifest.json: `champion_reset: true`, clean `git_commit: b48838b5a2a7`, resolved
+  semantics carrying `replay_cause_balance_cap=0.25` and `learning_rate_schedule_updates=33280`.
+
+Resume to iteration 154 launched under the watchdog (backgrounded properly this time),
+watchdog-attempts.jsonl shows attempt 1 running. Control arm follows sequentially after.
