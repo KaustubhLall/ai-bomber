@@ -775,3 +775,35 @@ wrote nothing.
 lever gets the next design pass (league diversification, H2 value/objective, or H3
 opponent-model) — is deliberately NOT taken autonomously: the frozen protocol ends here, and
 lever selection is a fresh design decision for the user/planner with these results in hand.
+
+## Post-verdict corrections + same-binary base re-evaluation (2026-07-12, KL-110 Phase A)
+
+An independent closeout of the Phase 3 report caught two reporting errors and one wording
+overclaim; all were re-verified against primary data and a same-binary base re-evaluation was
+run BEFORE any post-verdict rebuild (preflight-confirmed: working exe hash 17d02287... ==
+the arms' training/eval binary, tree clean at 227419e). Corrections, old -> new:
+
+1. **Drift "+11.7pp" retracted — canonical figure +8.603pp.** The original compared a 16-seed
+   base span against a 32-seed arm span (seeds 17-32 are more passive for the base too). On
+   the identical binary and identical 64-match span: base chosen-WAIT 65.016% -> control
+   73.619% (+8.603pp), treatment 67.296% (+2.280pp); treatment-vs-control -6.323pp
+   (unchanged — that comparison was always like-for-like). Binary sensitivity measured nil
+   (same 16 seeds, old vs arm binary: 61.888% vs 61.863%). Evidence:
+   `evidence/kl105-arm-eval-2026-07-12/base-iter130-SDon-agg.json`.
+2. **Dose "~8.5×" retracted — average expected exposure 1.867×** (42.508% vs 22.771%
+   run-average bomb-win-side batch share; 9.205× = 27.218% vs 2.957% at iteration 131 only).
+   Also reclassified as *expected* exposure computed from pool sizes: the metrics field
+   `realized_pool_a_batch_fraction` is the forced quota only (uniform remainder draws also
+   land in pool A); a forced-vs-total split is queued as post-battery hygiene.
+3. **"Bit-identical iteration-131 collection" softened to field-level identity** (cause-pool
+   counts, new_samples, learning rate identical; timing fields differ, as they must).
+4. **Scope statement added:** the sampler reweighted whole winning trajectories including
+   passive lead-up — the verdict kills whole-trajectory cause reweighting, not local-credit
+   sampler designs, which were never tested.
+
+The FLAT/NEGATIVE verdict itself is unaffected (the independent closeout concurred it is
+valid and the arms genuinely matched). Small arm artifacts (metrics/config/config-history/
+fork-manifest/semantic-fork-log/watchdog/train-console) are now archived under the evidence
+directory with a normalized repo-root-relative SHA256SUMS, so the LR-equality and
+single-attempt claims no longer depend on git-ignored local run dirs. Next: KL-110 Phase B,
+the aligned-opponent gates ablation (no training in any branch).

@@ -27,27 +27,49 @@ SUCCESS required (a)+(b)+(c)+(d); DIRECTIONAL required (a) or (b). Neither met �
 
 ## What the paired design actually revealed (descriptive, below the criteria bar)
 
-1. **Continued v6-league training at a healthy LR made BOTH arms substantially more passive
-   than their shared base** (chosen-WAIT 61.9% at the base → 73.6% control, 67.3% treatment).
-   The control arm isolates this cleanly: +11.7pp passivity drift from 24 iterations of
-   ordinary training on this data distribution at ~1e-4 LR. This is a *new* finding the
-   uncontrolled historical runs could never show.
-2. The treatment **attenuated the drift by 6.3pp but did not reverse it** — an ~8.5× batch
-   over-representation of demonstrated-kill samples (≈47% vs ≈28% bomb-win batch content) was
-   outrun by whatever the rest of the distribution teaches. It moved the raw head's WAIT
-   preference (66.1% vs control's ~74% argmax-WAIT) without moving kill behavior (1 vs 0
-   bomb wins) or deployed tactical competence (gates 0/6 vs 1/6; treatment's raw mode still
-   takes the trap kill in 5 steps while search suppresses it — the suppression pattern
-   survived the entire diet).
-3. Dose note: `realized_pool_a_batch_fraction` reports FORCED draws only (0.25); total
-   bomb-win-side batch content ≈ 0.25 + 0.75 × pool-share ≈ 47% by end of run, since the
-   remainder samples uniformly from a buffer that is itself ~29% pool A.
+*(Numbers corrected 2026-07-12 after an independent closeout caught two reporting errors and
+prompted a same-binary base re-evaluation — original figures retained inline for the record.)*
+
+1. **Continued v6-league training at a healthy LR made BOTH arms more passive than their
+   shared base.** Canonical like-for-like numbers (all three checkpoints on the identical
+   binary `17d02287...`, identical 32-game/64-match seed span, `base-iter130-SDon-*` in this
+   directory): base chosen-WAIT **65.016%** → control **73.619% (+8.603pp)**, treatment
+   **67.296% (+2.280pp)**. The originally-reported +11.7pp mixed a 16-seed base span with a
+   32-seed arm span (seeds 17-32 are more passive for the base too); the interim +7.507pp was
+   the 16-overlapping-seed figure. Binary sensitivity was measured, not assumed: the base's
+   old-binary vs arm-binary chosen-WAIT on the same 16 seeds differs by 0.025pp (61.888% vs
+   61.863%).
+2. The treatment **attenuated the drift (−6.323pp vs control) but did not reverse it** —
+   and the dose language is corrected: **expected** (not measured-realized) bomb-win-side
+   batch content averaged **42.508% (treatment) vs 22.771% (control) over the run — 1.867×**;
+   the 9.205× ratio (27.218% vs 2.957%) held only at iteration 131 while the control's pool
+   was still nearly empty. The originally-quoted "~8.5×" was that first-iteration figure
+   misapplied to the whole run. The enrichment moved the raw head's WAIT preference (66.1%
+   argmax-WAIT vs control's ~74%) without moving kill behavior (1 vs 0 bomb wins; base itself
+   scored 2/64 on this span) or deployed tactical competence (gates 0/6 vs 1/6; treatment's
+   raw mode still takes the trap kill in 5 steps while search suppresses it).
+3. Dose bookkeeping: the metrics field `realized_pool_a_batch_fraction` reports the FORCED
+   quota only (0.25); uniform remainder draws also select pool A, so total-selected share is
+   higher and the figures in (2) are expectations computed from pool sizes, not per-batch
+   measurements. (A forced-vs-total split in the metrics is queued as post-battery hygiene.)
+4. **Scope of the negative result:** pool A contained every frame of a bomb-winning
+   trajectory — including its passive lead-up. This verdict kills *whole-trajectory* cause
+   reweighting, not sampler/local-credit approaches generally (kill-local weighting was never
+   tested).
 
 ## Files
 
-Committed here: both arms' SD-on/SD-off aggregate JSONs + gates JSONs (each embeds argv,
-hashes, resolved semantics incl. the cap) + `SHA256SUMS` (also covering the local-only trace
-and per-match JSONLs under `results/kl105-arm-eval-2026-07-12/`). Arm run dirs
-(`results/kl105-arm-{treatment,control}-from-control03-130/`) retain fork manifests, metrics,
-checkpoints — local only. Reproduce: each agg's `invocation_argv`, or
+Committed here: both arms' SD-on/SD-off aggregate JSONs + gates JSONs + the **same-binary base
+re-evaluation** (`base-iter130-SDon-agg.json`, run 2026-07-12 on the preserved arm binary
+BEFORE any post-verdict rebuild, exactly for the like-for-like drift above) + each arm's small
+run artifacts under `arm-run-artifacts/{treatment,control}/` (metrics, config,
+config-history, fork-manifest, semantic-fork-log, watchdog-attempts, train-console.log — the
+files carrying the LR-equality, iteration-131 field-identity, champion-reset, and
+single-attempt claims) + `SHA256SUMS` (one repo-root-relative convention; also covers the
+local-only trace/per-match JSONLs under `results/kl105-arm-eval-2026-07-12/`). Arm run dirs
+retain checkpoints locally. Reproduce: each agg's `invocation_argv`, or
 `tools/launch/kl105-paired-eval.ps1`.
+
+Wording note (corrected): the arms' iteration-131 *collection fields* (cause-pool counts,
+new_samples, learning rate) are identical — full metrics rows are not bit-identical (timing
+fields legitimately differ).

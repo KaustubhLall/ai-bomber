@@ -1,14 +1,35 @@
-8ae9d7ec7b78728137543e019b1597b80b9ee4fdbc03ee111ce4e29b2142dfeb *control-iter154-SDoff-agg.json
-d7acae786b248dc4bf621a2b9cc1720303fd41e7922d7efccc1e340f1b7546e8 *control-iter154-SDon-agg.json
-b1ce75984fbc81c9a40b8ad6457be2d63ae857d4103aa5734c25c1d4b541bcb4 *control-iter154-gates.json
-98272c1a3f3c7cfad685d1f4c7b834efd3b93cd74710e1116efd2bdd7d50cd0f *treatment-iter154-SDoff-agg.json
-e74a9a79bc9f7aced916a396f20ec5ac84fda4e6eee38ea087cb95f8e6c01e5e *treatment-iter154-SDon-agg.json
-0490eab1f250993b2166ded98cc9688f73faf39e0895cd0eb7ae0273554e5a3e *treatment-iter154-gates.json
-530d8133d42e4a02bef492fce2756b31aeb5cd5deb3f14f518d8023a2eb65568 *results/kl105-arm-eval-2026-07-12/control-iter154-SDoff-trace.jsonl
-457920d258dccd3766a4314c4dde956fb23473464810dd071196da7a5c19846f *results/kl105-arm-eval-2026-07-12/control-iter154-SDon-trace.jsonl
-9441db14b49d52c5cc36187a993f9e247d90f129820569bfb895e5a54a267d51 *results/kl105-arm-eval-2026-07-12/treatment-iter154-SDoff-trace.jsonl
-d406ae830fc9cece2fc520422af00be3a9ab77b82d957427e3766c0178ffa8d6 *results/kl105-arm-eval-2026-07-12/treatment-iter154-SDon-trace.jsonl
+# SHA-256 manifest, all paths repo-root-relative. Committed evidence lives under
+# docs/experiment-memory/evidence/kl105-arm-eval-2026-07-12/; trace/per-match JSONLs
+# stay local-only under results/kl105-arm-eval-2026-07-12/ (git-ignored) and are
+# hashed here so preserved/regenerated copies can be verified.
+11533924294f5c5f5a20e16d71edd23ebd7810de72b085aaa9d37aa1e3e65a24 *docs/experiment-memory/evidence/kl105-arm-eval-2026-07-12/base-iter130-SDon-agg.json
+8ae9d7ec7b78728137543e019b1597b80b9ee4fdbc03ee111ce4e29b2142dfeb *docs/experiment-memory/evidence/kl105-arm-eval-2026-07-12/control-iter154-SDoff-agg.json
+d7acae786b248dc4bf621a2b9cc1720303fd41e7922d7efccc1e340f1b7546e8 *docs/experiment-memory/evidence/kl105-arm-eval-2026-07-12/control-iter154-SDon-agg.json
+b1ce75984fbc81c9a40b8ad6457be2d63ae857d4103aa5734c25c1d4b541bcb4 *docs/experiment-memory/evidence/kl105-arm-eval-2026-07-12/control-iter154-gates.json
+98272c1a3f3c7cfad685d1f4c7b834efd3b93cd74710e1116efd2bdd7d50cd0f *docs/experiment-memory/evidence/kl105-arm-eval-2026-07-12/treatment-iter154-SDoff-agg.json
+e74a9a79bc9f7aced916a396f20ec5ac84fda4e6eee38ea087cb95f8e6c01e5e *docs/experiment-memory/evidence/kl105-arm-eval-2026-07-12/treatment-iter154-SDon-agg.json
+0490eab1f250993b2166ded98cc9688f73faf39e0895cd0eb7ae0273554e5a3e *docs/experiment-memory/evidence/kl105-arm-eval-2026-07-12/treatment-iter154-gates.json
+ac5ba0ea3ccd875016aa42768dfabdef048cdadc2b6379b831bb213fa4024e14 *docs/experiment-memory/evidence/kl105-arm-eval-2026-07-12/arm-run-artifacts/control/config-history.jsonl
+43e0ec2db9103f6a6d9fbff432e171b4d0c8433ed3cd9961aebf97bcf5e997ba *docs/experiment-memory/evidence/kl105-arm-eval-2026-07-12/arm-run-artifacts/control/config.json
+3f274132eedbb4038943f1ae4b025a58c792145e1e79ff3c07750167e22c5404 *docs/experiment-memory/evidence/kl105-arm-eval-2026-07-12/arm-run-artifacts/control/fork-manifest.json
+52e0c4487cab3d3889a97dfe0cea82a4f06897a9a8ee222405470d2d75041d92 *docs/experiment-memory/evidence/kl105-arm-eval-2026-07-12/arm-run-artifacts/control/metrics.jsonl
+edf58803e56645c67b900e9ebf194e584159bfc3f3e5c1f70894a515db651fee *docs/experiment-memory/evidence/kl105-arm-eval-2026-07-12/arm-run-artifacts/control/semantic-fork-log.jsonl
+2119976defc3fbe3ab35032bf037cf7fd941f890be437cc1f55a547d97007347 *docs/experiment-memory/evidence/kl105-arm-eval-2026-07-12/arm-run-artifacts/control/train-console.log
+54ce6bb6fbc98661789ac70fd14e1ed3809b2c9704258c54011282af2948962d *docs/experiment-memory/evidence/kl105-arm-eval-2026-07-12/arm-run-artifacts/control/watchdog-attempts.jsonl
+a7031dc5e7d70f609cbe95d2a5cb9fd6d87e552e8249b1cf48dfa91f554e689e *docs/experiment-memory/evidence/kl105-arm-eval-2026-07-12/arm-run-artifacts/treatment/config-history.jsonl
+cf8ebc57ba6327a41330660e7d3ba678bcea7faeb8ba8f5d1b294a8dc2b733d7 *docs/experiment-memory/evidence/kl105-arm-eval-2026-07-12/arm-run-artifacts/treatment/config.json
+9042315955b8c1789d45f0671368c2d5bc0ee7c26d0c1a81c6f3ec8426724cd1 *docs/experiment-memory/evidence/kl105-arm-eval-2026-07-12/arm-run-artifacts/treatment/fork-manifest.json
+763488f1cab84ea5aae2300f6dc8ae93197e9fe78b8c28f486cfd3ddb1be42b2 *docs/experiment-memory/evidence/kl105-arm-eval-2026-07-12/arm-run-artifacts/treatment/metrics.jsonl
+82693b9ebb0c8bfd67bdd909a6440976ce923873e655d59038b53779e8c37204 *docs/experiment-memory/evidence/kl105-arm-eval-2026-07-12/arm-run-artifacts/treatment/semantic-fork-log.jsonl
+740f6962f1639c5fe2a475958be877446b2017215f02303e47fe636345cc0d07 *docs/experiment-memory/evidence/kl105-arm-eval-2026-07-12/arm-run-artifacts/treatment/train-console.log
+eae76a2bc8cb66886c26442713f03330532a047f46164fc24318b9eef005b4ed *docs/experiment-memory/evidence/kl105-arm-eval-2026-07-12/arm-run-artifacts/treatment/watchdog-attempts.jsonl
+00cd2d167a2392961e78507b4b25a1036983c637ed9b3f0be840b853768e8e82 *results/kl105-arm-eval-2026-07-12/base-iter130-SDon-permatch.jsonl
+c8bccfa0fe4463952e7666da9b001d7f4ddf4f55a71bbed1a1d4df47fcc646d1 *results/kl105-arm-eval-2026-07-12/base-iter130-SDon-trace.jsonl
 914e57be6ee1613cb12d4b2d0ca9d5ae4f3d8c01b6352716f977c035e821d6c2 *results/kl105-arm-eval-2026-07-12/control-iter154-SDoff-permatch.jsonl
+530d8133d42e4a02bef492fce2756b31aeb5cd5deb3f14f518d8023a2eb65568 *results/kl105-arm-eval-2026-07-12/control-iter154-SDoff-trace.jsonl
 e32f39089db529962a04529abfbdef8667c2abc8e4334538997dc4c94655935a *results/kl105-arm-eval-2026-07-12/control-iter154-SDon-permatch.jsonl
+457920d258dccd3766a4314c4dde956fb23473464810dd071196da7a5c19846f *results/kl105-arm-eval-2026-07-12/control-iter154-SDon-trace.jsonl
 612ceea1915a47040b5e8f1439f928c31c97163de58d343f1386d85da701b7f2 *results/kl105-arm-eval-2026-07-12/treatment-iter154-SDoff-permatch.jsonl
+9441db14b49d52c5cc36187a993f9e247d90f129820569bfb895e5a54a267d51 *results/kl105-arm-eval-2026-07-12/treatment-iter154-SDoff-trace.jsonl
 89e1570e0eb5fb399376eec8c6fac59606da402edaea2750eaa7d99a137033d7 *results/kl105-arm-eval-2026-07-12/treatment-iter154-SDon-permatch.jsonl
+d406ae830fc9cece2fc520422af00be3a9ab77b82d957427e3766c0178ffa8d6 *results/kl105-arm-eval-2026-07-12/treatment-iter154-SDon-trace.jsonl
