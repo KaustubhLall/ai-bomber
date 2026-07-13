@@ -996,6 +996,103 @@ if(TARGET bomber_alphazero_native)
       DEPENDS test_native_alphazero_teacher_semantic_override TIMEOUT 20)
   endif()
 
+  # v7 Stage-1 IL Bombing-Collapse guards (docs/experiment-memory/14-v7-from-scratch-design.md
+  # Stage 1; Meisheri et al. 2019): policy_entropy_bonus / value_only_iterations semantic fields
+  # and their applied-loss metrics keys. Two fixtures, own run-dirs. The off-is-identical case is
+  # guarded by the pre-existing native suite (every other train fixture leaves both knobs at 0),
+  # so no new test asserts it.
+  #
+  # (metrics) One fresh 3-iteration run with BOTH knobs on (--value-only-iterations 2 K=2,
+  # --policy-entropy-bonus 0.01) so the horizon straddles the value-only boundary: metrics rows
+  # are emitted after run()'s ++iteration, so rows iteration 1,2 (<=K) must show
+  # policy_loss_applied_weight==0.0 (value-only warmup) and row 3 must show 1.0. --simulations 2
+  # is fine (these knobs are loss-side, not search-side). The python check also confirms
+  # config.json / the fresh runtime_config record both fields.
+  add_test(NAME test_native_alphazero_collapse_guards_metrics_smoke
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-collapse-guards-smoke
+      --fresh --iterations 3 --games 2 --simulations 2
+      --train-steps 1 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 100 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress
+      --value-only-iterations 2 --policy-entropy-bonus 0.01)
+  set_tests_properties(test_native_alphazero_collapse_guards_metrics_smoke PROPERTIES TIMEOUT 90)
+
+  # (semantics) Same fresh -> resume(inherit) -> resume(explicit override) shape as the
+  # forced-playouts / teacher chains above, in its own dedicated run-dir: fresh sets BOTH
+  # --value-only-iterations 4 --policy-entropy-bonus 0.01; the resume passes NEITHER flag (must
+  # inherit both silently); the third invocation passes different values for BOTH
+  # (--value-only-iterations 6 --policy-entropy-bonus 0.02) so both must log a SEMANTIC FORK line.
+  add_test(NAME test_native_alphazero_collapse_guards_semantic_fresh
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-collapse-guards-semantic-smoke
+      --fresh --iterations 1 --games 2 --simulations 2
+      --train-steps 1 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 100 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress
+      --value-only-iterations 4 --policy-entropy-bonus 0.01)
+  set_tests_properties(test_native_alphazero_collapse_guards_semantic_fresh PROPERTIES TIMEOUT 60)
+  # No collapse-guard flags at all - both fields must inherit silently from the fresh manifest.
+  add_test(NAME test_native_alphazero_collapse_guards_semantic_resume
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-collapse-guards-semantic-smoke
+      --iterations 2 --games 2 --simulations 2
+      --train-steps 1 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 100 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress)
+  set_tests_properties(test_native_alphazero_collapse_guards_semantic_resume PROPERTIES
+    DEPENDS test_native_alphazero_collapse_guards_semantic_fresh TIMEOUT 60)
+  # Both --value-only-iterations (4 -> 6) and --policy-entropy-bonus (0.01 -> 0.02) diverge from
+  # the inherited manifest - both must log a SEMANTIC FORK line.
+  add_test(NAME test_native_alphazero_collapse_guards_semantic_override
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-collapse-guards-semantic-smoke
+      --iterations 3 --games 2 --simulations 2
+      --train-steps 1 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 100 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress
+      --value-only-iterations 6 --policy-entropy-bonus 0.02)
+  set_tests_properties(test_native_alphazero_collapse_guards_semantic_override PROPERTIES
+    DEPENDS test_native_alphazero_collapse_guards_semantic_resume TIMEOUT 60)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME test_native_alphazero_collapse_guards_metrics_check
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_alphazero_collapse_guards_metrics_check.py
+        ${CMAKE_BINARY_DIR}/native-alphazero-collapse-guards-smoke)
+    set_tests_properties(test_native_alphazero_collapse_guards_metrics_check PROPERTIES
+      DEPENDS test_native_alphazero_collapse_guards_metrics_smoke TIMEOUT 20)
+    add_test(NAME test_native_alphazero_collapse_guards_semantic_check
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_alphazero_collapse_guards_semantic_check.py
+        ${CMAKE_BINARY_DIR}/native-alphazero-collapse-guards-semantic-smoke)
+    set_tests_properties(test_native_alphazero_collapse_guards_semantic_check PROPERTIES
+      DEPENDS test_native_alphazero_collapse_guards_semantic_override TIMEOUT 20)
+  endif()
+
   # KL-101 Part D regression: a second `train` process must be refused while a first is still
   # running, even on a different run-dir - the actual failure mode that crashed training twice
   # earlier in this project's history. Self-contained (manages its own background process),

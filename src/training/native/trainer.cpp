@@ -1625,7 +1625,9 @@ std::string runtime_config_signature(const TrainConfig& config) {
            << ";baseline_mcts_simulations=" << config.baseline_mcts_simulations
            << ";baseline_mcts_depth=" << config.baseline_mcts_depth
            << ";seed=" << config.seed
-           << ";replay_cause_balance_cap=" << config.replay_cause_balance_cap;
+           << ";replay_cause_balance_cap=" << config.replay_cause_balance_cap
+           << ";policy_entropy_bonus=" << config.policy_entropy_bonus
+           << ";value_only_iterations=" << config.value_only_iterations;
     return output.str();
 }
 
@@ -1663,6 +1665,8 @@ const std::vector<std::pair<std::string, std::string>>& semantic_field_flags() {
         {"seed", "--seed"},
         {"replay_cause_balance_cap", "--replay-cause-balance-cap"},
         {"teacher_agents", "--teacher-agents"},
+        {"policy_entropy_bonus", "--policy-entropy-bonus"},
+        {"value_only_iterations", "--value-only-iterations"},
     };
     return fields;
 }
@@ -1693,7 +1697,9 @@ std::string semantic_manifest_string(const TrainConfig& config) {
            << ";learning_rate_schedule_updates=" << config.learning_rate_schedule_updates
            << ";seed=" << config.seed
            << ";replay_cause_balance_cap=" << config.replay_cause_balance_cap
-           << ";teacher_agents=" << config.teacher_agents;
+           << ";teacher_agents=" << config.teacher_agents
+           << ";policy_entropy_bonus=" << config.policy_entropy_bonus
+           << ";value_only_iterations=" << config.value_only_iterations;
     return output.str();
 }
 
@@ -1895,6 +1901,21 @@ std::vector<std::string> apply_semantic_manifest(TrainConfig& config,
                      "the compiled default \"heuristic\", the teacher roster this checkpoint was "
                      "trained under.\n";
     reconcile_string("teacher_agents", &TrainConfig::teacher_agents);
+    /* v7 Stage-1 IL Bombing-Collapse guards: policy_entropy_bonus / value_only_iterations did
+       not exist before this manifest schema addition - same situation as forced_playouts_k /
+       teacher_agents above. reconcile_double/reconcile_int's generic absent-key handling already
+       does the right thing behaviorally (config is left at whatever CLI parsing resolved - the
+       compiled defaults 0.0 / 0, both "off"), but stays silent; one combined NOTE covers both
+       keys since they were added together in the same schema change. Inheriting the defaults is
+       faithful, not a substitution: off reproduces exactly the ce+value loss (no entropy floor,
+       policy active from iteration 0) this checkpoint was trained under. */
+    if (!stored.count("policy_entropy_bonus"))
+        std::cerr << "NOTE - checkpoint manifest predates policy_entropy_bonus/"
+                     "value_only_iterations (v7 Stage 1 Bombing-Collapse guards); inheriting the "
+                     "compiled defaults (policy_entropy_bonus=0.0, value_only_iterations=0, both "
+                     "off), which reproduce the ce+value loss this checkpoint was trained under.\n";
+    reconcile_double("policy_entropy_bonus", &TrainConfig::policy_entropy_bonus);
+    reconcile_int("value_only_iterations", &TrainConfig::value_only_iterations);
     return forks;
 }
 
@@ -1984,6 +2005,7 @@ void validate_train_cli_options(int argc, char** argv, int first) {
         "--heuristic-regression-margin", "--fork-from", "--dirty-diff-digest",
         "--gates-agent", "--gates-opponent-model", "--replay-cause-balance-cap",
         "--temperature-final", "--forced-playouts-k", "--search-contempt-nscl",
+        "--policy-entropy-bonus", "--value-only-iterations",
     };
     static const std::set<std::string_view> flag_options = {
         "--fresh", "--no-progress", "--eval-mcts", "--overwrite-evidence",
@@ -2064,6 +2086,17 @@ void validate_config(const TrainConfig& config) {
         throw std::invalid_argument("temperature-final must lie in [0, temperature]");
     if (config.temperature_anneal && config.temperature_steps <= 0)
         throw std::invalid_argument("temperature-anneal requires temperature-steps > 0");
+    /* v7 Stage-1 IL Bombing-Collapse guards: policy_entropy_bonus scales an entropy bonus
+       SUBTRACTED from the policy CE; negative would penalize entropy (collapse harder, the
+       opposite of the guard's purpose) and 0.5 is already a generous upper bound relative to a
+       CE loss on kActions logits (Meisheri et al.'s floor is ~1e-2), wide enough for
+       experimentation while catching an obvious typo. value_only_iterations is an iteration
+       count (0-based window, like teacher_iterations), so negative is meaningless and 10000 is a
+       generous upper bound - well above any real bootstrap horizon this project runs. */
+    if (config.policy_entropy_bonus < 0.0 || config.policy_entropy_bonus > 0.5)
+        throw std::invalid_argument("policy-entropy-bonus must lie in [0, 0.5]");
+    if (config.value_only_iterations < 0 || config.value_only_iterations > 10000)
+        throw std::invalid_argument("value-only-iterations must lie in [0, 10000]");
     if (config.gates_opponent_model != "self" && config.gates_opponent_model != "aligned")
         throw std::invalid_argument(
             "--gates-opponent-model must be 'self' or 'aligned', got '" +
@@ -2805,6 +2838,16 @@ struct Trainer::Impl {
            actually in pool A - the number realized_pool_a_batch_fraction's name always implied
            but did not report. Always >= realized_pool_a_batch_fraction. */
         double total_pool_a_batch_fraction{};
+        /* v7 Stage-1 IL Bombing-Collapse guards: exactly what THIS iteration's loss graph
+           contained, so a metrics reader can reconstruct it without re-deriving the iteration
+           window. policy_loss_applied_weight is 1.0 when the policy CE contributed to the loss,
+           0.0 during the value-only warmup (iteration < config.value_only_iterations).
+           policy_entropy_bonus_applied is the beta actually subtracted as an entropy floor this
+           iteration (config.policy_entropy_bonus when the policy term is active AND beta>0, else
+           0.0). Both default 0.0 - the value a reader sees if optimize() early-returned (empty
+           replay / train_steps==0), i.e. nothing trained. */
+        double policy_loss_applied_weight{};
+        double policy_entropy_bonus_applied{};
     };
 
     struct SelfPlayMetrics {
@@ -3001,6 +3044,8 @@ struct Trainer::Impl {
                << "  \"selfkill_win_value\": " << config.selfkill_win_value << ",\n"
                << "  \"league_heuristic_fraction\": " << config.league_heuristic_fraction << ",\n"
                << "  \"replay_cause_balance_cap\": " << config.replay_cause_balance_cap << ",\n"
+               << "  \"policy_entropy_bonus\": " << config.policy_entropy_bonus << ",\n"
+               << "  \"value_only_iterations\": " << config.value_only_iterations << ",\n"
                << "  \"evaluation_interval\": " << config.evaluation_interval << ",\n"
                << "  \"evaluation_games\": " << config.evaluation_games << ",\n"
                << "  \"evaluation_simulations\": " << config.evaluation_simulations << ",\n"
@@ -3520,6 +3565,20 @@ struct Trainer::Impl {
         if (replay.size() == 0 || config.train_steps == 0) return metrics;
         PhaseProgress progress("optimize", config.train_steps, config.progress);
         model->train();
+        /* v7 Stage-1 IL Bombing-Collapse guards (docs/experiment-memory/14 Stage 1). Both read
+           the member `iteration`, which optimize() sees at the SAME 0-based value run()'s
+           teacher window compares (optimize() is called BEFORE run()'s ++iteration, exactly like
+           the `iteration < config.teacher_iterations` collection guard). value_only_iterations K:
+           the first K iterations (indices 0..K-1) train value only, so the policy term is active
+           iff iteration >= K. These are constant across this call's train_steps (they depend
+           only on iteration + config), so they are computed once and recorded verbatim in
+           metrics for observability - policy_loss below is still accumulated UNSCALED for the
+           reader regardless. */
+        const bool policy_active = iteration >= config.value_only_iterations;
+        const bool entropy_bonus_active = policy_active && config.policy_entropy_bonus > 0.0;
+        metrics.policy_loss_applied_weight = policy_active ? 1.0 : 0.0;
+        metrics.policy_entropy_bonus_applied =
+            entropy_bonus_active ? config.policy_entropy_bonus : 0.0;
         int steps_completed = 0;
         /* Once optimization starts, finish the phase. A partial optimizer phase
            would require persisting an intra-iteration cursor and would replay
@@ -3548,7 +3607,26 @@ struct Trainer::Impl {
             auto policy_loss = -(target_policy * torch::log_softmax(logits, 1))
                 .sum(1).mean();
             auto value_loss = torch::mse_loss(predicted_value, target_value);
-            auto loss = policy_loss + value_loss;
+            /* v7 Stage-1 IL Bombing-Collapse guards. Explicit branches keep the OFF path
+               (policy_active && !entropy_bonus_active - the default when both knobs are off) at
+               `policy_loss + value_loss`, bit-for-bit today's graph. During the value-only
+               warmup the policy term is dropped from the graph entirely (weight 0.0); the
+               forward is still run above and policy_loss is still reported unscaled below. When
+               the entropy floor is active the DIFFERENTIABLE entropy of the network's softmax
+               policy is subtracted (a separate, live-tensor computation - the metrics `entropy`
+               below stays on the detached softmax, unchanged). */
+            torch::Tensor loss;
+            if (!policy_active) {
+                loss = value_loss;
+            } else if (entropy_bonus_active) {
+                auto log_policy = torch::log_softmax(logits, 1);
+                auto differentiable_entropy =
+                    -(torch::softmax(logits, 1) * log_policy).sum(1).mean();
+                loss = policy_loss - config.policy_entropy_bonus * differentiable_entropy +
+                       value_loss;
+            } else {
+                loss = policy_loss + value_loss;
+            }
             loss.backward();
             torch::nn::utils::clip_grad_norm_(model->parameters(), 5.0);
             optimizer.step();
@@ -4404,6 +4482,14 @@ struct Trainer::Impl {
                << optimization.realized_pool_a_batch_fraction
                << ",\"forced_pool_a_fraction\":" << optimization.realized_pool_a_batch_fraction
                << ",\"total_pool_a_fraction\":" << optimization.total_pool_a_batch_fraction
+               /* v7 Stage-1 IL Bombing-Collapse guards: exactly what this iteration's loss graph
+                  contained (see OptimizationMetrics above). A reader sees the value-only warmup
+                  as policy_loss_applied_weight==0.0 (metrics rows are emitted after ++iteration,
+                  so those are rows iteration 1..K), and the entropy floor's beta as
+                  policy_entropy_bonus_applied. */
+               << ",\"policy_loss_applied_weight\":" << optimization.policy_loss_applied_weight
+               << ",\"policy_entropy_bonus_applied\":"
+               << optimization.policy_entropy_bonus_applied
                << '}'
                /* KL-101 Part E: this iteration's phase timings (all 7 phases KL-101/KL-102
                   ask for) - the "same-machine/same-config baseline" KL-102's throughput work
@@ -5610,6 +5696,10 @@ TrainConfig parse_train_config(int argc, char** argv, int first) {
                                                      config.league_heuristic_fraction);
     config.replay_cause_balance_cap = parse_number(argc, argv, first, "--replay-cause-balance-cap",
                                                     config.replay_cause_balance_cap);
+    config.policy_entropy_bonus = parse_number(argc, argv, first, "--policy-entropy-bonus",
+                                               config.policy_entropy_bonus);
+    config.value_only_iterations = parse_number(argc, argv, first, "--value-only-iterations",
+                                                 config.value_only_iterations);
     config.promotion_margin = parse_number(argc, argv, first, "--promotion-margin", config.promotion_margin);
     config.promotion_confidence_z = parse_number(argc, argv, first, "--promotion-confidence-z", config.promotion_confidence_z);
     config.random_score_floor = parse_number(argc, argv, first, "--random-score-floor", config.random_score_floor);
@@ -5730,6 +5820,17 @@ void print_native_help() {
         "                            greedy, enemy-bot, external, alpha-beta, mcts, evasive - a\n"
         "                            typo or empty roster fails closed at startup. Only harvested\n"
         "                            while iteration < --teacher-iterations and --teacher-games>0\n"
+        "  --policy-entropy-bonus X  v7 Stage-1 IL Bombing-Collapse guard (semantic field, in\n"
+        "                            [0,0.5], default 0 = off, bit-for-bit). >0: the policy loss\n"
+        "                            becomes policy_ce - X*H(pi), an entropy floor keeping the\n"
+        "                            softmax policy from collapsing (Meisheri et al. 2019; v7 IL\n"
+        "                            uses 0.01) - see docs/experiment-memory/14 Stage 1\n"
+        "  --value-only-iterations N v7 Stage-1 IL Bombing-Collapse guard (semantic field, in\n"
+        "                            [0,10000], default 0 = off, bit-for-bit). Staged value\n"
+        "                            warmup: the first N iterations (iteration < N, same 0-based\n"
+        "                            window as --teacher-iterations) train VALUE ONLY (policy-loss\n"
+        "                            weight 0); v7 IL uses 4 - see docs/experiment-memory/14\n"
+        "                            Stage 1\n"
         "  --legacy-accept-unverified-semantics\n"
         "                            Required to resume/evaluate a checkpoint saved before the\n"
         "                            semantic manifest (KL-101) - its trained reward/mechanics/\n"

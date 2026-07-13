@@ -854,3 +854,34 @@ that no v6-era behavior changed.
 **Next gate: Stage-1 IL design** (MCTS-256 teacher collection mode, IL loss path, staged value
 warmup, entropy floor — the "Bombing Collapse" guards) as its own design pass; its teacher-
 collection GPU run gets a documented launch-gate sign-off before anything executes.
+
+## v7 Stage-1 launch gate (2026-07-13) — planner sign-off
+
+Implementation complete via the devin-swe-orchestrator loop the user directed: D1 (teacher
+collector: roster/both-seat/tags/histogram, Devin-opus + swe-check review CLEAN after two
+minor advisor-applied fixes) and D2 (Bombing-Collapse guards: entropy floor +
+value-only warmup, Devin-opus + swe-check review CLEAN with all seven priority areas
+citation-verified) — commits `86fe423` and this one. Suites at launch: 92/92 native, 22/22
+dependency-free, re-run by the planner after each unit.
+
+**The run** (`tools/launch/v7-stage1-bootstrap.ps1 -IAcknowledgeLaunchGate`, fresh
+`results/v7-stage1`): 30 iterations == the teacher window exactly, so the run STOPS at the
+stage boundary. Teacher roster `mcts,mcts,heuristic,heuristic` (all four ordered matchups),
+32 teacher games/iteration with both-seat harvest (~8.3k samples/iter, ~250k total ≈ 1.25
+buffer turnovers of pure demonstration data), mirror trickle `--games 8` (~4%), league OFF,
+`--value-only-iterations 4`, `--policy-entropy-bonus 0.01`, canary every 5 iterations. Full
+v7.0 semantics explicit: alpha 1.5, forced-playouts-k 2, temperature anneal 1.0->0.25/60,
+crush 0.1, cap 0. LR horizon pinned ONCE to the full planned campaign (51,200 updates = 400
+iterations) so no later stage re-derives a schedule — the v6 bug class, closed by
+construction.
+
+**Wall-clock estimate**: teacher collection dominates and is CPU-bound (mcts-vs-mcts ~20-40s/
+game est.); ~12-16 min/iteration incl. trickle+optimize, canary ~2-3 min per eval interval
+(first full-scale measurement lands in drift_canary_seconds) → **~6-9h total**. Atomic
+per-iteration checkpoints make a crash resumable; no watchdog on the fresh bootstrap (resume
+manually if needed).
+
+**Pre-registered Stage-1 exit gate** (decided on evidence at iteration 30, doc 14): canary
+gates ≥3/6 deployed (search mode) AND the student's bomb usage within 2x of the teacher
+histogram's bomb_fraction (teacher_actions metrics vs the network action_histogram /
+canary probes). Pass → Stage-2 ladder design. Fail → stop, write up, no knob-turning.

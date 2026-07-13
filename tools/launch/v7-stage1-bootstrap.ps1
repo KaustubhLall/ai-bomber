@@ -54,13 +54,16 @@ if ((Test-Path -LiteralPath $runDir) -and
     throw "Non-empty run dir $runDir already exists - refusing --fresh overwrite. If a re-run is deliberate, archive/remove the old attempt explicitly first."
 }
 
-# PROVISIONAL - review at launch-gate time. iterations*train_steps (150*128=19200) derives
-# cleanly as the cosine LR horizon for a fresh run even if --lr-schedule-updates were omitted;
-# it is passed explicitly anyway for auditability (project discipline: explicit > default),
-# not because 150 is a settled campaign length.
-$iterations = 150
+# PINNED at the Stage-1 launch gate (2026-07-13, doc 12): --iterations 30 == teacher_iterations
+# exactly, so the run STOPS at the stage boundary and the Stage-1 exit gate (gates >=3/6 +
+# student bomb-usage within 2x of the teacher histogram) is decided on evidence before anything
+# continues. The LR horizon is deliberately NOT this run's length: it is pinned once to the
+# full planned v7 campaign (400 iterations x 128 train_steps = 51,200 updates) so no later
+# stage ever re-derives a schedule against accumulated optimizer updates - the exact v6
+# bug class (see the LR-horizon rule in the standing project rules).
+$iterations = 30
 $trainSteps = 128
-$lrScheduleUpdates = $iterations * $trainSteps
+$lrScheduleUpdates = 51200
 
 $trainerArgs = @(
     "--run-dir", $runDir,
@@ -68,7 +71,10 @@ $trainerArgs = @(
     "--iterations", "$iterations",
     "--width", "13", "--height", "11", "--max-steps", "200", "--crate-density", "50",
     "--flame-duration", "2", "--sudden-death-start", "120", "--shrink-interval", "4",
-    "--channels", "128", "--blocks", "10", "--games", "128", "--simulations", "96",
+    # --games 8: the Stage-1 mirror TRICKLE (doc 14 Stage-1 design) - ~4% of samples, keeps the
+    # loop's invariants intact and canary-visible without a new IL-only mode; teacher games below
+    # are the real Stage-1 data source.
+    "--channels", "128", "--blocks", "10", "--games", "8", "--simulations", "96",
     "--train-steps", "$trainSteps", "--batch-size", "512", "--replay-capacity", "200000",
     "--learning-rate", "0.0002", "--min-learning-rate", "0.00001",
     "--lr-schedule-updates", "$lrScheduleUpdates",
@@ -87,8 +93,20 @@ $trainerArgs = @(
     # measured in idle-streak structure under it).
     "--temperature", "1.0", "--temperature-final", "0.25",
     "--temperature-anneal", "--temperature-steps", "60",
-    "--teacher-games", "32", "--teacher-iterations", "20",
-    "--eval-interval", "10", "--eval-games", "32", "--eval-simulations", "96", "--eval-seed-base", "900001",
+    # Roster note (D1 review): the rotation formula yields only cross-matchups for a 2-entry
+    # roster; the duplicated 4-entry roster below produces all four ordered matchup types
+    # (mcts/mcts, mcts/heuristic, heuristic/heuristic, heuristic/mcts) across the game cycle.
+    "--teacher-agents", "mcts,mcts,heuristic,heuristic",
+    "--teacher-games", "32", "--teacher-iterations", "30",
+    # v7 Stage 1 Bombing-Collapse guards (doc 14 Stage 1; Meisheri et al. 2019): entropy floor
+    # beta=0.01 on the policy loss so the shared trunk's policy does not collapse onto WAIT.
+    "--policy-entropy-bonus", "0.01",
+    # v7 Stage 1 Bombing-Collapse guards (doc 14 Stage 1): staged value warmup - the first K=4
+    # iterations train value only (policy-loss weight 0) before the policy head starts learning.
+    "--value-only-iterations", "4",
+    # eval-interval 5 (not the v6-era 10): the drift canary rides the eval interval, and Stage 1
+    # is exactly the phase where early Bombing-Collapse must be caught within a few iterations.
+    "--eval-interval", "5", "--eval-games", "32", "--eval-simulations", "96", "--eval-seed-base", "900001",
     "--promotion-games", "64", "--promotion-simulations", "96", "--promotion-seed-base", "1100001",
     "--promotion-margin", "0", "--random-score-floor", "0.95", "--heuristic-score-floor", "0.55", "--heuristic-regression-margin", "0.03",
     "--mcts-eval-interval", "50", "--mcts-eval-games", "4", "--baseline-mcts-simulations", "256", "--baseline-mcts-depth", "16",
@@ -101,20 +119,14 @@ $trainerArgs = @(
     # mutual-death was reconsidered and deliberately kept, not raised toward -1, as a mild
     # aggression tiebreak near the wall).
     "--arena-crush-win-value", "0.1", "--selfkill-win-value", "0.3",
-    "--timeout-draw-value", "-0.5", "--mutual-death-value", "-0.2"
-    # --league-heuristic-fraction X - deliberately OMITTED, not defaulted-and-forgotten. Stage 1
-    # (teacher bootstrap / IL, doc 14 section 3) has not yet designed the actual collection mix
-    # (algorithmic-ladder rungs, teacher-game composition, Backplay/Go-Exploit starts); the
-    # league-heuristic-fraction knob is the closest EXISTING lever to "how much of collection is
-    # non-mirror," but plugging in a number here before that design lands would be exactly the
-    # kind of silent, unconsidered default this project's discipline exists to prevent. Un-
-    # comment and set explicitly once Stage 1's collection-mix design is settled:
-    # "--league-heuristic-fraction", "0.5",
-    #
-    # --replay-cause-balance-cap X - deliberately OMITTED (stays at the compiled default 0/off).
-    # This is the KL-105 Phase 3 replay-reweighting lever; doc 14 section 1 names it explicitly
-    # as a v6 lever that "failed because reward/data-side fixes alone were never sufficient in
-    # any published Pommerman result either" - re-enabling it is not part of v7.0's recipe.
+    "--timeout-draw-value", "-0.5", "--mutual-death-value", "-0.2",
+    # Stage-1 collection mix settled at the launch gate (doc 14 Stage-1 design): teacher games
+    # are the data source, the mirror trickle is --games 8 above, and league play is OFF for the
+    # IL window - the ladder (Stage 2) is where league opponents enter, gated on the Stage-1
+    # exit criteria, not blended in early. replay-cause-balance-cap stays 0 explicitly (the
+    # Phase 3 verdict killed the whole-trajectory sampler; tags still collect for telemetry).
+    "--league-heuristic-fraction", "0",
+    "--replay-cause-balance-cap", "0"
 )
 
 Write-Host "Bootstrapping v7 Stage 1 (fresh, dirichlet-alpha=1.5, forced-playouts-k=2, temperature-anneal 1.0->0.25/60, arena-crush-win-value=0.1, iterations=$iterations, lr-schedule-updates=$lrScheduleUpdates)..."

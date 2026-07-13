@@ -276,6 +276,36 @@ struct TrainConfig {
        just a search/eval budget. Must lie in [0, 0.9] - see kBoostMax in trainer.cpp for why
        the cap itself is bounded well under 1.0. CLI --replay-cause-balance-cap. */
     double replay_cause_balance_cap{0.0};
+    /* v7 Stage-1 IL Bombing-Collapse guards (docs/experiment-memory/14-v7-from-scratch-design.md
+       Stage 1; Meisheri et al. 2019 arXiv:1911.04947 named "Bombing Collapse" during the RL
+       handoff - shared trunks + a default entropy target collapse the policy onto WAIT; the
+       print mitigations are an entropy floor on the policy loss and a staged value warmup). Both
+       ride the FULL manifest machinery exactly like forced_playouts_k - persisted/inherited/
+       explicit-override-logged, part of runtime_config_signature, config.json, and
+       semantic_field_flags() - because they change what optimize() actually computes, i.e. what
+       the trained weights saw. Both default off, and OFF is bit-for-bit today's loss (explicit
+       branches in optimize(), never a multiply-by-zero on a live tensor).
+         - policy_entropy_bonus (beta): when > 0 the per-batch policy loss becomes
+           policy_ce - beta * H(pi), pi the network's softmax policy on the batch, H the
+           DIFFERENTIABLE Shannon entropy (the metrics `entropy` value stays on the detached
+           softmax, unchanged, for observability). Rewards the optimizer for not collapsing the
+           policy. beta<=0.0 (default 0.0, "off"): the entropy term is never added to the graph.
+           v7 IL sets 0.01. CLI --policy-entropy-bonus X, must lie in [0, 0.5]. */
+    double policy_entropy_bonus{0.0};
+    /* value_only_iterations (K): staged value warmup. optimize() runs BEFORE run()'s
+       ++iteration, so the member `iteration` it reads is the SAME 0-based index the teacher
+       window compares (collect_teacher runs while `iteration < teacher_iterations` at run()'s
+       call site). The first K iterations (indices 0..K-1, i.e. `iteration < value_only_iterations`
+       - same strictly-less-than convention as teacher_iterations) train VALUE ONLY: the total
+       loss is value_loss alone (weight decay unchanged - it lives in the AdamW step), the policy
+       CE and the entropy bonus contribute 0 via an explicit branch (the forward is still run and
+       the unscaled policy_loss is still reported for observability, alongside a
+       policy_loss_applied_weight of 0.0 in metrics). Because metrics rows are emitted AFTER
+       ++iteration, a reader sees those exact value-only rows as iteration 1..K (<= K). K<=0
+       (default 0, "off"): `iteration >= 0` always holds, so the policy term is active from the
+       first iteration, bit-for-bit today. v7 IL sets 4. CLI --value-only-iterations N, must lie
+       in [0, 10000]. */
+    int value_only_iterations{0};
     double promotion_margin{0.0};
     double promotion_confidence_z{1.6448536269514722};
     double random_score_floor{0.95};
