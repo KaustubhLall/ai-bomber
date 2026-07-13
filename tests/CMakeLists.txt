@@ -889,6 +889,113 @@ if(TARGET bomber_alphazero_native)
       DEPENDS test_native_alphazero_search_contempt_override TIMEOUT 20)
   endif()
 
+  # v7 Stage-1 IL (docs/experiment-memory/14-v7-from-scratch-design.md Stage 1): collect_teacher()
+  # upgrade - the per-iteration teacher_actions histogram (metrics) and the teacher_agents
+  # semantic-field machinery. CI deliberately keeps the roster to heuristic/random (fast and
+  # deterministic at these tiny counts); mcts teacher support is exercised in production only.
+  #
+  # (metrics) One fresh 2-iteration run whose whole horizon is inside the teacher window
+  # (--teacher-iterations 2, --teacher-games 2, --teacher-agents heuristic,random), so BOTH
+  # metrics.jsonl rows must carry a well-formed teacher_actions block; the python check also
+  # confirms config.json / the fresh runtime_config record the roster. --simulations 2 is fine
+  # (teacher games never run MCTS search for a heuristic/random roster).
+  add_test(NAME test_native_alphazero_teacher_metrics_smoke
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-teacher-smoke
+      --fresh --iterations 2 --games 2 --simulations 2
+      --train-steps 1 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 2 --teacher-iterations 2
+      --teacher-agents heuristic,random
+      --eval-interval 1 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress)
+  set_tests_properties(test_native_alphazero_teacher_metrics_smoke PROPERTIES TIMEOUT 90)
+
+  # (semantics) Same fresh -> resume(inherit) -> resume(explicit override) shape as the
+  # forced-playouts / search-contempt chains above, in its own dedicated run-dir: fresh sets
+  # --teacher-agents heuristic,random; the resume passes NO teacher-agents flag (must inherit
+  # silently); the third invocation passes --teacher-agents random,heuristic (must log a SEMANTIC
+  # FORK line). --teacher-iterations 3 keeps the teacher window open across all three iterations,
+  # though the semantic check only reads config-history/config.json.
+  add_test(NAME test_native_alphazero_teacher_semantic_fresh
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-teacher-semantic-smoke
+      --fresh --iterations 1 --games 2 --simulations 2
+      --train-steps 1 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 3
+      --teacher-agents heuristic,random
+      --eval-interval 100 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress)
+  set_tests_properties(test_native_alphazero_teacher_semantic_fresh PROPERTIES TIMEOUT 60)
+  # No teacher-agents flag at all - must inherit teacher_agents=heuristic,random silently.
+  add_test(NAME test_native_alphazero_teacher_semantic_resume
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-teacher-semantic-smoke
+      --iterations 2 --games 2 --simulations 2
+      --train-steps 1 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 3
+      --eval-interval 100 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress)
+  set_tests_properties(test_native_alphazero_teacher_semantic_resume PROPERTIES
+    DEPENDS test_native_alphazero_teacher_semantic_fresh TIMEOUT 60)
+  # Only --teacher-agents diverges from the inherited manifest value (heuristic,random ->
+  # random,heuristic) - must log a SEMANTIC FORK line.
+  add_test(NAME test_native_alphazero_teacher_semantic_override
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-teacher-semantic-smoke
+      --iterations 3 --games 2 --simulations 2
+      --train-steps 1 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 3
+      --eval-interval 100 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress
+      --teacher-agents random,heuristic)
+  set_tests_properties(test_native_alphazero_teacher_semantic_override PROPERTIES
+    DEPENDS test_native_alphazero_teacher_semantic_resume TIMEOUT 60)
+
+  # (invalid roster) --teacher-agents with an unknown name must fail closed at startup
+  # (validate_config throws, listing valid names) - same WILL_FAIL pattern as
+  # test_native_alphazero_unknown_option_fails.
+  add_test(NAME test_native_alphazero_teacher_agents_invalid_fails
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> evaluate --teacher-agents bogus)
+  set_tests_properties(test_native_alphazero_teacher_agents_invalid_fails PROPERTIES
+    TIMEOUT 20 WILL_FAIL TRUE)
+
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME test_native_alphazero_teacher_metrics_check
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_alphazero_teacher_metrics_check.py
+        ${CMAKE_BINARY_DIR}/native-alphazero-teacher-smoke)
+    set_tests_properties(test_native_alphazero_teacher_metrics_check PROPERTIES
+      DEPENDS test_native_alphazero_teacher_metrics_smoke TIMEOUT 20)
+    add_test(NAME test_native_alphazero_teacher_semantic_check
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_alphazero_teacher_semantic_check.py
+        ${CMAKE_BINARY_DIR}/native-alphazero-teacher-semantic-smoke)
+    set_tests_properties(test_native_alphazero_teacher_semantic_check PROPERTIES
+      DEPENDS test_native_alphazero_teacher_semantic_override TIMEOUT 20)
+  endif()
+
   # KL-101 Part D regression: a second `train` process must be refused while a first is still
   # running, even on a different run-dir - the actual failure mode that crashed training twice
   # earlier in this project's history. Self-contained (manages its own background process),

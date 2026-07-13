@@ -105,8 +105,29 @@ struct TrainConfig {
     int replay_capacity{200'000};
     int channels{128};
     int residual_blocks{10};
+    /* teacher_games / teacher_iterations bound the v7 Stage-1 imitation-learning (IL) bootstrap:
+       for the first teacher_iterations iterations, collect_teacher() harvests teacher_games
+       expert-vs-expert games whose one-hot policy targets clone the experts' moves (see the
+       collector for the both-seat/cause-tag mechanics). 0 games or 0 iterations disables the
+       bootstrap entirely - the loop then trains on self-play/league data only, as before v7. */
     int teacher_games{32};
     int teacher_iterations{20};
+    /* v7 Stage-1 IL (docs/experiment-memory/14-v7-from-scratch-design.md Stage 1): the expert
+       roster collect_teacher() draws BOTH seats from, comma-separated (--teacher-agents, e.g.
+       "mcts,heuristic"). Every name must be one parse_gate_agent_name() accepts (the strict
+       whitelist - a typo throws in validate_config rather than silently becoming random, unlike
+       agent_parse_type). Per game seat0 = roster[game_index % n], seat1 = roster[(game_index+1)
+       % n] (both = roster[0] when n==1) - so a single-entry roster is expert-vs-itself and a
+       multi-entry roster rotates matchups; vs-random is deliberately NOT the default any more
+       (random suicides in ~6 steps and poisons the value targets - doc 14 Stage 1).
+       A semantic field riding the FULL manifest machinery exactly like temperature_final /
+       forced_playouts_k - persisted/inherited/explicit-override-logged, part of
+       runtime_config_signature, config.json, and semantic_field_flags() - because it changes
+       the IL data distribution the network's early weights are shaped by. Default "heuristic"
+       (both seats heuristic): a deliberate v7 break from the old heuristic-vs-random single-seat
+       harvest; a legacy checkpoint with no teacher_agents key inherits this compiled default via
+       the faithful-default NOTE path in apply_semantic_manifest(). */
+    std::string teacher_agents{"heuristic"};
     int evaluation_interval{5};
     int evaluation_games{32};
     int evaluation_simulations{64};
