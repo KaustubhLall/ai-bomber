@@ -695,6 +695,89 @@ if(TARGET bomber_alphazero_native)
       DEPENDS test_native_alphazero_temperature_anneal_override TIMEOUT 20)
   endif()
 
+  # v7 Stage 0 item 0.2 (docs/experiment-memory/14-v7-from-scratch-design.md): forced_playouts_k
+  # semantic-field machinery. Same fresh -> resume(inherit) -> resume(explicit override) shape as
+  # the temperature-anneal chain above, in its own dedicated run-dir: fresh sets
+  # --forced-playouts-k 2; the resume passes NO forced-playouts flag at all (must inherit
+  # silently); the third invocation passes only --forced-playouts-k 3 (must log a SEMANTIC FORK
+  # line). --eval-interval 1 on all three doubles this fixture as the forced-playouts telemetry
+  # fixture below (every metrics.jsonl row gets a well-formed "forced_playouts" object).
+  # --simulations 32 (vs this file's usual --simulations 2) is the ONE deliberate deviation from
+  # the temperature-anneal chain's flag shape: forcing's floor invariant (root_floor_violations()
+  # in trainer.cpp) needs a large enough total-visit budget for the sqrt(k*P*N) floors of ALL
+  # competing noised actions to become simultaneously satisfiable (their sum grows like sqrt(N),
+  # the budget grows like N, so any fixed k/branching-factor combination eventually crosses over -
+  # at --simulations 2 the search never leaves that early transient, so the invariant check would
+  # be measuring an artifact of too-small a budget, not real forcing behavior).
+  add_test(NAME test_native_alphazero_forced_playouts_fresh
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-forced-playouts-smoke
+      --fresh --iterations 1 --games 2 --simulations 32
+      --train-steps 1 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 1 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress
+      --forced-playouts-k 2)
+  set_tests_properties(test_native_alphazero_forced_playouts_fresh PROPERTIES TIMEOUT 90)
+  # No forced-playouts flag at all - must inherit forced_playouts_k=2 silently from the manifest.
+  add_test(NAME test_native_alphazero_forced_playouts_resume
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-forced-playouts-smoke
+      --iterations 2 --games 2 --simulations 32
+      --train-steps 1 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 1 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress)
+  set_tests_properties(test_native_alphazero_forced_playouts_resume PROPERTIES
+    DEPENDS test_native_alphazero_forced_playouts_fresh TIMEOUT 90)
+  # Only --forced-playouts-k diverges from the inherited manifest value (2 -> 3) - must log a
+  # SEMANTIC FORK line.
+  add_test(NAME test_native_alphazero_forced_playouts_override
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-forced-playouts-smoke
+      --iterations 3 --games 2 --simulations 32
+      --train-steps 1 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 1 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress
+      --forced-playouts-k 3)
+  set_tests_properties(test_native_alphazero_forced_playouts_override PROPERTIES
+    DEPENDS test_native_alphazero_forced_playouts_resume TIMEOUT 90)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME test_native_alphazero_forced_playouts_semantic_check
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_alphazero_forced_playouts_semantic_check.py
+        ${CMAKE_BINARY_DIR}/native-alphazero-forced-playouts-smoke)
+    set_tests_properties(test_native_alphazero_forced_playouts_semantic_check PROPERTIES
+      DEPENDS test_native_alphazero_forced_playouts_override TIMEOUT 20)
+
+    # Forcing-floor + pruning telemetry properties (v7 Stage 0 item 0.2 test plan items 3-4):
+    # reuses the SAME fixture chain above (all three invocations pass forced_playouts_k>0 and
+    # --eval-interval 1) rather than a dedicated one - same reuse pattern as the drift-canary
+    # check reusing the temperature-anneal fixture.
+    add_test(NAME test_native_alphazero_forced_playouts_metrics_check
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_alphazero_forced_playouts_metrics_check.py
+        ${CMAKE_BINARY_DIR}/native-alphazero-forced-playouts-smoke)
+    set_tests_properties(test_native_alphazero_forced_playouts_metrics_check PROPERTIES
+      DEPENDS test_native_alphazero_forced_playouts_override TIMEOUT 20)
+  endif()
+
   # KL-101 Part D regression: a second `train` process must be refused while a first is still
   # running, even on a different run-dir - the actual failure mode that crashed training twice
   # earlier in this project's history. Self-contained (manages its own background process),
@@ -722,4 +805,13 @@ if(TARGET bomber_alphazero_native)
   add_executable(test_replay_sampling test_replay_sampling.cpp)
   target_include_directories(test_replay_sampling PRIVATE ${CMAKE_SOURCE_DIR}/src)
   add_test(NAME test_replay_sampling COMMAND test_replay_sampling)
+
+  # v7 Stage 0 item 0.2: prune_policy_target_visits() (src/training/native/
+  # policy_target_pruning.h) is the pure, Torch-free extraction of the KataGo
+  # policy-target-pruning arithmetic - same rationale/wiring as test_replay_sampling above
+  # (header has no native-alphazero/LibTorch dependency; wired here purely for build-graph
+  # convenience alongside the rest of this test surface).
+  add_executable(test_policy_target_pruning test_policy_target_pruning.cpp)
+  target_include_directories(test_policy_target_pruning PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  add_test(NAME test_policy_target_pruning COMMAND test_policy_target_pruning)
 endif()

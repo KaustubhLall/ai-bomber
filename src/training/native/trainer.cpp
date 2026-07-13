@@ -1,4 +1,5 @@
 #include "training/native/trainer.h"
+#include "training/native/policy_target_pruning.h"
 #include "training/native/replay_sampling.h"
 
 extern "C" {
@@ -694,6 +695,23 @@ struct SearchResult {
     std::array<float, kJointActions> priors{};
     std::array<float, kJointActions> value_sum0{};
     std::array<float, kJointActions> value_sum1{};
+    /* v7 Stage 0 item 0.2 (KataGo forced playouts, Wu arXiv:1902.10565 S4.1-4.2): per-seat,
+       per-action count of ROOT simulations that selected that seat's marginal action because it
+       was FORCED (marginal visits below the sqrt(k*P*N) floor), not because it won PUCT on its
+       own merit - see BatchedMcts::select_joint_root_forced(). All-zero whenever
+       root_noise==false (eval/gates/promotion never force - see search()'s at-root branch) or
+       config.forced_playouts_k<=0 (off, default). Consumed by policy_target_pruning.h at
+       collection time to prune the POLICY TRAINING TARGET only; action selection
+       (sample_joint_action) always uses the unpruned `visits` above. */
+    std::array<int, kActions> forced0{};
+    std::array<int, kActions> forced1{};
+    /* v7 Stage 0 item 0.2 telemetry: count of root actions (summed over both seats) whose FINAL
+       marginal visits, after the whole simulation budget, fell below the forced-playouts floor
+       by more than the documented one-simulation slack - see the post-simulation-loop check in
+       search(). Expected 0 whenever forcing is active; surfaced into metrics.jsonl as
+       forced_floor_violations so a regression is always-on telemetry, not a silent invariant.
+       All-zero under the same conditions as forced0/forced1 above. */
+    int floor_violations{};
 };
 
 struct LeafJob {
@@ -740,6 +758,18 @@ public:
             for (auto& root : roots) add_root_noise(*root);
         }
 
+        /* v7 Stage 0 item 0.2: per-root, per-seat forced-selection counts, owned by this search
+           call (NOT Node - only roots ever need this bookkeeping, so it lives here rather than
+           bloating every node in the tree). Persists ACROSS the whole simulation loop below
+           (declared outside it), since a forced floor is re-checked against the CURRENT
+           accumulated visit count on every simulation. Zero-initialized (std::array<int,
+           kActions>{} default), so a root that never triggers forcing (root_noise==false, or
+           forced_playouts_k<=0, or simply no action ever qualifies) reports all-zero - exactly
+           the "off" SearchResult contract. */
+        std::vector<std::array<int, kActions>> forced_counts0(roots.size());
+        std::vector<std::array<int, kActions>> forced_counts1(roots.size());
+        const bool forcing_enabled = root_noise && config_.forced_playouts_k > 0.0;
+
         for (int simulation = 0; simulation < std::max(simulation_count, 1); ++simulation) {
             std::vector<LeafJob> leaves;
             leaves.reserve(roots.size());
@@ -752,7 +782,19 @@ public:
                 Node* node = roots[root_index].get();
                 std::vector<std::pair<Node*, int>> path;
                 while (node->expanded && !node->terminal) {
-                    const int action = select_joint(*node);
+                    /* Root-only hook: path.empty() is true exactly on this while loop's FIRST
+                       iteration, i.e. exactly when `node` is still the root this simulation
+                       started from - forcing must never apply at any deeper ply (hard
+                       constraint; select_joint() itself is never modified, so every non-root
+                       selection - and every selection at all when forcing_enabled is false,
+                       which covers every eval/gates/promotion call and every
+                       forced_playouts_k<=0 collection call - takes the IDENTICAL call it took
+                       before this feature existed). */
+                    const bool at_root = path.empty();
+                    const int action = (at_root && forcing_enabled)
+                        ? select_joint_root_forced(*node, forced_counts0[root_index],
+                                                   forced_counts1[root_index])
+                        : select_joint(*node);
                     path.emplace_back(node, action);
                     if (!node->children[action]) {
                         BomberEnv child_env;
@@ -804,6 +846,18 @@ public:
             results[index].priors = roots[index]->priors;
             results[index].value_sum0 = roots[index]->value_sum0;
             results[index].value_sum1 = roots[index]->value_sum1;
+            /* v7 Stage 0 item 0.2: forced_counts0/1 default-initialize to all-zero and are only
+               ever written inside the at_root&&forcing_enabled branch above, so this assignment
+               is unconditionally safe (and correctly all-zero) whenever forcing never fired this
+               call. floor_violations is left at SearchResult's own zero default unless forcing
+               was actually enabled this call - root_floor_violations() is meaningless (and its
+               own kPriorEpsilon-gated loop would just report 0 anyway) when forced_playouts_k<=0
+               or root_noise==false, so skip the redundant pass entirely rather than rely on that
+               coincidence. */
+            results[index].forced0 = forced_counts0[index];
+            results[index].forced1 = forced_counts1[index];
+            if (forcing_enabled)
+                results[index].floor_violations = root_floor_violations(*roots[index]);
         }
         return results;
     }
@@ -849,6 +903,129 @@ private:
             }
         }
         return selected_zero * kActions + selected_one;
+    }
+
+    /* v7 Stage 0 item 0.2 (KataGo forced playouts, Wu arXiv:1902.10565 S4.1; independently
+       replicated by Trudeau & Bowling 2023): ROOT-ONLY replacement for select_joint(), called
+       exactly when search()'s at_root&&forcing_enabled guard is true - never at any other ply,
+       and never at all unless root_noise (collection) and config_.forced_playouts_k>0. A
+       brand-new function rather than a branch inside select_joint() itself, so select_joint()'s
+       own compiled behavior - and therefore every non-root selection, and every root selection
+       on any eval/gates/promotion/off-by-default call - is provably untouched by construction,
+       not merely by argument.
+
+       Computes the identical per-seat marginal PUCT pick select_joint() would (same
+       accumulation order, same strict-> tie-break, so this only diverges from plain PUCT when
+       forcing actually fires), then applies KataGo's forcing rule on top: seat s's action a is
+       FORCED - selected regardless of its PUCT score - whenever its marginal visit count n(a) is
+       below floor(a) = sqrt(k * P(a) * N), P(a) the seat's POST-noise marginal root prior
+       (node.priors already holds add_root_noise()'s output, since that runs once before the
+       simulation loop starts) and N this root's total visits so far (std::accumulate over
+       node.visits, exactly what select_joint() itself uses for its exploration scale). If more
+       than one action qualifies (deficit = floor(a) - n(a) > 0), the MOST starved one (largest
+       deficit, ties toward the lower action index - matching this file's >-strict tie-break
+       convention elsewhere) is forced; forcing a* itself is a no-op in practice (a* is already
+       the most-visited action by definition, so it essentially never has a positive deficit; it
+       is not special-cased here because the arithmetic already handles it, and any exclusion
+       gets reintroduced correctly at the pruning step in policy_target_pruning.h instead, which
+       DOES special-case a*, per KataGo's actual algorithm). Each seat's forced_counts array
+       (owned by the caller - see search()'s per-root forced_counts0/1 vectors) is incremented at
+       the forced action whenever forcing fires for that seat this simulation, so it accumulates
+       to exactly "how many simulations selected this action because it was forced," the count
+       policy_target_pruning.h needs. */
+    int select_joint_root_forced(const Node& node, std::array<int, kActions>& forced0,
+                                 std::array<int, kActions>& forced1) const {
+        const int total = std::accumulate(node.visits.begin(), node.visits.end(), 0);
+        const float scale = std::sqrt(static_cast<float>(total) + 1.0f);
+        const float k = static_cast<float>(config_.forced_playouts_k);
+        std::array<int, kActions> visits_zero{};
+        std::array<int, kActions> visits_one{};
+        std::array<float, kActions> values_zero{};
+        std::array<float, kActions> values_one{};
+        std::array<float, kActions> priors_zero{};
+        std::array<float, kActions> priors_one{};
+        for (int action = 0; action < kActions; ++action) {
+            for (int opponent = 0; opponent < kActions; ++opponent) {
+                const int index_zero = action * kActions + opponent;
+                visits_zero[action] += node.visits[index_zero];
+                values_zero[action] += node.value_sum0[index_zero];
+                priors_zero[action] += node.priors[index_zero];
+                const int index_one = opponent * kActions + action;
+                visits_one[action] += node.visits[index_one];
+                values_one[action] += node.value_sum1[index_one];
+                priors_one[action] += node.priors[index_one];
+            }
+        }
+        auto select_seat = [&](const std::array<int, kActions>& visits,
+                               const std::array<float, kActions>& values,
+                               const std::array<float, kActions>& priors,
+                               std::array<int, kActions>& forced_counts) {
+            int puct_action = 0;
+            float best = -std::numeric_limits<float>::infinity();
+            for (int action = 0; action < kActions; ++action) {
+                if (priors[action] <= 0.0f) continue;
+                const float q = visits[action] ? values[action] / visits[action] : 0.0f;
+                const float score = q + static_cast<float>(config_.c_puct) * priors[action] *
+                                          scale / (1.0f + visits[action]);
+                if (score > best) { best = score; puct_action = action; }
+            }
+            int forced_action = -1;
+            float best_deficit = 0.0f;
+            for (int action = 0; action < kActions; ++action) {
+                if (priors[action] <= 0.0f) continue;
+                const float required =
+                    std::sqrt(k * priors[action] * static_cast<float>(total));
+                const float deficit = required - static_cast<float>(visits[action]);
+                if (deficit > best_deficit) { best_deficit = deficit; forced_action = action; }
+            }
+            if (forced_action >= 0) {
+                ++forced_counts[forced_action];
+                return forced_action;
+            }
+            return puct_action;
+        };
+        const int selected_zero = select_seat(visits_zero, values_zero, priors_zero, forced0);
+        const int selected_one = select_seat(visits_one, values_one, priors_one, forced1);
+        return selected_zero * kActions + selected_one;
+    }
+
+    /* v7 Stage 0 item 0.2 telemetry: post-hoc invariant check, run once per root AFTER the whole
+       simulation budget for this search() call (NOT per-simulation) - counts how many root
+       actions, across both seats, with non-negligible post-noise marginal prior ended up below
+       their forced-playouts floor by more than one simulation's slack. kPriorEpsilon excludes
+       actions with essentially no prior mass (safe-action-masked to exactly 0, or renormalized
+       to a negligible sliver) - those can never be forced in the first place (their own floor is
+       ~0 too), so they are not a meaningful test of whether forcing did its job. The "-1" slack
+       accounts for the floor being a monotonically-growing function of N (including N from the
+       very last simulation) checked against an integer visit count that can only integrate whole
+       simulations - see select_joint_root_forced() above, which computes N and the floor
+       identically. Expected 0 whenever forcing is active; surfaced into metrics.jsonl as
+       forced_floor_violations (see collect_self_play/collect_league_play) so this invariant is
+       always-on telemetry, not a silent assumption. */
+    int root_floor_violations(const Node& root) const {
+        const int total = std::accumulate(root.visits.begin(), root.visits.end(), 0);
+        const float k = static_cast<float>(config_.forced_playouts_k);
+        constexpr float kPriorEpsilon = 1e-3f;
+        int violations = 0;
+        for (int seat = 0; seat < 2; ++seat) {
+            std::array<int, kActions> visits{};
+            std::array<float, kActions> priors{};
+            for (int action = 0; action < kActions; ++action) {
+                for (int opponent = 0; opponent < kActions; ++opponent) {
+                    const int joint = seat == 0 ? action * kActions + opponent
+                                                : opponent * kActions + action;
+                    visits[action] += root.visits[joint];
+                    priors[action] += root.priors[joint];
+                }
+            }
+            for (int action = 0; action < kActions; ++action) {
+                if (priors[action] < kPriorEpsilon) continue;
+                const int required = static_cast<int>(std::floor(
+                    std::sqrt(k * priors[action] * static_cast<float>(total)))) - 1;
+                if (visits[action] < required) ++violations;
+            }
+        }
+        return violations;
     }
 
     static void backup(const std::vector<std::pair<Node*, int>>& path,
@@ -1268,6 +1445,7 @@ std::string runtime_config_signature(const TrainConfig& config) {
            << ";c_puct=" << config.c_puct
            << ";dirichlet_alpha=" << config.dirichlet_alpha
            << ";dirichlet_fraction=" << config.dirichlet_fraction
+           << ";forced_playouts_k=" << config.forced_playouts_k
            << ";temperature=" << config.temperature
            << ";temperature_steps=" << config.temperature_steps
            << ";temperature_final=" << config.temperature_final
@@ -1308,6 +1486,7 @@ const std::vector<std::pair<std::string, std::string>>& semantic_field_flags() {
         {"c_puct", "--c-puct"},
         {"dirichlet_alpha", "--dirichlet-alpha"},
         {"dirichlet_fraction", "--dirichlet-fraction"},
+        {"forced_playouts_k", "--forced-playouts-k"},
         {"temperature", "--temperature"},
         {"temperature_steps", "--temperature-steps"},
         {"temperature_final", "--temperature-final"},
@@ -1335,6 +1514,7 @@ std::string semantic_manifest_string(const TrainConfig& config) {
            << ";c_puct=" << config.c_puct
            << ";dirichlet_alpha=" << config.dirichlet_alpha
            << ";dirichlet_fraction=" << config.dirichlet_fraction
+           << ";forced_playouts_k=" << config.forced_playouts_k
            << ";temperature=" << config.temperature
            << ";temperature_steps=" << config.temperature_steps
            << ";temperature_final=" << config.temperature_final
@@ -1447,6 +1627,19 @@ std::vector<std::string> apply_semantic_manifest(TrainConfig& config,
     reconcile_double("c_puct", &TrainConfig::c_puct);
     reconcile_double("dirichlet_alpha", &TrainConfig::dirichlet_alpha);
     reconcile_double("dirichlet_fraction", &TrainConfig::dirichlet_fraction);
+    /* v7 Stage 0 item 0.2: forced_playouts_k did not exist before this manifest schema
+       addition - same situation as temperature_final/temperature_anneal and
+       replay_cause_balance_cap above. The generic absent-key handling in reconcile_double
+       already does the right thing behaviorally (config is left at whatever CLI parsing
+       resolved - forced_playouts_k=0.0 unless explicitly overridden), but stays silent; this
+       gets the same one-line NOTE those additions did. Inheriting 0.0 is faithful, not a
+       substitution: it reproduces the unforced root-selection behavior this checkpoint was
+       actually trained under. */
+    if (!stored.count("forced_playouts_k"))
+        std::cerr << "NOTE - checkpoint manifest predates forced_playouts_k (v7 Stage 0 item "
+                     "0.2); inheriting the compiled default 0.0 (off), which reproduces the "
+                     "unforced root-selection behavior this checkpoint was trained under.\n";
+    reconcile_double("forced_playouts_k", &TrainConfig::forced_playouts_k);
     reconcile_double("temperature", &TrainConfig::temperature);
     reconcile_int("temperature_steps", &TrainConfig::temperature_steps);
     /* v7 Stage 0 item 0.1+0.3: temperature_final/temperature_anneal did not exist before this
@@ -1578,7 +1771,7 @@ void validate_train_cli_options(int argc, char** argv, int first) {
         "--promotion-confidence-z", "--random-score-floor", "--heuristic-score-floor",
         "--heuristic-regression-margin", "--fork-from", "--dirty-diff-digest",
         "--gates-agent", "--gates-opponent-model", "--replay-cause-balance-cap",
-        "--temperature-final",
+        "--temperature-final", "--forced-playouts-k",
     };
     static const std::set<std::string_view> flag_options = {
         "--fresh", "--no-progress", "--eval-mcts", "--overwrite-evidence",
@@ -1624,6 +1817,12 @@ void validate_config(const TrainConfig& config) {
         throw std::invalid_argument("league heuristic fraction must lie in [0, 1]");
     if (config.replay_cause_balance_cap < 0.0 || config.replay_cause_balance_cap > 0.9)
         throw std::invalid_argument("replay cause-balance cap must lie in [0, 0.9]");
+    /* v7 Stage 0 item 0.2: forced_playouts_k is a multiplier inside a sqrt(k*P*N) visit floor
+       (BatchedMcts::select_joint_root_forced), so negative is meaningless; 10 is a generous
+       upper bound (KataGo's own k~=2 default) wide enough for experimentation while still
+       catching an obvious typo/unit confusion (e.g. a value meant for a different knob). */
+    if (config.forced_playouts_k < 0.0 || config.forced_playouts_k > 10.0)
+        throw std::invalid_argument("forced-playouts-k must lie in [0, 10]");
     /* v7 Stage 0 item 0.1+0.3: temperature_final must be a valid endpoint for the linear anneal
        to land on - below 0 is not a probability-like temperature, above `temperature` would be
        annealing UP, not down. temperature_anneal's linear fraction (resolve_temperature() in
@@ -2341,6 +2540,30 @@ struct Trainer::Impl {
         int64_t total_steps{};
     };
 
+    /* v7 Stage 0 item 0.2: KataGo forced-playouts telemetry (docs/experiment-memory/
+       14-v7-from-scratch-design.md), accumulated across BOTH collect_self_play() and
+       collect_league_play() for one iteration - reset ONCE per iteration in run(), right before
+       collection starts, unlike last_self_play/last_league_play which are each reset inside
+       their OWN single collect_* call (this one deliberately is not, since it must span both
+       calls). All-zero whenever config.forced_playouts_k<=0 (off, default) - both collection
+       functions only touch these fields inside their own `config.forced_playouts_k > 0.0`
+       branch. */
+    struct ForcedPlayoutMetrics {
+        /* Seat-decisions observed this iteration - 2 per root search in mirror self-play (seat 0
+           and seat 1 each build their own policy target), 1 per root search in league play (the
+           learner seat only). Matches how many times prune_policy_target_visits() was called. */
+        int64_t moves{};
+        /* Sum, over `moves`, of that move's forced-simulation count (sum of the seat's forced0/
+           forced1 array from SearchResult) - mean_forced_per_move = forced_visits_sum/moves. */
+        int64_t forced_visits_sum{};
+        /* Sum, over `moves`, of (visits removed by pruning)/total_visits for that move -
+           mean_pruned_visit_fraction = pruned_fraction_sum/moves. */
+        double pruned_fraction_sum{};
+        /* Sum of SearchResult::floor_violations across every root search this iteration (both
+           collection calls) - expected 0; see BatchedMcts::root_floor_violations(). */
+        int64_t floor_violations{};
+    };
+
     TrainConfig config;
     torch::Device device;
     PolicyValueNet model;
@@ -2358,6 +2581,7 @@ struct Trainer::Impl {
     std::filesystem::path metrics_path;
     SelfPlayMetrics last_self_play;
     Evaluation last_league_play;
+    ForcedPlayoutMetrics last_forced_playouts;
     /* KL-101 Part D: global native-GPU lock is held by train and evaluate for the object's
        lifetime; the run-dir lock is training-only. OS handles release on every exit path. */
     std::unique_ptr<ProcessLock> system_lock;
@@ -2466,6 +2690,7 @@ struct Trainer::Impl {
                << "  \"c_puct\": " << config.c_puct << ",\n"
                << "  \"dirichlet_alpha\": " << config.dirichlet_alpha << ",\n"
                << "  \"dirichlet_fraction\": " << config.dirichlet_fraction << ",\n"
+               << "  \"forced_playouts_k\": " << config.forced_playouts_k << ",\n"
                << "  \"temperature\": " << config.temperature << ",\n"
                << "  \"temperature_steps\": " << config.temperature_steps << ",\n"
                << "  \"temperature_final\": " << config.temperature_final << ",\n"
@@ -2603,17 +2828,53 @@ struct Trainer::Impl {
                 Sample one;
                 encode_state(game.env, 0, zero.state);
                 encode_state(game.env, 1, one.state);
+                std::array<int, kActions> marginal_zero{};
+                std::array<int, kActions> marginal_one{};
                 for (int action = 0; action < kActions; ++action) {
-                    int marginal_zero = 0;
-                    int marginal_one = 0;
                     for (int opponent = 0; opponent < kActions; ++opponent) {
-                        marginal_zero += visits[action * kActions + opponent];
-                        marginal_one += visits[opponent * kActions + action];
+                        marginal_zero[action] += visits[action * kActions + opponent];
+                        marginal_one[action] += visits[opponent * kActions + action];
                     }
-                    zero.policy[action] = static_cast<float>(marginal_zero) /
-                                          std::max(total_visits, 1);
-                    one.policy[action] = static_cast<float>(marginal_one) /
-                                         std::max(total_visits, 1);
+                }
+                /* v7 Stage 0 item 0.2 (KataGo forced playouts + policy-target pruning): ACTION
+                   SELECTION below (sample_joint_action, on the raw joint `visits`) always uses
+                   the UNPRUNED marginals - only the POLICY TRAINING TARGET built here is pruned,
+                   and only when forcing is active. config.forced_playouts_k<=0 (off, default)
+                   never enters this branch, so zero.policy/one.policy are built from
+                   marginal_zero/marginal_one exactly as before this feature existed - bit for
+                   bit (see policy_target_pruning.h for the pruning arithmetic, and
+                   ForcedPlayoutMetrics above for what this records). */
+                std::array<int, kActions> policy_visits_zero = marginal_zero;
+                std::array<int, kActions> policy_visits_one = marginal_one;
+                int policy_total_zero = total_visits;
+                int policy_total_one = total_visits;
+                if (config.forced_playouts_k > 0.0) {
+                    auto record_forced_playout_move = [&](
+                            const std::array<int, kActions>& marginal,
+                            const std::array<int, kActions>& forced,
+                            std::array<int, kActions>& policy_visits_out, int& policy_total_out) {
+                        policy_visits_out = prune_policy_target_visits(marginal, forced);
+                        policy_total_out = std::accumulate(
+                            policy_visits_out.begin(), policy_visits_out.end(), 0);
+                        const int forced_sum = std::accumulate(forced.begin(), forced.end(), 0);
+                        ++last_forced_playouts.moves;
+                        last_forced_playouts.forced_visits_sum += forced_sum;
+                        last_forced_playouts.pruned_fraction_sum += total_visits > 0
+                            ? static_cast<double>(total_visits - policy_total_out) / total_visits
+                            : 0.0;
+                    };
+                    record_forced_playout_move(marginal_zero, searches[active_index].forced0,
+                                               policy_visits_zero, policy_total_zero);
+                    record_forced_playout_move(marginal_one, searches[active_index].forced1,
+                                               policy_visits_one, policy_total_one);
+                    last_forced_playouts.floor_violations +=
+                        searches[active_index].floor_violations;
+                }
+                for (int action = 0; action < kActions; ++action) {
+                    zero.policy[action] = static_cast<float>(policy_visits_zero[action]) /
+                                          std::max(policy_total_zero, 1);
+                    one.policy[action] = static_cast<float>(policy_visits_one[action]) /
+                                         std::max(policy_total_one, 1);
                 }
                 game.trajectory.push_back(std::move(zero));
                 game.trajectory.push_back(std::move(one));
@@ -2758,15 +3019,36 @@ struct Trainer::Impl {
                 const int total_visits = std::accumulate(visits.begin(), visits.end(), 0);
                 Sample sample;
                 encode_state(game.env, learner_seat, sample.state);
+                std::array<int, kActions> marginal{};
                 for (int action = 0; action < kActions; ++action) {
-                    int marginal = 0;
                     for (int opponent_action = 0; opponent_action < kActions; ++opponent_action)
-                        marginal += learner_seat == 0
+                        marginal[action] += learner_seat == 0
                             ? visits[action * kActions + opponent_action]
                             : visits[opponent_action * kActions + action];
-                    sample.policy[action] = static_cast<float>(marginal) /
-                                            std::max(total_visits, 1);
                 }
+                /* v7 Stage 0 item 0.2: same "unpruned for action selection, pruned only for the
+                   policy target" split as collect_self_play() above - see that function's own
+                   comment for the full rationale. Only the LEARNER seat's marginal/forced array
+                   is relevant here (the opponent seat is scripted, never trained on). */
+                std::array<int, kActions> policy_visits = marginal;
+                int policy_total = total_visits;
+                if (config.forced_playouts_k > 0.0) {
+                    const auto& forced = learner_seat == 0 ? searches[active_index].forced0
+                                                           : searches[active_index].forced1;
+                    policy_visits = prune_policy_target_visits(marginal, forced);
+                    policy_total = std::accumulate(policy_visits.begin(), policy_visits.end(), 0);
+                    const int forced_sum = std::accumulate(forced.begin(), forced.end(), 0);
+                    ++last_forced_playouts.moves;
+                    last_forced_playouts.forced_visits_sum += forced_sum;
+                    last_forced_playouts.pruned_fraction_sum += total_visits > 0
+                        ? static_cast<double>(total_visits - policy_total) / total_visits
+                        : 0.0;
+                    last_forced_playouts.floor_violations +=
+                        searches[active_index].floor_violations;
+                }
+                for (int action = 0; action < kActions; ++action)
+                    sample.policy[action] = static_cast<float>(policy_visits[action]) /
+                                            std::max(policy_total, 1);
                 game.trajectory.push_back(std::move(sample));
 
                 const float temperature = resolve_temperature(game.env.state.step, config);
@@ -3730,6 +4012,25 @@ struct Trainer::Impl {
                << ",\"draws\":" << last_self_play.draws
                << ",\"losses\":" << last_self_play.losses
                << ",\"mean_steps\":" << last_self_play.mean_steps << '}'
+               /* v7 Stage 0 item 0.2 (docs/experiment-memory/14-v7-from-scratch-design.md):
+                  KataGo forced-playouts telemetry, combined across this iteration's mirror
+                  self-play AND league play (see ForcedPlayoutMetrics/last_forced_playouts
+                  above) - all-zero whenever config.forced_playouts_k<=0 (off, default).
+                  forced_floor_violations is expected to be exactly 0 whenever forcing is active
+                  (BatchedMcts::root_floor_violations() invariant); a nonzero count here is a
+                  real regression, not noise. */
+               << ",\"forced_playouts\":{\"mean_forced_per_move\":"
+               << (last_forced_playouts.moves > 0
+                       ? static_cast<double>(last_forced_playouts.forced_visits_sum) /
+                             static_cast<double>(last_forced_playouts.moves)
+                       : 0.0)
+               << ",\"mean_pruned_visit_fraction\":"
+               << (last_forced_playouts.moves > 0
+                       ? last_forced_playouts.pruned_fraction_sum /
+                             static_cast<double>(last_forced_playouts.moves)
+                       : 0.0)
+               << ",\"forced_floor_violations\":" << last_forced_playouts.floor_violations
+               << ",\"moves\":" << last_forced_playouts.moves << '}'
                << ",\"optimization\":{\"loss\":" << optimization.loss
                << ",\"policy_loss\":" << optimization.policy_loss
                << ",\"value_loss\":" << optimization.value_loss
@@ -3849,6 +4150,11 @@ struct Trainer::Impl {
         while (iteration < config.iterations && !stop_requested.load()) {
             const auto started = std::chrono::steady_clock::now();
             last_phase_timings = {};
+            /* v7 Stage 0 item 0.2: reset ONCE per iteration, before either collection call -
+               last_forced_playouts spans BOTH collect_self_play() and collect_league_play()
+               below (unlike last_self_play/last_league_play, which each reset themselves inside
+               their own single call). */
+            last_forced_playouts = {};
             std::vector<Sample> collected;
             if (iteration < config.teacher_iterations && config.teacher_games > 0) {
                 auto teacher = collect_teacher(config.teacher_games);
@@ -4875,6 +5181,8 @@ TrainConfig parse_train_config(int argc, char** argv, int first) {
     config.c_puct = parse_number(argc, argv, first, "--c-puct", config.c_puct);
     config.dirichlet_alpha = parse_number(argc, argv, first, "--dirichlet-alpha", config.dirichlet_alpha);
     config.dirichlet_fraction = parse_number(argc, argv, first, "--dirichlet-fraction", config.dirichlet_fraction);
+    config.forced_playouts_k = parse_number(argc, argv, first, "--forced-playouts-k",
+                                            config.forced_playouts_k);
     config.temperature = parse_number(argc, argv, first, "--temperature", config.temperature);
     config.temperature_final = parse_number(argc, argv, first, "--temperature-final",
                                             config.temperature_final);
@@ -4978,6 +5286,16 @@ void print_native_help() {
         "                            uniform sampling, bit-for-bit); tagging always runs, only\n"
         "                            the sampler bias is gated by this cap - see docs/\n"
         "                            experiment-memory/13-kl105-experiment-design.md section 3\n"
+        "  --forced-playouts-k X     KataGo forced playouts + policy-target pruning (in [0,10],\n"
+        "                            default 0 = off, bit-for-bit). >0: during COLLECTION\n"
+        "                            searches only (root_noise on - mirror/league; eval/gates/\n"
+        "                            promotion never force), a root action is selected\n"
+        "                            regardless of PUCT score whenever its marginal visits fall\n"
+        "                            below sqrt(X * post-noise prior * total visits); the POLICY\n"
+        "                            TARGET (not action selection) is then pruned of forced-only\n"
+        "                            visits at collection time - counters measured prior\n"
+        "                            starvation under Dirichlet noise - see docs/experiment-\n"
+        "                            memory/14-v7-from-scratch-design.md item 0.2\n"
         "  --temperature-anneal      Linearly anneal the sample temperature from --temperature\n"
         "                            (step 0) down to --temperature-final (step\n"
         "                            --temperature-steps), then argmax after - default off,\n"

@@ -14,12 +14,17 @@
 #
 # v7.0 Stage 0 semantics carried here (doc 14 section 3 table):
 #   0.1 Dirichlet alpha 0.3 -> 1.5 (--dirichlet-alpha), fraction unchanged (0.25)
+#   0.2 KataGo forced playouts + policy-target pruning, k=2 (--forced-playouts-k) - root-only,
+#       collection-only (mirror + league); directly counters the measured prior-starvation
+#       finding (BOMB visits starve below prior ~0.08) this same alpha=1.5 change interacts
+#       with. See src/training/native/trainer.cpp (BatchedMcts::select_joint_root_forced) and
+#       src/training/native/policy_target_pruning.h.
 #   0.3 Temperature anneal 1.0 -> 0.25 over 60 steps, argmax after (--temperature-anneal
 #       --temperature-final --temperature-steps)
 #   Reward re-derivation: arena-crush win 0.3 -> 0.1 (--arena-crush-win-value); selfkill-win,
 #       timeout-draw, mutual-death values kept at their v6 settings (see doc 14 "Reward
 #       re-derivation" section - only arena-crush-win-value changes in v7.0)
-# 0.2 (forced playouts) and 0.4 (search-contempt) are later units - nothing to wire here yet.
+# 0.4 (search-contempt) is a later unit - nothing to wire here yet.
 # 0.5 (the drift canary) needs no launcher flag: trainer.cpp now runs it automatically at every
 #   --eval-interval, in-process, recorded into metrics.jsonl's "gates" field - see
 #   run_gate_canary()/append_metrics() in src/training/native/trainer.cpp. At this launcher's
@@ -72,6 +77,11 @@ $trainerArgs = @(
     # practice; explicit here rather than changed as trainer.cpp's compiled default (project
     # discipline: explicit > default for a deliberate recipe change).
     "--dirichlet-alpha", "1.5", "--dirichlet-fraction", "0.25",
+    # v7 Stage 0 item 0.2: KataGo forced playouts + policy-target pruning, k=2 (KataGo's own
+    # default) - forces a noised root action's visits toward sqrt(k*P*N) during collection only,
+    # then prunes forced-only visits back out of the POLICY TARGET (not action selection) so the
+    # network is not taught "forced == good" merely from the forcing itself.
+    "--forced-playouts-k", "2",
     # v7 Stage 0 item 0.3: linear anneal 1.0 -> 0.25 over steps 0-60, argmax after - replaces
     # the old flat-then-argmax step function (data-diversity collapse after step 30 was
     # measured in idle-streak structure under it).
@@ -107,7 +117,7 @@ $trainerArgs = @(
     # any published Pommerman result either" - re-enabling it is not part of v7.0's recipe.
 )
 
-Write-Host "Bootstrapping v7 Stage 1 (fresh, dirichlet-alpha=1.5, temperature-anneal 1.0->0.25/60, arena-crush-win-value=0.1, iterations=$iterations, lr-schedule-updates=$lrScheduleUpdates)..."
+Write-Host "Bootstrapping v7 Stage 1 (fresh, dirichlet-alpha=1.5, forced-playouts-k=2, temperature-anneal 1.0->0.25/60, arena-crush-win-value=0.1, iterations=$iterations, lr-schedule-updates=$lrScheduleUpdates)..."
 & $NativeExe train @trainerArgs
 if ($LASTEXITCODE -eq 0) {
     Write-Host "Bootstrap complete."

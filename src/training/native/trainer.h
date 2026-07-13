@@ -114,6 +114,29 @@ struct TrainConfig {
     double c_puct{1.5};
     double dirichlet_alpha{0.3};
     double dirichlet_fraction{0.25};
+    /* v7 Stage 0 item 0.2 (docs/experiment-memory/14-v7-from-scratch-design.md; KataGo forced
+       playouts + policy-target pruning, Wu arXiv:1902.10565 S4.1-4.2, independently replicated
+       by Trudeau & Bowling 2023): a semantic field riding the FULL manifest machinery exactly
+       like temperature_final - persisted/inherited/explicit-override-logged, part of
+       runtime_config_signature, config.json, and semantic_field_flags().
+         - forced_playouts_k<=0.0 (default 0.0, "off"): EXACTLY today's root selection, bit for
+           bit - BatchedMcts::search()'s root-only forcing hook is never invoked (see the
+           path.empty()-gated branch in search()), so a legacy checkpoint or any run that never
+           passes --forced-playouts-k is unaffected.
+         - forced_playouts_k>0.0: during COLLECTION searches only (root_noise==true - mirror
+           self-play and league play; eval/gates/promotion always pass root_noise==false and are
+           therefore never affected regardless of this value), a root action a for seat s is
+           FORCED - selected regardless of its PUCT score - whenever that seat's marginal visit
+           count n(a) < sqrt(forced_playouts_k * P(a) * N), P(a) the seat's POST-noise marginal
+           root prior and N the root's total simulation count so far; the most-starved qualifying
+           action (largest deficit) wins if more than one qualifies. Guarantees every noised
+           action a minimum, prior-scaled visit floor that grows with sqrt(N), directly countering
+           measured prior starvation (BOMB visits starve below prior ~0.08 - see doc 14 section
+           1.3). The POLICY TRAINING TARGET (not action selection, which stays on unpruned
+           visits) is then pruned of forced-only visits at collection time - see
+           policy_target_pruning.h - so the network is not taught "forced == good" merely from
+           the forcing itself. CLI --forced-playouts-k X, must lie in [0, 10]. */
+    double forced_playouts_k{0.0};
     double temperature{1.0};
     /* v7 Stage 0 item 0.1+0.3 (docs/experiment-memory/14-v7-from-scratch-design.md): the sample
        temperature used for step < temperature_steps of self-play/league collection (argmax
