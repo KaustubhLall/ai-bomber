@@ -125,3 +125,26 @@ GPU-days interleaved (or overnight batches). Stages 2-3: at measured ~8 min/iter
 100-150 iterations ≈ 2-3 overnights per stage-block, with promotion gates deciding actual
 length. Total to a defensible go/no-go on the recipe: roughly a week of part-time GPU, all
 under advisor-gated launches.
+
+## Stage-1 IL design (settled 2026-07-13, advisor-owned; implementation via Devin CLI per the
+## devin-swe-orchestrator pattern the user invoked — Fable plans/reviews, Devin implements,
+## swe-check reviews independently)
+
+- **Teacher collector**: the existing `collect_teacher()` (heuristic-vs-RANDOM, expert-seat
+  samples, one-hot targets, active for iteration < teacher_iterations) upgraded to a
+  configurable expert roster (`--teacher-agents`, semantic field; v7 uses `mcts,heuristic`),
+  expert-vs-expert games (vs-random is degenerate — random suicides in ~6 steps, poisoning
+  value targets), BOTH-seat harvesting with mirror-parity per-seat values, KL-105 cause tags
+  on teacher samples (they contain exactly the demonstrated kills IL exists to clone), and a
+  per-iteration teacher action histogram + bomb_fraction in metrics (the denominator for the
+  Stage-1 exit gate's "student bomb usage within 2x of teacher").
+- **No new IL mode**: during the teacher window the launcher simply sets a small mirror
+  trickle (--games 8 ≈ 4% of samples) + --league-heuristic-fraction 0 + heavy teacher games;
+  the trickle keeps the loop's invariants intact and is canary-visible. Judgment call recorded.
+- **Bombing-Collapse guards** (Meisheri et al., adapted to the shared trunk): new semantic
+  `policy_entropy_bonus` (loss = policy_ce − β·H(π); v7 IL β=0.01) and semantic
+  `value_only_iterations` (first K iterations train value only, policy-loss weight 0; v7 K=4)
+  — plus the Stage-0 canary from iteration 0.
+- **Stage-1 exit gate** (unchanged from the stage table): gates ≥3/6 deployed (search mode,
+  canary) AND student bomb-usage within 2x of the teacher histogram's bomb_fraction. Decided
+  by the advisor on the run's metrics, not by clock.
