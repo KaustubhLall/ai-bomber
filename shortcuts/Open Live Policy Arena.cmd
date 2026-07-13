@@ -1,0 +1,4 @@
+@echo off
+set "EXE=%~dp0..\build-codex-vs\src\Release\bomber_viz.exe"
+if not exist "%EXE%" echo Build Release first: cmake --build build-codex-vs --config Release & pause & exit /b 1
+start "AI Bomber Live Policy Arena" "%EXE%" --matchup --fps 1 --render-fps 60 --start-paused

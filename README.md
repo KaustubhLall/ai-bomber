@@ -12,10 +12,15 @@ The project is built around a small fixed-size simulator that can run without a 
 - A local observation format designed to be exported to Python, C++, or another training loop
 - A raylib visualizer for inspecting reward, danger, bombs, local observations, and agent behavior
 - CTest coverage for core environment rules, determinism, replay, rewards, agents, metrics, and hardened invariants
+- Cloneable joint-action search API, alpha-beta and MCTS planning baselines
+- Fixed-seed tournament matrices, NumPy references, and a native C++/LibTorch full-simulator AlphaZero trainer
 
 ## Current status
 
-The current implementation is a local research sandbox, not a trained neural agent. It includes rule-based baselines and a stable C interface so model training can be added without rewriting the simulator. The most useful next step is to connect the observation/action API to a training process and compare learned policies against the included baselines.
+The current implementation is a local research sandbox with rule-based baselines,
+a verified full-simulator neural checkpoint, and an opt-in native C++/LibTorch
+training path. The stronger native-MCTS baseline remains an explicit open
+boundary rather than a solved strength claim.
 
 ## Build
 
@@ -69,44 +74,154 @@ ctest --test-dir build --output-on-failure
 ./build/bomber_headless --agent heuristic --episodes 1 --seed 42 --replay replay.bin
 ```
 
+`--agent` controls agent 0. `--enemy` installs one shared opponent policy for
+enemies 1..N; when it is omitted, enemies use the environment's
+`built-in-random` fallback. These are independent choices: a run is not self-play
+unless both sides are explicitly configured with the same policy.
+
 ## Run benchmark
 
 ```bash
 ./build/bomber_benchmark --episodes 10000 --seed 1
+
+# Reproducible holdout policy matrix in machine-readable form.
+./build/bomber_benchmark --matrix --episodes 20 --seed 9001 --suite holdout --output results/matrix.json
 ```
+
+## Learning baselines
+
+```bash
+python tools/learning.py alphazero-lite --seed 1 --output results/az.json --checkpoint results/az.npz
+python tools/learning.py ppo --seed 1 --output results/ppo.json --checkpoint results/ppo.npz
+python tools/plot_results.py results/ppo.json results/ppo.svg
+```
+
+These framework-free reference pipelines provide reproducible policy/value, replay-target, rollout/advantage, clipped-update, entropy, checkpoint, and fixed-holdout evaluation paths. Their compact shaped-reward arena is intentionally easier than the full C simulator; see [experiment protocol](docs/EXPERIMENTS.md) before making comparative claims.
+
+## Full-simulator AlphaZero self-play
+
+For high-throughput runs, build the opt-in native trainer and keep the full hot
+path in C/C++:
+
+```powershell
+cmake -S . -B build-native-gpu -G "Visual Studio 18 2026" -A x64 `
+  -DAI_BOMBER_BUILD_VIZ=OFF -DAI_BOMBER_BUILD_TESTS=ON `
+  -DAI_BOMBER_BUILD_NATIVE_ALPHAZERO=ON
+cmake --build build-native-gpu --config Release -j 12
+.\tools\run_native_alphazero.ps1 benchmark
+.\tools\run_native_alphazero.ps1 train `
+  --run-dir results\alphazero-native-main --iterations 1000
+```
+
+See the [native build, benchmark, recovery, and long-run guide](docs/NATIVE_ALPHAZERO.md)
+and the [cross-game grokking protocol](docs/SELF_PLAY_GROKKING_PLAYBOOK.md).
+
+The dependency-light NumPy reference remains available:
+
+```powershell
+cmake --build build-codex-vs --config Release --target bomber_training
+python tools/train_alphazero.py `
+  --library build-codex-vs/src/Release/bomber_training.dll `
+  --run-dir results/alphazero-main --iterations 100
+```
+
+This path runs PUCT-guided self-play against the real C environment. It saves
+atomic, auto-resumable checkpoints containing model/optimizer/RNG/replay state,
+keeps periodic and best snapshots, appends durable JSONL metrics, and displays
+progress, throughput, elapsed time, and ETA. See the
+[full training and recovery guide](docs/ALPHAZERO_TRAINING.md).
+
+The selected native iteration-70 checkpoint completed an untouched,
+role-balanced holdout at 128-0-0 against random, 41-87-0 against the native
+heuristic, and 2-14-0 against native MCTS. The full trajectory supports noisy
+ordinary learning, not a grokking claim. See the
+[verified result and MCTS boundary](docs/ALPHAZERO_RESULTS.md).
 
 ## Run visualizer
 
 ```bash
-# Default: compare random, heuristic, and greedy agents across epochs.
-./build/bomber_viz --seed 1337 --epochs 500
+# Default: six simultaneous role-balanced matchups; press 2 for the board.
+./build/bomber_viz --seed 1337
+
+# Start directly in View 2 with any independent matchup slate (up to eight).
+./build/bomber_viz --view compare \
+  --matchup mcts:heuristic --matchup heuristic:mcts \
+  --matchup mcts:greedy --matchup greedy:mcts --epochs 20
 
 # Specific agents, repeating --agent for each policy.
 ./build/bomber_viz --agent random --agent scripted --agent heuristic --agent greedy
 
 # Single agent.
-./build/bomber_viz --agent heuristic --seed 1337
+./build/bomber_viz --agent heuristic --enemy random --agents 2 --seed 1337
 
 # Replay mode.
 ./build/bomber_viz --replay replay.bin
 ```
 
+Windows users can run the preset launchers in `shortcuts/`, or execute
+`shortcuts/install-desktop-shortcuts.ps1` once to create MCTS, alpha-beta,
+policy-comparison, live-policy-arena, match-history, and causal-win replay
+shortcuts on the Desktop.
+
+Visualizer matchup configuration mirrors the headless runner: `--agent` selects
+agent 0, `--enemy` selects its shared opponent, `--agents` sets the total arena
+agent count, and `--seed` controls deterministic setup. For View 2, repeat
+`--matchup blue:red` to create up to eight independent simultaneous games and
+use `--view compare` to open the board directly. Reversing a pair creates a
+role-balanced comparison. Omitting `--enemy` is shown explicitly as
+`Opponent Policy: built-in-random`.
+
 ### Visualizer views
 
-- **Arena View (1)**: board view with danger overlay, local observation, status panel, reward graph, action distribution, bomb timeline, decision trace, event log, and controls
-- **Graphs View (2)**: per-epoch reward, running average reward, action distribution, and training overview table for all agents
-- **Comparison View (3)**: side-by-side mini arenas for all configured agents with a shared training overview panel
+- **Arena View (1)**: redesigned dashboard with large centered arena, top status bar, right inspector panel (decision trace, agent/enemy stats, active bombs), bottom event timeline, and optional legend
+- **Compare View (2)**: adaptive 1-8 game board for independent policy pairs, with live seed/step/outcome/reward and a shared matchup overview; click a game and press **1** to inspect it full-size
+- **Graphs View (3)**: per-epoch reward, running average reward, action distribution, and training overview table for all agents
+- **Debug View (4)**: detailed technical view with raw local observation, danger map, and event log
+- **Match History (5)**: persistent recorded matches with seed, policies, outcome, causal eliminations, state hash, and frame-by-frame replay
 
 ### Visualizer controls
 
 - **SPACE**: pause or resume
 - **R**: reset all sessions
-- **+/-**: adjust speed multiplier
+- **F2/F3**, **+/-**, or the visible **Game - / Game +** buttons: choose 1/2/3/5/10/30 simulation steps per second
+- **F5/F6** or **Render - / Render +**: change only the window refresh rate
+- **F7** or **Set Game**: type an exact simulation rate from 1 to 60 steps per second
+- **M**: choose two policies, seed, open/standard/dense map, and 1-20 matches, then launch recorded live play
+- **5**: open match history; use PageUp/PageDown for matches and Left/Right for frames
+- **H**: open the in-app controls and powerup guide
 - **S**: step once while paused
 - **TAB**: switch active agent
-- **1/2/3**: switch view
+- **1/2/3/4/5**: switch view (Arena/Compare/Graphs/Debug/History)
 - **N**: start a new epoch for the active agent
+- **L**: toggle legend
+- **O**: toggle observation window overlay
+- **D**: toggle danger overlay
+- **G**: toggle grid lines
+- **P**: save screenshot to `screenshots/ai-bomber-arena.png`
 - **ESC**: quit
+
+### Powerups
+
+- **Bomb capacity (red)** adds one reusable bomb slot; its ammo returns after that bomb explodes.
+- **Blast range (orange)** extends future bomb flames by one tile in each open direction.
+- **Speed level (blue)** is recorded in state and observations, but does not currently alter grid movement speed.
+
+With the default configuration, a destroyed crate has a 30% chance to reveal one of the three powerups.
+
+The default visualizer creates six simultaneous role-balanced matchups for 20
+epochs; press **2** to see the board. Use the Live Policy Arena shortcut for a
+single configurable match, Match History for recorded games, or Policy
+Comparison to open the six-game board immediately. Battle matches terminate
+after 200 steps instead of running indefinitely.
+
+### Screenshots
+
+To capture a screenshot of the current visualizer state:
+1. Navigate to the desired view (typically Arena View for best results)
+2. Press **P** to save a screenshot
+3. Screenshots are saved to the `screenshots/` directory
+
+Note: The `screenshots/` directory is created automatically on first screenshot capture. Generated screenshots should not be committed to version control unless specifically intended for documentation.
 
 ## Project structure
 
@@ -131,6 +246,8 @@ assets/       optional configs, sprites, and fonts
 | `scripted` | Avoids immediate danger, bombs adjacent crates, and seeks visible powerups. |
 | `heuristic` | Uses danger information and escape checks before bombing. |
 | `greedy` / `greedy_crate` | Prioritizes crate destruction while still avoiding known danger. |
+| `alpha-beta` | Depth-limited deterministic lookahead using the tactical evaluator. |
+| `mcts` | Fixed-budget Monte Carlo rollouts with action visits and values. |
 
 ## Documentation
 
@@ -142,6 +259,11 @@ assets/       optional configs, sprites, and fonts
 - [Visualizer](docs/VISUALIZER.md)
 - [Adding Agents](docs/ADDING_AGENTS.md)
 - [Future Model Integration](docs/FUTURE_MODELS.md)
+- [Full-simulator AlphaZero Training](docs/ALPHAZERO_TRAINING.md)
+- [Native C++/LibTorch AlphaZero](docs/NATIVE_ALPHAZERO.md)
+- [Statistically gated superhuman AlphaZero ladder](docs/SUPERHUMAN_ALPHAZERO.md)
+- [Reusable Self-Play and Grokking Playbook](docs/SELF_PLAY_GROKKING_PLAYBOOK.md)
+- [AlphaZero Verified Results](docs/ALPHAZERO_RESULTS.md)
 
 ## Roadmap
 

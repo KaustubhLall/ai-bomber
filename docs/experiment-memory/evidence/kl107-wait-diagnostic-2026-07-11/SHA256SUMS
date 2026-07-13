@@ -1,0 +1,35 @@
+# SHA-256 manifest for the 2026-07-11 KL-107 systematic WAIT-diagnostic pass.
+# Generated with `sha256sum`. Verify with: sha256sum -c SHA256SUMS (run from this directory
+# for the *-agg.json lines; the trace/binary lines are absolute paths since those files are
+# NOT committed here - see README.md for why and where they actually live).
+#
+# === Committed in this directory (verify with `sha256sum -c` from here) ===
+1355e2bfb61c8586e827aad65f273c3dc88956729cf1c71436477e0be32f3809  control03-iter130-agg.json
+504cfc1ff2c390d9e56ffb35c6f47b7af095a699548b7c49e4e865a9494291b9  crush01-iter130-agg.json
+9b23be8442f47141cabe1542b6270c5c132a44da5f46e1087aee40e485e02704  lever2-iter160-agg.json
+#
+# === Raw trace JSONLs (NOT committed - stay local under results/, git-ignored;
+#     hashes recorded here so a copy can be verified against this record if preserved
+#     or regenerated) ===
+5a0aeeaec8df46a4c73f2e82b1a75ad330f1ac2d84deb71cf7d7884479ddc4c4  crush01-iter130-trace.jsonl (4104 rows + header; originally at results/kl107-wait-diagnostic-2026-07-11/)
+35411497ae464e494940ae780a42e801fd2df71e75d5e19402ef6f1fac3f1dfb  control03-iter130-trace.jsonl (4004 rows + header)
+913bc958f105f9e7b36a4b96a7f6d9a5700e85fad8c261cdf880252445942408  lever2-iter160-trace.jsonl (5349 rows + header)
+#
+# === Checkpoints evaluated (each agg's own checkpoint_sha256, restated here for a
+#     single lookup point) ===
+416993ce3a9f272226afb7f8f650cd6cd02fe7b9390eb60f009741773f1ba1a1  v6-league-crush01/iteration_000130.pt
+ab5771d34f3be18e0911b1da51690fa62dc75f5ec6d0a06dba082cdc069cb288  control03-from102/iteration_000130.pt
+29930a4ce30b0cfef69827c98a04b7590cbd700e3f8a0ef7338d4bd6239fe5c3  lever2-sdstart160/iteration_000160.pt
+#
+# === Executables ===
+# The binary that actually PRODUCED this evidence (all three agg/trace files above) - stamped
+# git_commit: d6eeb4ea30d3-dirty in its own evidence output due to the CMake configure-time
+# staleness bug documented in Phase 0b (trainer.h, near AI_BOMBER_GIT_SHA) and KL-107's Linear
+# text. Source matches commit 54a2a42 exactly (confirmed: Phase 0a's independent stat
+# reproduction landed on identical numbers to a separately-computed reference table).
+32394bed7c832fe36f2eaf8ddfa60f67aab43d8f995cd8c1f203c95d0eb3f3f6  bomber_alphazero_native.exe (as run 2026-07-11, stale git_commit stamp)
+#
+# The corrected, freshly-reconfigured binary at clean HEAD 2396258 (Phase 0b) - NOT used to
+# produce the evidence above; recorded so future evidence can be compared against a known-good
+# provenance stamp. git_commit correctly reads 2396258e40ee with this binary.
+37b067c1ac7424adc1be66ce47703c36106ffa667e08c3aa0f75e0718de9e877  bomber_alphazero_native.exe (clean HEAD 2396258, Phase 0b verification build)

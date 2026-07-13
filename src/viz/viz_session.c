@@ -2,6 +2,7 @@
 #include "env/bomber_map.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 void viz_session_init(VizSession* vs, int max_epochs, uint64_t base_seed) {
     memset(vs, 0, sizeof(VizSession));
@@ -9,34 +10,65 @@ void viz_session_init(VizSession* vs, int max_epochs, uint64_t base_seed) {
     vs->base_seed = base_seed;
     vs->active_session = 0;
     vs->paused = 0;
-    vs->speed_mult = 1;
+    vs->simulation_hz = 1;
+    vs->target_fps = 60;
+    vs->show_help = 1;
     vs->step_once = 0;
     vs->auto_advance_epoch = 1;
     vs->view_mode = VIEW_ARENA;
     vs->show_danger = 1;
     vs->show_obs = 1;
     vs->show_local_obs = 1;
+    vs->show_legend = 1;
+    vs->show_observation_window = 0;
+    vs->show_grid = 0;
+    vs->matchup_blue = AGENT_MCTS;
+    vs->matchup_red = AGENT_HEURISTIC;
+    vs->matchup_seed = base_seed;
+    vs->matchup_map_preset = 1;
+    vs->matchup_matches = 1;
+    /* Match the training regime by default (config_battle's own default is disabled) so a
+       live demo game plays out the same dynamics the champion was actually trained under —
+       matches main_headless.c's own MCTS self-play example. Overridable via CLI flags. */
+    vs->sudden_death_start = 120;
+    vs->shrink_interval = 4;
+    (void)match_history_init(&vs->history, "history");
 }
 
 int viz_session_add_agent(VizSession* vs, AgentType type, const char* name,
-                          const BomberConfig* config) {
+                          AgentType opponent_type, const char* opponent_name,
+                          int has_opponent_policy, const BomberConfig* config) {
     if (vs->session_count >= MAX_VIZ_AGENTS) return -1;
     int idx = vs->session_count;
     AgentSession* s = &vs->sessions[idx];
 
     memset(s, 0, sizeof(AgentSession));
     s->type = type;
+    s->opponent_type = opponent_type;
+    s->has_opponent_policy = has_opponent_policy;
     s->config = *config;
     strncpy(s->name, name, sizeof(s->name) - 1);
+    strncpy(s->opponent_name, has_opponent_policy ? opponent_name : "built-in-random",
+            sizeof(s->opponent_name) - 1);
 
     agent_init(&s->agent, type);
     env_init(&s->env, &s->config);
+    if (has_opponent_policy) {
+        agent_init(&s->opponent, opponent_type);
+        env_set_opponent(&s->env, &s->opponent);
+    }
     env_reset(&s->env, vs->base_seed);
     agent_reset(&s->agent, vs->base_seed);
+    if (has_opponent_policy) agent_reset(&s->opponent, vs->base_seed ^ UINT64_C(0x9E3779B97F4A7C15));
 
     dashboard_init(&s->dashboard);
     s->epoch_count = 0;
     s->episode_done = 0;
+    s->replay = (Replay*)calloc(1, sizeof(Replay));
+    if (s->replay) {
+        replay_init(s->replay, &s->config, vs->base_seed);
+        replay_set_policies(s->replay, s->name, s->opponent_name);
+    }
 
     vs->session_count++;
     return idx;
@@ -49,10 +81,18 @@ void viz_session_reset_epoch(VizSession* vs, int session_idx) {
     uint64_t ep_seed = vs->base_seed + (uint64_t)s->epoch_count;
     env_reset(&s->env, ep_seed);
     agent_reset(&s->agent, ep_seed);
+    if (s->has_opponent_policy) agent_reset(&s->opponent, ep_seed ^ UINT64_C(0x9E3779B97F4A7C15));
     dashboard_init(&s->dashboard);
     s->current_reward = 0.0f;
     s->current_step = 0;
     s->episode_done = 0;
+    s->epoch_recorded = 0;
+    s->history_recorded = 0;
+    s->outcome = TERMINAL_NONE;
+    if (s->replay) {
+        replay_init(s->replay, &s->config, ep_seed);
+        replay_set_policies(s->replay, s->name, s->opponent_name);
+    }
 }
 
 void viz_session_reset_all(VizSession* vs) {
@@ -75,6 +115,7 @@ void viz_session_switch_agent(VizSession* vs, int idx) {
 
 void viz_session_switch_view(VizSession* vs, ViewMode mode) {
     vs->view_mode = mode;
+    vs->show_matchup = 0;
 }
 
 AgentSession* viz_session_active(VizSession* vs) {
@@ -115,8 +156,8 @@ void viz_session_step(VizSession* vs) {
         AgentSession* s = &vs->sessions[i];
         if (s->episode_done) {
             if (vs->auto_advance_epoch && s->epoch_count < vs->max_epochs) {
-                record_epoch(vs, i);
-                viz_session_reset_epoch(vs, i);
+                if (!s->epoch_recorded) { record_epoch(vs, i); s->epoch_recorded = 1; }
+                if (s->epoch_count < vs->max_epochs) viz_session_reset_epoch(vs, i);
             }
             continue;
         }
@@ -124,23 +165,151 @@ void viz_session_step(VizSession* vs) {
         Observation obs;
         DebugSnapshot snap;
 
-        for (int sp = 0; sp < vs->speed_mult; sp++) {
+        for (int sp = 0; sp < 1; sp++) {
             if (s->episode_done) break;
 
+            DebugSnapshot before;
+            env_get_debug_snapshot(&s->env, &before);
             env_observe(&s->env, 0, &obs);
             env_get_debug_snapshot(&s->env, &snap);
             Action action = agent_act(&s->agent, &obs, &snap);
             StepResult result = env_step(&s->env, action);
+            DebugSnapshot after;
+            env_get_debug_snapshot(&s->env, &after);
 
             dashboard_add_action(&s->dashboard, action);
             dashboard_add_reward(&s->dashboard, result.reward);
             s->current_reward += result.reward;
             s->current_step++;
+            if (s->replay) replay_record_env(s->replay, &s->env, result);
+
+            char event[MAX_EVENT_LEN];
+            const char* action_names[] = {"UP", "DOWN", "LEFT", "RIGHT", "BOMB", "WAIT"};
+            if (before.state.agents[0].x != after.state.agents[0].x ||
+                before.state.agents[0].y != after.state.agents[0].y) {
+                snprintf(event, sizeof(event), "Step %d: Agent moved %s", after.state.step, action_names[action]);
+                dashboard_add_event(&s->dashboard, event);
+            } else if (action == ACTION_PLACE_BOMB) {
+                snprintf(event, sizeof(event), "Step %d: Agent placed bomb", after.state.step);
+                dashboard_add_event(&s->dashboard, event);
+            }
+            for (int a = 1; a < after.state.agent_count; a++) {
+                if (before.state.agents[a].alive && !after.state.agents[a].alive) {
+                    snprintf(event, sizeof(event), "Step %d: Enemy %d defeated", after.state.step, a);
+                    dashboard_add_event(&s->dashboard, event);
+                } else if (before.state.agents[a].x != after.state.agents[a].x ||
+                           before.state.agents[a].y != after.state.agents[a].y) {
+                    snprintf(event, sizeof(event), "Step %d: Enemy %d moved", after.state.step, a);
+                    dashboard_add_event(&s->dashboard, event);
+                }
+            }
+            int bombs_before = 0, bombs_after = 0;
+            for (int b = 0; b < MAX_BOMBS; b++) {
+                bombs_before += before.state.bombs[b].active;
+                bombs_after += after.state.bombs[b].active;
+            }
+            if (bombs_after < bombs_before) {
+                snprintf(event, sizeof(event), "Step %d: Bomb exploded", after.state.step);
+                dashboard_add_event(&s->dashboard, event);
+            }
+            int crates_before = map_count_crates(&before.state);
+            int crates_after = map_count_crates(&after.state);
+            if (crates_after < crates_before) {
+                snprintf(event, sizeof(event), "Step %d: Crate destroyed", after.state.step);
+                dashboard_add_event(&s->dashboard, event);
+            }
+            int danger_before = before.danger.time_to_blast[before.state.agents[0].y][before.state.agents[0].x] >= 0;
+            int danger_after = after.danger.time_to_blast[after.state.agents[0].y][after.state.agents[0].x] >= 0;
+            if (danger_before != danger_after) {
+                snprintf(event, sizeof(event), "Step %d: Agent %s danger", after.state.step,
+                         danger_after ? "entered" : "escaped");
+                dashboard_add_event(&s->dashboard, event);
+            }
+            if (result.done) {
+                snprintf(event, sizeof(event), "Step %d: Episode ended (%d)", after.state.step,
+                         (int)result.terminal_reason);
+                dashboard_add_event(&s->dashboard, event);
+            }
 
             if (result.done) {
                 s->episode_done = 1;
+                s->outcome = result.terminal_reason;
+                if (!s->epoch_recorded && s->epoch_count < vs->max_epochs) {
+                    record_epoch(vs, i);
+                    s->epoch_recorded = 1;
+                }
+                if (!s->history_recorded && s->replay) {
+                    int owned = 0, self_kills = 0, opponent_self = 0, opponent_kills = 0;
+                    if (!s->env.state.agents[0].alive) {
+                        if (s->env.state.death_owner[0] == 0) self_kills++;
+                        else if (s->env.state.death_owner[0] > 0) opponent_kills++;
+                    }
+                    for (int a = 1; a < s->env.state.agent_count; a++) if (!s->env.state.agents[a].alive) {
+                        if (s->env.state.death_owner[a] == 0) owned++;
+                        else if (s->env.state.death_owner[a] == a) opponent_self++;
+                    }
+                    s->history_recorded = match_history_add(&vs->history, s->replay, result.terminal_reason,
+                                                            owned, self_kills, opponent_self, opponent_kills);
+                }
                 break;
             }
         }
     }
+    int all_complete = vs->session_count > 0;
+    for (int i = 0; i < vs->session_count; i++)
+        if (!vs->sessions[i].episode_done || vs->sessions[i].epoch_count < vs->max_epochs) all_complete = 0;
+    if (all_complete) vs->paused = 1;
+}
+
+int viz_session_start_match(VizSession* vs, AgentType blue, AgentType red, uint64_t seed) {
+    if (!vs) return 0;
+    for (int i = 0; i < vs->session_count; i++) { free(vs->sessions[i].replay); vs->sessions[i].replay = NULL; }
+    memset(vs->sessions, 0, sizeof(vs->sessions));
+    vs->session_count = 0;
+    vs->active_session = 0;
+    vs->base_seed = seed;
+    vs->max_epochs = vs->matchup_matches;
+    vs->paused = 0;
+    vs->matchup_blue = blue;
+    vs->matchup_red = red;
+    vs->matchup_seed = seed;
+    BomberConfig config; config_battle(&config); config.agent_count = 2; config.seed = (int)seed;
+    static const int densities[] = {30, 50, 70};
+    int preset = vs->matchup_map_preset;
+    if (preset < 0) preset = 0;
+    if (preset > 2) preset = 2;
+    config.crate_density = densities[preset];
+    config.sudden_death_start = vs->sudden_death_start;
+    config.shrink_interval = vs->shrink_interval;
+    config_normalize(&config);
+    return viz_session_add_agent(vs, blue, agent_type_name(blue), red, agent_type_name(red), 1, &config) >= 0;
+}
+
+int viz_session_load_history(VizSession* vs, int index) {
+    if (!vs || index < 0 || index >= vs->history.count) return 0;
+    if (!vs->history_replay) vs->history_replay = (Replay*)calloc(1, sizeof(Replay));
+    if (!vs->history_replay || !match_history_load_replay(&vs->history, index, vs->history_replay)) return 0;
+    vs->history.selected = index;
+    vs->history_frame = 0;
+    vs->history_playing = 0;
+    vs->view_mode = VIEW_HISTORY;
+    vs->paused = 1;
+    return 1;
+}
+
+void viz_session_history_step(VizSession* vs, int delta) {
+    if (!vs || !vs->history_replay || vs->history_replay->frame_count <= 0) return;
+    vs->history_frame += delta;
+    if (vs->history_frame < 0) vs->history_frame = 0;
+    if (vs->history_frame >= vs->history_replay->frame_count) {
+        vs->history_frame = vs->history_replay->frame_count - 1;
+        vs->history_playing = 0;
+    }
+}
+
+void viz_session_shutdown(VizSession* vs) {
+    if (!vs) return;
+    for (int i = 0; i < vs->session_count; i++) free(vs->sessions[i].replay);
+    free(vs->history_replay);
+    vs->history_replay = NULL;
 }

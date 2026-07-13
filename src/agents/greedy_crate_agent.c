@@ -1,4 +1,5 @@
 #include "agents/greedy_crate_agent.h"
+#include "agents/search_agent.h"
 #include "env/bomber_map.h"
 #include "core/math_util.h"
 #include <string.h>
@@ -39,8 +40,13 @@ static int has_adjacent_crate(const Observation* obs) {
 }
 
 Action greedy_crate_agent_act(Agent* agent, const Observation* obs, const DebugSnapshot* debug) {
-    (void)debug;
     GreedyCrateAgent* ga = (GreedyCrateAgent*)agent->impl;
+
+    if (debug->state.agents[obs->agent_id].bombs_active > 0) {
+        int found = 0;
+        Action escape = search_robust_escape_action(debug, obs->agent_id, &found);
+        if (found) return escape;
+    }
 
     /* Always escape danger first */
     if (obs->in_danger || obs->imminent_danger) {
@@ -52,7 +58,8 @@ Action greedy_crate_agent_act(Agent* agent, const Observation* obs, const DebugS
 
     /* If adjacent to crate, bomb it (if safe) */
     if (has_adjacent_crate(obs) && obs->valid_actions[ACTION_PLACE_BOMB] &&
-        obs->safe_actions[ACTION_PLACE_BOMB]) {
+        obs->safe_actions[ACTION_PLACE_BOMB] &&
+        search_bomb_is_robustly_safe(debug, obs->agent_id)) {
         return ACTION_PLACE_BOMB;
     }
 

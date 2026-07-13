@@ -4,6 +4,17 @@ build_viz/
 build_ninja/
 build_viz.bat
 build_test.bat
+build_debug/
+build_w4/
+build_polish/
+build-codex*/
+build-native*/
+results/
+results-smoke.json
+history/
+screenshots/
+ai-bomber-arena.png
+pr1.diff
 *.exe
 *.lib
 *.pdb
@@ -20,6 +31,9 @@ src/lib/
 # Test artifacts
 *.bin
 test_replay.bin
+__pycache__/
+*.py[cod]
+.venv-gpu/
 
 # OS files
 Thumbs.db

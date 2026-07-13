@@ -7,8 +7,9 @@ void runner_run_single(BomberEnv* env, Agent* agent, uint64_t seed,
                        Metrics* metrics, Replay* replay, int record) {
     BomberConfig cfg = env->config;
     env_init(env, &cfg);
-    env_reset(env, seed);
     agent_reset(agent, seed);
+    if (env->opponent) agent_reset(env->opponent, seed ^ UINT64_C(0x9E3779B97F4A7C15));
+    env_reset(env, seed);
 
     Observation obs;
     DebugSnapshot debug;
@@ -32,9 +33,10 @@ void runner_run_single(BomberEnv* env, Agent* agent, uint64_t seed,
         if (env->last_reward.powerup > 0) powerups = 1;
 
         metrics_update(metrics, action, result, crates_destroyed, powerups);
+        if (result.done) metrics_record_elimination_causes(metrics, &env->state);
 
         if (record && replay) {
-            replay_record(replay, action, &env->state, result.reward, result.terminal_reason);
+            replay_record_env(replay, env, result);
         }
 
         if (result.done) break;
@@ -42,7 +44,7 @@ void runner_run_single(BomberEnv* env, Agent* agent, uint64_t seed,
 }
 
 void runner_run(const RunConfig* rc, Metrics* metrics) {
-    BomberEnv env;
+    BomberEnv env = {0};
     env.config = rc->config;
     Agent agent;
     agent_init(&agent, rc->agent_type);
@@ -64,6 +66,8 @@ void runner_run(const RunConfig* rc, Metrics* metrics) {
 
         if (replay_ptr && ep == 0) {
             replay_init(replay_ptr, &rc->config, ep_seed);
+            replay_set_policies(replay_ptr, agent_type_name(rc->agent_type),
+                                (int)rc->enemy_type >= 0 ? agent_type_name(rc->enemy_type) : "built-in-random");
         }
 
         env_set_opponent(&env, enemy_ptr);

@@ -16,6 +16,7 @@ void compute_blast_tiles(const BomberState* state, int bx, int by, int range, Bl
 
     for (int d = 0; d < 4; d++) {
         for (int r = 1; r <= range; r++) {
+            if (result->count >= MAX_BLAST_TILES) return; /* guard the fixed buffer */
             int nx = bx + dx[d] * r;
             int ny = by + dy[d] * r;
             if (!map_in_bounds(state, nx, ny)) break;
@@ -46,22 +47,77 @@ int explode_bomb(BomberState* state, int bomb_index, RNG* rng, float powerup_rat
 
     bomb->active = 0;
 
+    if (owner >= 0 && owner < state->agent_count) {
+        for (int i = 0; i < blast.count; i++)
+            if (state->tiles[blast.tiles[i].y][blast.tiles[i].x] == TILE_CRATE)
+                state->agents[owner].crates_destroyed++;
+    }
+
+    /* Destroy loose powerups already lying in the blast (before crate reveal, so a
+       powerup revealed by THIS blast survives it) — flames consume items canonically. */
+    for (int i = 0; i < blast.count; i++) {
+        TileType t = state->tiles[blast.tiles[i].y][blast.tiles[i].x];
+        if (t == TILE_POWERUP_BOMB || t == TILE_POWERUP_RANGE || t == TILE_POWERUP_SPEED)
+            state->tiles[blast.tiles[i].y][blast.tiles[i].x] = TILE_FLOOR;
+    }
+
     destroy_crates(state, &blast, rng, powerup_rate);
 
-    apply_blast_damage(state, &blast);
+    /* Lay persistent flame; damage is applied by the per-tick flame pass so the fire
+       has canonical area denial rather than a single-tick instantaneous hit. */
+    ignite_flame(state, &blast, owner);
 
     trigger_chain_reactions(state, &blast, rng, powerup_rate);
 
     return 1;
 }
 
-void apply_blast_damage(BomberState* state, const BlastResult* blast) {
+void ignite_flame(BomberState* state, const BlastResult* blast, int owner_id) {
+    int ttl = state->flame_duration > 0 ? state->flame_duration : 1;
+    for (int i = 0; i < blast->count; i++) {
+        int bx = blast->tiles[i].x;
+        int by = blast->tiles[i].y;
+        if (ttl > state->flame_ttl[by][bx]) state->flame_ttl[by][bx] = ttl; /* keep the max on overlap */
+        state->flame_owner[by][bx] = owner_id;
+    }
+}
+
+void apply_flame_damage(BomberState* state) {
+    for (int a = 0; a < state->agent_count; a++) {
+        if (!state->agents[a].alive) continue;
+        int ax = state->agents[a].x;
+        int ay = state->agents[a].y;
+        if (state->flame_ttl[ay][ax] > 0) {
+            int owner = state->flame_owner[ay][ax];
+            state->agents[a].alive = 0;
+            state->death_owner[a] = owner;
+            if (owner >= 0 && owner < state->agent_count && owner != a)
+                state->agents[owner].eliminations++;
+        }
+    }
+}
+
+void decay_flame(BomberState* state) {
+    for (int y = 0; y < state->height; y++) {
+        for (int x = 0; x < state->width; x++) {
+            if (state->flame_ttl[y][x] > 0) {
+                state->flame_ttl[y][x]--;
+                if (state->flame_ttl[y][x] == 0) state->flame_owner[y][x] = -1;
+            }
+        }
+    }
+}
+
+void apply_blast_damage(BomberState* state, const BlastResult* blast, int owner_id) {
     for (int i = 0; i < blast->count; i++) {
         int bx = blast->tiles[i].x;
         int by = blast->tiles[i].y;
         for (int a = 0; a < state->agent_count; a++) {
             if (state->agents[a].alive && state->agents[a].x == bx && state->agents[a].y == by) {
                 state->agents[a].alive = 0;
+                state->death_owner[a] = owner_id;
+                if (owner_id >= 0 && owner_id < state->agent_count && owner_id != a)
+                    state->agents[owner_id].eliminations++;
             }
         }
     }

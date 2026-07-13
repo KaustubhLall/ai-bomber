@@ -1,0 +1,6143 @@
+#include "training/native/trainer.h"
+#include "training/native/policy_target_pruning.h"
+#include "training/native/replay_sampling.h"
+
+extern "C" {
+#include "training/encoding.h"
+#include "agents/agent.h"
+#include "agents/search_agent.h"
+#include "core/config.h"
+#include "core/replay.h"
+#include "env/env.h"
+#include "env/bomber_map.h"
+#include "sim/evaluator.h"
+}
+
+#include <ATen/autocast_mode.h>
+#include <torch/serialize.h>
+#include <torch/version.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <csignal>
+#include <cstring>
+#include <ctime>
+#include <deque>
+#include <exception>
+#include <fstream>
+#include <functional>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <map>
+#include <numeric>
+#include <numbers>
+#include <optional>
+#include <random>
+#include <sstream>
+#include <stdexcept>
+#include <string_view>
+#include <tuple>
+#include <vector>
+
+#ifdef AI_BOMBER_NATIVE_OPENMP
+#include <omp.h>
+#endif
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
+
+namespace bomber::az {
+namespace {
+
+constexpr int kActions = BOMBER_TRAINING_ACTIONS;
+constexpr int kJointActions = kActions * kActions;
+constexpr int kObservationSize = BOMBER_TRAINING_OBSERVATION_SIZE;
+constexpr int kFormatVersion = 1;
+/* KL-105 Phase 3: bounds ReplayBuffer::batch()'s effective oversampling factor for pool-A
+   (bomb_win_side==1) samples. f = min(cap, kBoostMax * n_A / N) - even when pool A is a tiny
+   sliver of the buffer, no single pool-A sample is expected to be drawn more than kBoostMax
+   times per batch on average (max expected repeats per pool-A sample per batch =
+   f*batch/n_A <= kBoostMax*batch/N, independent of how small n_A actually is), so a handful of
+   early bomb kills cannot dominate the gradient before the pool has grown. */
+constexpr double kBoostMax = 16.0;
+
+std::atomic<bool> stop_requested{false};
+
+void signal_handler(int) { stop_requested.store(true); }
+
+/* Self-contained streaming SHA-256 (FIPS 180-4) - no existing hash utility anywhere in this
+   codebase, and this is the only place one is needed (KL-101 fork/checkpoint provenance:
+   parent checkpoint hash, own executable hash). Deliberately not shelling out to an external
+   tool (certutil/sha256sum) from inside the trainer - keeps provenance capture portable and
+   dependency-free, matching how the rest of this file avoids extra libraries. Verified against
+   the standard test vectors (SHA-256("") and SHA-256("abc")) and cross-checked against
+   PowerShell's Get-FileHash on a real file before being trusted for provenance records. */
+std::string sha256_file(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) throw std::runtime_error("cannot open for hashing: " + path.string());
+
+    static constexpr uint32_t k[64] = {
+        0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+        0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+        0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+        0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+        0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+        0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+        0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+        0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
+    uint32_t h[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+                      0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+    const auto rotr = [](uint32_t x, int n) { return (x >> n) | (x << (32 - n)); };
+    const auto process_block = [&](const unsigned char* data) {
+        uint32_t w[64];
+        for (int i = 0; i < 16; ++i)
+            w[i] = (static_cast<uint32_t>(data[i * 4]) << 24) |
+                   (static_cast<uint32_t>(data[i * 4 + 1]) << 16) |
+                   (static_cast<uint32_t>(data[i * 4 + 2]) << 8) |
+                   static_cast<uint32_t>(data[i * 4 + 3]);
+        for (int i = 16; i < 64; ++i) {
+            const uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+            const uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+        for (int i = 0; i < 64; ++i) {
+            const uint32_t s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+            const uint32_t ch = (e & f) ^ (~e & g);
+            const uint32_t temp1 = hh + s1 + ch + k[i] + w[i];
+            const uint32_t s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+            const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            const uint32_t temp2 = s0 + maj;
+            hh = g; g = f; f = e; e = d + temp1; d = c; c = b; b = a; a = temp1 + temp2;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d;
+        h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+    };
+
+    std::vector<char> read_buffer(1 << 20);
+    unsigned char block[64];
+    size_t block_used = 0;
+    uint64_t total_length = 0;
+    while (file) {
+        file.read(read_buffer.data(), static_cast<std::streamsize>(read_buffer.size()));
+        const std::streamsize got = file.gcount();
+        if (got <= 0) break;
+        total_length += static_cast<uint64_t>(got);
+        size_t offset = 0;
+        while (offset < static_cast<size_t>(got)) {
+            const size_t take = std::min(static_cast<size_t>(got) - offset, size_t{64} - block_used);
+            std::memcpy(block + block_used, read_buffer.data() + offset, take);
+            block_used += take;
+            offset += take;
+            if (block_used == 64) {
+                process_block(block);
+                block_used = 0;
+            }
+        }
+    }
+    const uint64_t bit_length = total_length * 8;
+    block[block_used++] = 0x80;
+    if (block_used > 56) {
+        while (block_used < 64) block[block_used++] = 0;
+        process_block(block);
+        block_used = 0;
+    }
+    while (block_used < 56) block[block_used++] = 0;
+    for (int i = 7; i >= 0; --i)
+        block[block_used++] = static_cast<unsigned char>((bit_length >> (i * 8)) & 0xff);
+    process_block(block);
+
+    std::ostringstream hex;
+    hex << std::hex << std::setfill('0');
+    for (const uint32_t word : h) hex << std::setw(8) << word;
+    return hex.str();
+}
+
+/* KL-101 Part D: durable stdout capture. Redirects std::cout's underlying streambuf to write
+   to both the real console AND an append-only log file, for the process's lifetime (RAII,
+   scoped to run()). One centralized change here captures every existing std::cout print
+   statement throughout this file (progress bars, promotion-gate lines, semantic forks,
+   behavior reports...) without touching each call site individually - and any future one
+   added later, without needing to remember to also log it. This is what an unattended
+   watchdog-wrapped overnight run needs to be inspectable after the fact: the live console
+   window is not the only place iteration-by-iteration output exists. */
+class TeeStreambuf : public std::streambuf {
+public:
+    TeeStreambuf(std::streambuf* console, std::ostream& file) : console_(console), file_(file) {}
+
+protected:
+    int overflow(int character) override {
+        if (character != EOF) {
+            console_->sputc(static_cast<char>(character));
+            file_.put(static_cast<char>(character));
+        }
+        return character;
+    }
+    std::streamsize xsputn(const char* data, std::streamsize count) override {
+        console_->sputn(data, count);
+        file_.write(data, count);
+        file_.flush();
+        return count;
+    }
+
+private:
+    std::streambuf* console_;
+    std::ostream& file_;
+};
+
+class ConsoleTee {
+public:
+    explicit ConsoleTee(const std::filesystem::path& log_path)
+        : log_(log_path, std::ios::app), buf_(std::cout.rdbuf(), log_),
+          original_(std::cout.rdbuf(&buf_)) {
+        log_ << "\n--- console tee started, pid=" <<
+#ifdef _WIN32
+            GetCurrentProcessId()
+#else
+            ::getpid()
+#endif
+            << " ---\n";
+    }
+    ~ConsoleTee() { std::cout.rdbuf(original_); }
+    ConsoleTee(const ConsoleTee&) = delete;
+    ConsoleTee& operator=(const ConsoleTee&) = delete;
+
+private:
+    std::ofstream log_;
+    TeeStreambuf buf_;
+    std::streambuf* original_;
+};
+
+/* KL-101 Part E: adds elapsed wall-clock time to accumulator on destruction (RAII, so it's
+   recorded even if the timed block throws). Scoped-per-call-site rather than a global
+   profiler - this is deliberately the simplest thing that gives Brick 6/KL-102 the
+   "phase timings + same-machine baseline" its own ordered plan lists as its first step,
+   without building general-purpose profiling infrastructure this project doesn't need yet. */
+class ScopedTimer {
+public:
+    explicit ScopedTimer(double& accumulator)
+        : accumulator_(accumulator), started_(std::chrono::steady_clock::now()) {}
+    ~ScopedTimer() {
+        accumulator_ += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started_).count();
+    }
+    ScopedTimer(const ScopedTimer&) = delete;
+    ScopedTimer& operator=(const ScopedTimer&) = delete;
+
+private:
+    double& accumulator_;
+    std::chrono::steady_clock::time_point started_;
+};
+
+/* KL-101 Part E: one iteration's worth of phase timings, all 7 phases KL-101/KL-102 ask for.
+   Reset at the top of each run() loop iteration; checkpoint serialization/durable flush
+   accumulate (+=) rather than overwrite since save_checkpoint() can be called more than once
+   per iteration (latest.pt always, best.pt on promotion). */
+struct PhaseTimings {
+    double mirror_collection_seconds{};
+    double league_collection_seconds{};
+    double optimization_seconds{};
+    double evaluation_random_seconds{};
+    double evaluation_heuristic_seconds{};
+    double evaluation_incumbent_seconds{};
+    double evaluation_mcts_seconds{};
+    /* v7 Stage 0 item 0.5 (docs/experiment-memory/14-v7-from-scratch-design.md): cost of the
+       in-training drift canary (six tactical gates, search mode, run_gate_canary() in this
+       file) - 0 on any iteration the canary did not run (same convention as the other
+       evaluation_*_seconds fields, which are also only nonzero on an evaluation_interval
+       iteration). */
+    double drift_canary_seconds{};
+    double replay_serialization_seconds{};
+    double checkpoint_serialization_seconds{};
+    double durable_flush_seconds{};
+};
+
+std::string format_duration(double seconds) {
+    if (!std::isfinite(seconds) || seconds < 0.0) return "--:--:--";
+    auto total = static_cast<long long>(seconds + 0.5);
+    const auto hours = total / 3600;
+    const auto minutes = (total % 3600) / 60;
+    const auto remaining = total % 60;
+    std::ostringstream output;
+    output << std::setfill('0') << std::setw(2) << hours << ':'
+           << std::setw(2) << minutes << ':' << std::setw(2) << remaining;
+    return output.str();
+}
+
+class PhaseProgress {
+public:
+    PhaseProgress(std::string name, int total, bool enabled)
+        : name_(std::move(name)), total_(std::max(total, 1)), enabled_(enabled),
+          started_(std::chrono::steady_clock::now()) {}
+
+    void update(int completed, std::string_view suffix = {}) {
+        if (!enabled_) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (completed < total_ && now - last_print_ < std::chrono::milliseconds(250)) return;
+        last_print_ = now;
+        const double elapsed = std::chrono::duration<double>(now - started_).count();
+        const double rate = completed > 0 ? completed / std::max(elapsed, 1e-9) : 0.0;
+        const double eta = rate > 0.0 ? (total_ - completed) / rate :
+                                       std::numeric_limits<double>::infinity();
+        const int width = 28;
+        const int filled = std::clamp(completed * width / total_, 0, width);
+        std::cout << '\r' << name_ << " [" << std::string(filled, '=')
+                  << std::string(width - filled, ' ') << "] "
+                  << std::setw(6) << completed << '/' << total_
+                  << " ETA " << format_duration(eta);
+        if (!suffix.empty()) std::cout << ' ' << suffix;
+        if (completed >= total_) std::cout << '\n';
+        std::cout << std::flush;
+    }
+
+private:
+    std::string name_;
+    int total_;
+    bool enabled_;
+    std::chrono::steady_clock::time_point started_;
+    std::chrono::steady_clock::time_point last_print_{};
+};
+
+class AutocastGuard {
+public:
+    AutocastGuard() {
+        previous_ = at::autocast::is_autocast_enabled(at::kCUDA);
+        at::autocast::set_autocast_dtype(at::kCUDA, at::kBFloat16);
+        at::autocast::set_autocast_enabled(at::kCUDA, true);
+    }
+    ~AutocastGuard() { at::autocast::set_autocast_enabled(at::kCUDA, previous_); }
+private:
+    bool previous_{};
+};
+
+/* KL-105 Phase 3: game-level outcome cause, the same taxonomy at every tagging site (mirror
+   collect_self_play, league collect_league_play, and - as of v7 Stage 1 - collect_teacher too:
+   teacher games ARE tagged now, since they contain exactly the demonstrated kills the IL
+   bootstrap exists to clone) - "how the game ended", not "who won".
+   0=unknown/legacy (never classified - a pre-KL-105 checkpoint's inherited samples, or a
+   default-constructed Sample that no collection path ever finalized), 1=bomb (loser died to the
+   OTHER side's bomb - a real tactical kill), 2=selfkill (loser died to its own bomb),
+   3=arena_crush (loser died to the closing
+   sudden-death arena, death_owner==-1), 4=mutual_death (both dead, draw), 5=timeout_draw (ran
+   out the clock, at least one side alive, draw). */
+enum class OutcomeCause : uint8_t {
+    kUnknown = 0,
+    kBomb = 1,
+    kSelfkill = 2,
+    kArenaCrush = 3,
+    kMutualDeath = 4,
+    kTimeoutDraw = 5,
+};
+constexpr size_t kOutcomeCauseCount = 6;
+
+struct Sample {
+    std::array<at::Half, kObservationSize> state{};
+    std::array<float, kActions> policy{};
+    float value{};
+    /* KL-105 Phase 3 sample tags (docs/experiment-memory/13-kl105-experiment-design.md section
+       3). Both default to 0 so a default-constructed or legacy-loaded Sample lands in the
+       "unknown"/not-pool-A bucket without any special-casing at the call sites. */
+    uint8_t outcome_cause{static_cast<uint8_t>(OutcomeCause::kUnknown)};
+    /* 1 iff outcome_cause==bomb AND this sample's seat is the WINNING seat of that bomb-decisive
+       game (ReplayBuffer::batch()'s pool A - see kBoostMax above). Loser-seat samples of a bomb
+       game get the cause tag but bomb_win_side stays 0: they show a death, not a demonstrated
+       kill, from that seat's perspective. */
+    uint8_t bomb_win_side{0};
+};
+
+/* v7 Stage-1 IL (D3): FNV-1a 64-bit, the determinism oracle for the OpenMP-parallelized
+   collect_teacher() (see TrainConfig::teacher_threads in trainer.h). Same "no existing hash
+   utility anywhere in this codebase, self-contained" rationale as sha256_file above, but FNV-1a
+   instead of SHA-256 - this digest is a cheap per-sample checksum meant to run over every teacher
+   sample of every teacher iteration, not a cryptographic provenance hash. hash_teacher_sample
+   folds exactly the four fields that pin a teacher game's trajectory + finalization (policy
+   argmax byte, the value's IEEE-754 bits via memcpy to uint32, outcome_cause, bomb_win_side) -
+   never the encoded state planes (state determinism follows from action determinism given the
+   seeded env, and at::Half buffers are large for no additional signal). */
+constexpr uint64_t kFnvOffsetBasis64 = 0xcbf29ce484222325ULL;
+constexpr uint64_t kFnvPrime64 = 0x100000001b3ULL;
+
+void fnv1a_update(uint64_t& hash, const void* data, size_t length) {
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    for (size_t index = 0; index < length; ++index) {
+        hash ^= bytes[index];
+        hash *= kFnvPrime64;
+    }
+}
+
+void hash_teacher_sample(uint64_t& hash, const Sample& sample) {
+    /* policy is exactly one-hot by construction (collect_teacher sets exactly one action's
+       policy entry to 1.0f on a zero-initialized array), so a linear-scan argmax is unambiguous -
+       no tie-break rule is needed. */
+    uint8_t policy_argmax = 0;
+    float best = sample.policy[0];
+    for (int action = 1; action < kActions; ++action) {
+        if (sample.policy[static_cast<size_t>(action)] > best) {
+            best = sample.policy[static_cast<size_t>(action)];
+            policy_argmax = static_cast<uint8_t>(action);
+        }
+    }
+    fnv1a_update(hash, &policy_argmax, sizeof(policy_argmax));
+    uint32_t value_bits;
+    std::memcpy(&value_bits, &sample.value, sizeof(value_bits));
+    fnv1a_update(hash, &value_bits, sizeof(value_bits));
+    fnv1a_update(hash, &sample.outcome_cause, sizeof(sample.outcome_cause));
+    fnv1a_update(hash, &sample.bomb_win_side, sizeof(sample.bomb_win_side));
+}
+
+std::string hex_digest64(uint64_t value) {
+    std::ostringstream hex;
+    hex << std::hex << std::setfill('0') << std::setw(16) << value;
+    return hex.str();
+}
+
+class ReplayBuffer {
+public:
+    explicit ReplayBuffer(size_t capacity) : capacity_(capacity) {
+        samples_.reserve(capacity);
+    }
+
+    size_t size() const { return samples_.size(); }
+    size_t capacity() const { return capacity_; }
+
+    void add(Sample sample) {
+        if (samples_.size() < capacity_) {
+            samples_.push_back(std::move(sample));
+        } else {
+            samples_[next_] = std::move(sample);
+            next_ = (next_ + 1) % capacity_;
+        }
+    }
+
+    void add(std::vector<Sample>& samples) {
+        for (auto& sample : samples) add(std::move(sample));
+        samples.clear();
+    }
+
+    /* cause_balance_cap<=0 (default), or pool_a empty, takes select_replay_indices()'s uniform
+       fallback (src/training/native/replay_sampling.h) - byte-for-byte the pre-KL-105 code:
+       same std::uniform_int_distribution constructed the same way, same choose(rng) call per
+       row, nothing else touches rng - this is the "cap=0 is exactly current behavior" contract
+       the whole feature is gated on. select_replay_indices() is the actual index-selection
+       algorithm (kept Torch-free so it can be unit-tested without linking LibTorch); this
+       method only builds pool_a, calls it, and fills tensor rows from the indices it returns.
+       Returns BOTH pool-A fractions of this batch: forced (what the sampler was compelled to
+       draw from pool A - the pre-KL-110 "realized" number, 0.0 whenever the uniform path was
+       taken) and total (every SELECTED row, forced or drawn from the uniform remainder, that
+       actually landed in pool A - uniform draws over the whole buffer can land in pool A too,
+       so forced alone understates true pool-A representation in the batch). */
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, double, double> batch(
+            int requested, std::mt19937_64& rng, double cause_balance_cap = 0.0) const {
+        const int count = std::min<int>(requested, static_cast<int>(samples_.size()));
+        std::vector<float> states(static_cast<size_t>(count) * kObservationSize);
+        std::vector<float> policies(static_cast<size_t>(count) * kActions);
+        std::vector<float> values(count);
+        /* One linear pass over uint8 tags per batch (~200k samples) is sub-millisecond; the
+           optimization phase this feeds is ~7.6s/iteration total (KL-105 design doc section 3),
+           so this scan is noise relative to a forward/backward pass - measured, not assumed.
+           in_pool_a is built in the same pass as pool_a (KL-110 hygiene) so counting how many
+           SELECTED rows land in pool A costs nothing beyond this existing scan. */
+        std::vector<size_t> pool_a;
+        std::vector<bool> in_pool_a;
+        if (cause_balance_cap > 0.0) {
+            pool_a.reserve(samples_.size());
+            in_pool_a.assign(samples_.size(), false);
+            for (size_t index = 0; index < samples_.size(); ++index)
+                if (samples_[index].bomb_win_side) {
+                    pool_a.push_back(index);
+                    in_pool_a[index] = true;
+                }
+        }
+        int forced_pool_a_draws = 0;
+        const std::vector<size_t> indices = select_replay_indices(
+            samples_.size(), pool_a, cause_balance_cap, kBoostMax, count, rng,
+            &forced_pool_a_draws);
+        auto fill_row = [&](int row, const Sample& sample) {
+            for (int cell = 0; cell < kObservationSize; ++cell)
+                states[static_cast<size_t>(row) * kObservationSize + cell] =
+                    static_cast<float>(sample.state[cell]);
+            std::copy(sample.policy.begin(), sample.policy.end(),
+                      policies.begin() + static_cast<size_t>(row) * kActions);
+            values[row] = sample.value;
+        };
+        int total_pool_a_selected = 0;
+        for (int row = 0; row < count; ++row) {
+            const size_t index = indices[static_cast<size_t>(row)];
+            fill_row(row, samples_[index]);
+            if (!in_pool_a.empty() && in_pool_a[index]) ++total_pool_a_selected;
+        }
+        const double forced_pool_a_fraction = count > 0 ?
+            static_cast<double>(forced_pool_a_draws) / static_cast<double>(count) : 0.0;
+        const double total_pool_a_fraction = count > 0 ?
+            static_cast<double>(total_pool_a_selected) / static_cast<double>(count) : 0.0;
+        auto state_tensor = torch::from_blob(states.data(),
+            {count, BOMBER_TRAINING_CHANNELS, BOMBER_TRAINING_VIEW_SIZE,
+             BOMBER_TRAINING_VIEW_SIZE}, torch::kFloat32).clone();
+        auto policy_tensor = torch::from_blob(policies.data(), {count, kActions},
+                                               torch::kFloat32).clone();
+        auto value_tensor = torch::from_blob(values.data(), {count}, torch::kFloat32).clone();
+        return {state_tensor, policy_tensor, value_tensor, forced_pool_a_fraction,
+                total_pool_a_fraction};
+    }
+
+    /* Per-cause sample counts (index = OutcomeCause value) plus the pool-A (bomb_win_side==1)
+       size, snapshotted on demand for metrics reporting - O(replay size) linear scan, called
+       once per iteration (append_metrics), not per batch. */
+    struct CausePools {
+        std::array<int64_t, kOutcomeCauseCount> cause_counts{};
+        int64_t bomb_win_side_pool{};
+    };
+    CausePools cause_pool_snapshot() const {
+        CausePools result;
+        for (const auto& sample : samples_) {
+            result.cause_counts[sample.outcome_cause]++;
+            if (sample.bomb_win_side) result.bomb_win_side_pool++;
+        }
+        return result;
+    }
+
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> tensors() const {
+        const auto count = static_cast<int64_t>(samples_.size());
+        auto states = torch::empty({count, BOMBER_TRAINING_CHANNELS,
+                                    BOMBER_TRAINING_VIEW_SIZE,
+                                    BOMBER_TRAINING_VIEW_SIZE}, torch::kFloat16);
+        auto policies = torch::empty({count, kActions}, torch::kFloat32);
+        auto values = torch::empty({count}, torch::kFloat32);
+        /* [count, 2] uint8: column 0 = outcome_cause, column 1 = bomb_win_side. Row-aligned
+           with states/policies/values by construction (same loop, same index). */
+        auto tags = torch::empty({count, 2}, torch::kUInt8);
+        auto* state_data = states.data_ptr<at::Half>();
+        auto* policy_data = policies.data_ptr<float>();
+        auto* value_data = values.data_ptr<float>();
+        auto* tag_data = tags.data_ptr<uint8_t>();
+        for (int64_t row = 0; row < count; ++row) {
+            std::memcpy(state_data + row * kObservationSize, samples_[row].state.data(),
+                        sizeof(at::Half) * kObservationSize);
+            std::memcpy(policy_data + row * kActions, samples_[row].policy.data(),
+                        sizeof(float) * kActions);
+            value_data[row] = samples_[row].value;
+            tag_data[row * 2] = samples_[row].outcome_cause;
+            tag_data[row * 2 + 1] = samples_[row].bomb_win_side;
+        }
+        return {states, policies, values, tags};
+    }
+
+    /* `tags` may be an UNDEFINED tensor (torch::Tensor{}, .defined()==false): the caller passes
+       that when the checkpoint archive has no "replay_tags" key, which is every checkpoint
+       saved before KL-105 Phase 3. Every Sample in samples_ is freshly default-constructed by
+       resize() just above, so outcome_cause/bomb_win_side already read 0 (unknown/legacy) -
+       skipping the tag copy loop in that case is not a missing feature, it is the correct,
+       semantically faithful default: a legacy checkpoint was trained entirely under cap=0 (the
+       concept did not exist yet), so treating all of its samples as "not pool A" reproduces
+       exactly the sampling behavior it actually trained under, not a silent substitution. */
+    void load(const torch::Tensor& states, const torch::Tensor& policies,
+              const torch::Tensor& values, const torch::Tensor& tags, size_t next) {
+        auto state_cpu = states.to(torch::kCPU, torch::kFloat16).contiguous();
+        auto policy_cpu = policies.to(torch::kCPU, torch::kFloat32).contiguous();
+        auto value_cpu = values.to(torch::kCPU, torch::kFloat32).contiguous();
+        const size_t count = std::min<size_t>(state_cpu.size(0), capacity_);
+        samples_.clear();
+        samples_.resize(count);
+        const auto* state_data = state_cpu.data_ptr<at::Half>();
+        const auto* policy_data = policy_cpu.data_ptr<float>();
+        const auto* value_data = value_cpu.data_ptr<float>();
+        const bool has_tags = tags.defined() &&
+            static_cast<size_t>(tags.size(0)) == state_cpu.size(0);
+        torch::Tensor tag_cpu;
+        const uint8_t* tag_data = nullptr;
+        if (has_tags) {
+            tag_cpu = tags.to(torch::kCPU, torch::kUInt8).contiguous();
+            tag_data = tag_cpu.data_ptr<uint8_t>();
+        }
+        for (size_t row = 0; row < count; ++row) {
+            std::memcpy(samples_[row].state.data(), state_data + row * kObservationSize,
+                        sizeof(at::Half) * kObservationSize);
+            std::memcpy(samples_[row].policy.data(), policy_data + row * kActions,
+                        sizeof(float) * kActions);
+            samples_[row].value = value_data[row];
+            if (tag_data == nullptr) continue;
+            /* Defensive clamp, not a trust boundary this project otherwise has (it's the
+               user's own checkpoint file): a foreign/corrupted tag byte outside the known
+               enum range must not become an out-of-bounds index into CausePools::cause_counts
+               later - fold anything unrecognized into kUnknown rather than propagate it. */
+            const uint8_t cause = tag_data[row * 2];
+            samples_[row].outcome_cause = cause < kOutcomeCauseCount ? cause
+                : static_cast<uint8_t>(OutcomeCause::kUnknown);
+            samples_[row].bomb_win_side = tag_data[row * 2 + 1] ? 1 : 0;
+        }
+        next_ = count == capacity_ ? next % capacity_ : 0;
+    }
+
+    size_t next() const { return next_; }
+
+private:
+    size_t capacity_;
+    size_t next_{};
+    std::vector<Sample> samples_;
+};
+
+BomberConfig game_config(const TrainConfig& config) {
+    BomberConfig result;
+    config_battle(&result);
+    result.width = config.width;
+    result.height = config.height;
+    result.max_steps = config.max_steps;
+    result.crate_density = config.crate_density;
+    result.flame_duration = config.flame_duration;
+    result.sudden_death_start = config.sudden_death_start;
+    result.shrink_interval = config.shrink_interval;
+    config_normalize(&result);
+    return result;
+}
+
+int outcome(const BomberEnv& env, int perspective) {
+    const int opponent = 1 - perspective;
+    const bool self_alive = env.state.agents[perspective].alive != 0;
+    const bool other_alive = env.state.agents[opponent].alive != 0;
+    if (self_alive && !other_alive) return 1;
+    if (!self_alive && other_alive) return -1;
+    /* A decisive elimination on the exact horizon is still a win in the
+       authoritative engine. Only both-alive timeouts and mutual deaths draw. */
+    return 0;
+}
+
+float tactical_value(const BomberEnv& env, int perspective) {
+    BomberEnv copy;
+    env_copy(&copy, &env);
+    copy.opponent = nullptr;
+    if (copy.state.step >= copy.config.max_steps) copy.config.max_steps = copy.state.step + 1;
+    return evaluator_score_state(&copy, perspective);
+}
+
+float terminal_training_value(const BomberEnv& env, int perspective,
+                              double timeout_draw_value, double mutual_death_value,
+                              double arena_crush_win_value, double selfkill_win_value) {
+    const int result = outcome(env, perspective);
+    if (result > 0) {
+        /* Full value only for a DEMONSTRATED kill: the loser's death_owner is the WINNER's
+           own bomb. A win where the loser blew itself up (its own mistake) or was crushed by
+           the closing arena (attrition, zero interaction) is decisive but shows no offensive
+           skill — devalue both so a search comparing "wait for their mistake / the arena"
+           against "force a kill" prefers the latter whenever reachable. See trainer.h's doc
+           comment. Losses are NOT reweighted by cause: a loss is a loss. */
+        const int loser = 1 - perspective;
+        const int died_owner = env.state.death_owner[loser];
+        if (died_owner == perspective) return 1.0f;
+        if (died_owner == -1)
+            return static_cast<float>(std::clamp(arena_crush_win_value, 0.0, 1.0));
+        return static_cast<float>(std::clamp(selfkill_win_value, 0.0, 1.0));
+    }
+    if (result < 0) return -1.0f;
+    const bool self_alive = env.state.agents[perspective].alive != 0;
+    const bool other_alive = env.state.agents[1 - perspective].alive != 0;
+    if (self_alive && other_alive) {
+        /* Both-alive timeout is a stall. Value it negatively (per seat, so BOTH sides
+           see running out the clock as worse than any win) — this removes the "safe ~0
+           draw" attractor that collapses self-play into mutual avoidance. A small tactical
+           term keeps a gradient so the dominant side is less penalized and pressing an
+           advantage still pays. */
+        const double advantage = tactical_value(env, perspective) - tactical_value(env, 1 - perspective);
+        /* Scale the tactical nudge down as the draw value hardens toward -1, so a
+           deliberately harsh draw (e.g. --draw-value -0.9, "a draw is almost a loss")
+           is not lifted back toward 0 by the +0.15 advantage term. The factor is 1 for
+           every draw value at or above the -0.5 default (identical to the trained regime)
+           and ramps linearly to 0 at -1, where draw==loss leaves no room to shape. */
+        const double shape_scale = std::clamp((1.0 + timeout_draw_value) / 0.5, 0.0, 1.0);
+        const double shaped = timeout_draw_value + 0.15 * shape_scale * std::tanh(advantage / 125.0);
+        return static_cast<float>(std::clamp(shaped, -1.0, 0.0));
+    }
+    /* Mutual death: engaged but no winner. Mildly negative — worse than a win, but better
+       than a passive stall, so trading blows is not discouraged relative to hiding. */
+    return static_cast<float>(std::clamp(mutual_death_value, -1.0, 0.0));
+}
+
+void encode_state(const BomberEnv& env, int perspective,
+                  std::array<at::Half, kObservationSize>& output) {
+    std::array<float, kObservationSize> temporary{};
+    if (bomber_training_encode_env(&env, perspective, temporary.data(),
+                                   kObservationSize) != kObservationSize)
+        throw std::runtime_error("C observation encoder failed");
+    for (int index = 0; index < kObservationSize; ++index)
+        output[index] = at::Half(temporary[index]);
+}
+
+int baseline_action(AgentType type, const BomberEnv& env, int perspective, uint64_t seed) {
+    Agent agent;
+    agent_init(&agent, type);
+    agent_reset(&agent, seed);
+    Observation observation;
+    DebugSnapshot snapshot;
+    env_observe(&env, perspective, &observation);
+    env_get_debug_snapshot(&env, &snapshot);
+    return static_cast<int>(agent_act(&agent, &observation, &snapshot));
+}
+
+/* Shared by expand_and_backup's policy masking and KL-107 trace capture, so a trace's
+   safe_action_mask always matches what the search itself actually treated as safe for that
+   seat - duplicating this logic at both call sites would risk silent drift between what the
+   trace reports and what the search enforced. Returns a kActions-sized 0/1 mask indexed by
+   action; count_out receives the number of safe actions (falls back to plain legality when
+   the tactical safe-action check reports none, matching the search's own fallback exactly). */
+std::array<int, kActions> safe_action_mask_for(const BomberEnv& env, int seat, int& count_out) {
+    std::array<int, kActions> safe{};
+    count_out = bomber_training_safe_actions_env(&env, seat, safe.data(), kActions);
+    if (count_out <= 0) {
+        Action legal[kActions];
+        env_legal_actions(&env, seat, legal, &count_out);
+        safe.fill(0);
+        for (int legal_index = 0; legal_index < count_out; ++legal_index)
+            safe[static_cast<int>(legal[legal_index])] = 1;
+    }
+    return safe;
+}
+
+struct Node {
+    explicit Node(const BomberEnv& source, bool is_terminal = false) : terminal(is_terminal) {
+        env_copy(&env, &source);
+        env.opponent = nullptr;
+    }
+    BomberEnv env{};
+    bool terminal{};
+    bool expanded{};
+    std::array<float, kJointActions> priors{};
+    std::array<int, kJointActions> visits{};
+    /* Per-seat value sums (decoupled general-sum PUCT). Each seat backs up and maximizes
+       its OWN value, so a draw that is negative for BOTH seats is avoided by both. A single
+       shared value_sum would cancel a common-mode draw penalty in the seat-0-minus-seat-1
+       aggregation, hiding draw-aversion from the search entirely. */
+    std::array<float, kJointActions> value_sum0{};
+    std::array<float, kJointActions> value_sum1{};
+    std::array<std::unique_ptr<Node>, kJointActions> children{};
+};
+
+struct SearchConstraint {
+    int fixed_opponent_seat{-1};
+    AgentType fixed_opponent_type{AGENT_RANDOM};
+    uint64_t opponent_seed{};
+    /* KL-110 Phase B: appended LAST, with a default member initializer, so every existing
+       3-field aggregate initializer ({modeled_seat, type, seed} at self-play/league/evaluate's
+       three constraint-construction sites) still compiles unchanged and still means "no fixed
+       action" (aggregate init leaves a trailing unlisted field at its default). -1 (default) =
+       the fixed seat's action comes from baseline_action() as before (a real scripted-agent
+       decision, possibly stateful/RNG-driven). [0, kActions) = expand_and_backup one-hots that
+       EXACT action for the fixed seat at every expanded node instead of calling
+       baseline_action() - used by the gates "aligned" opponent model to pin search's internal
+       lookahead to a NONE/CONSTANT scenario's actual (stateless, deterministic) opponent
+       action. Only ever set outside [-1, kActions) by a bug; validated at the gates
+       construction site (gate_search_constraint()), not here - self-play/league/evaluate never
+       set it, so re-validating on every leaf expansion would be pure overhead on the hot path. */
+    int fixed_opponent_action{-1};
+    /* v7 Stage 0 item 0.4 (SEARCH-CONTEMPT PROTOTYPE): appended LAST, with a default member
+       initializer, so every existing aggregate initializer (the 3-field {modeled_seat, type,
+       seed} shape at self-play/league/evaluate's construction sites, and the 3-field
+       SearchConstraint{-1, AGENT_RANDOM, seed} literal in gate_search_constraint()'s "self"
+       early return) still compiles unchanged and still means "contempt off" (aggregate init
+       leaves a trailing unlisted field at its default) - identical reasoning to
+       fixed_opponent_action's own appended-last precedent directly above. -1 (default) = off,
+       BatchedMcts::search()'s descent loop always calls select_joint() exactly as before this
+       field existed. [0, kActions) is not a legal seat value here (only 0 or 1 - two seats
+       total); this project's convention elsewhere validates such constraint fields at their
+       construction site rather than on the hot path, but contempt's ONLY construction site
+       (gate_search_constraint()) only ever writes 1 or -1, so there is nothing to validate
+       against a bad CLI-supplied value the way fixed_opponent_action's aligned mode does.
+       >=0 (0 or 1) = this is the seat whose PUCT adaptation gets frozen past
+       config.search_contempt_nscl visits per node - see search_contempt_nscl's own doc comment
+       in trainer.h for the full mechanism. The OTHER seat (1 - contempt_seat) is never
+       modified - it is always this project's ordinary per-seat PUCT, unconditionally. Only
+       ever set by gate_search_constraint() (--gates-search-contempt sets it to 1, the scenario
+       opponent seat - the gates learner is always seat 0); self-play/league/evaluate/promotion
+       never set it, so contempt_seat stays -1 (off) on every training call site by
+       construction, not by a runtime check - this prototype has no training-path effect.
+       >=0 additionally REQUIRES the search() call's root_noise argument to be false - throws
+       otherwise (see search()'s own validation, right after the constraint-count check) -
+       contempt is a gates-only diagnostic and must never coexist with Dirichlet-noised
+       collection. When fixed_opponent_seat also equals this seat (gates "aligned" opponent
+       model), contempt is a documented NO-OP: expand_and_backup already one-hots that seat's
+       policy to a single fixed action at every node it expands, so that seat's marginal visit
+       distribution - snapshotted by contempt or not - is already 100% concentrated on that same
+       action; freezing a distribution that is already a point mass changes nothing. */
+    int contempt_seat{-1};
+};
+
+struct SearchResult {
+    std::array<int, kJointActions> visits{};
+    /* KL-107: root priors after safe-action masking/renormalization, plus per-seat search
+       backup sums. These are useful but are NOT unmasked policy-head probabilities or raw
+       value-head outputs; callers must not label them that way. */
+    std::array<float, kJointActions> priors{};
+    std::array<float, kJointActions> value_sum0{};
+    std::array<float, kJointActions> value_sum1{};
+    /* v7 Stage 0 item 0.2 (KataGo forced playouts, Wu arXiv:1902.10565 S4.1-4.2): per-seat,
+       per-action count of ROOT simulations that selected that seat's marginal action because it
+       was FORCED (marginal visits below the sqrt(k*P*N) floor), not because it won PUCT on its
+       own merit - see BatchedMcts::select_joint_root_forced(). All-zero whenever
+       root_noise==false (eval/gates/promotion never force - see search()'s at-root branch) or
+       config.forced_playouts_k<=0 (off, default). Consumed by policy_target_pruning.h at
+       collection time to prune the POLICY TRAINING TARGET only; action selection
+       (sample_joint_action) always uses the unpruned `visits` above. */
+    std::array<int, kActions> forced0{};
+    std::array<int, kActions> forced1{};
+    /* v7 Stage 0 item 0.2 telemetry: count of root actions (summed over both seats) whose FINAL
+       marginal visits, after the whole simulation budget, fell below the forced-playouts floor
+       by more than the documented one-simulation slack - see the post-simulation-loop check in
+       search(). Expected 0 whenever forcing is active; surfaced into metrics.jsonl as
+       forced_floor_violations so a regression is always-on telemetry, not a silent invariant.
+       All-zero under the same conditions as forced0/forced1 above. */
+    int floor_violations{};
+};
+
+struct LeafJob {
+    Node* leaf{};
+    std::vector<std::pair<Node*, int>> path;
+    SearchConstraint constraint;
+};
+
+class BatchedMcts {
+public:
+    BatchedMcts(PolicyValueNet model, torch::Device device, const TrainConfig& config,
+                std::mt19937_64& rng, int iteration, bool bootstrap_enabled = true)
+        : model_(std::move(model)), device_(device), config_(config), rng_(rng),
+          iteration_(iteration), bootstrap_enabled_(bootstrap_enabled) {}
+
+    /* fixed_opponent_violation_count: KL-110 Phase B internal-node enforcement proof. Appended
+       LAST with a default (nullptr), so every existing call site (self-play, league, evaluate,
+       promotion arena - none of which fix an opponent action) compiles unchanged and pays no
+       cost. When non-null AND a root's constraint has fixed_opponent_action >= 0, traverses
+       that root's ENTIRE built tree (not just the root marginals SearchResult already exposes -
+       a root-only check cannot rule out the constraint silently not applying a few plies down)
+       before the tree is freed at function return, and ADDS the count of violating expanded
+       nodes onto *fixed_opponent_violation_count (accumulates across the whole vector of roots,
+       and across repeated calls if the caller reuses the same pointer - see
+       count_fixed_opponent_violations() below and its call site near the end of this method). */
+    std::vector<SearchResult> search(const std::vector<BomberEnv*>& environments,
+                                     const std::vector<SearchConstraint>& constraints,
+                                     bool root_noise, int simulations = -1,
+                                     int* fixed_opponent_violation_count = nullptr) {
+        if (environments.empty()) return {};
+        if (constraints.size() != environments.size())
+            throw std::runtime_error("MCTS constraint count mismatch");
+        /* v7 Stage 0 item 0.4 (SEARCH-CONTEMPT PROTOTYPE): contempt_seat>=0 must never coexist
+           with Dirichlet-noised collection - see SearchConstraint::contempt_seat's own doc
+           comment. Checked once here, up front, rather than per-simulation on the hot path;
+           training call sites (self-play/league) never set contempt_seat at all, so this can
+           only ever fire on a future misuse of the constraint construction site, not on any
+           reachable CLI path today (gates - the only contempt_seat>=0 source - always calls
+           search() with root_noise==false). */
+        if (root_noise) {
+            for (const auto& constraint : constraints)
+                if (constraint.contempt_seat >= 0)
+                    throw std::runtime_error(
+                        "search-contempt (contempt_seat>=0) is incompatible with "
+                        "root_noise=true - contempt is a gates-only prototype and must never "
+                        "coexist with Dirichlet-noised collection");
+        }
+        const int simulation_count = simulations > 0 ? simulations : config_.simulations;
+        std::vector<std::unique_ptr<Node>> roots;
+        roots.reserve(environments.size());
+        for (auto* env : environments) roots.push_back(std::make_unique<Node>(*env));
+
+        std::vector<LeafJob> initial;
+        initial.reserve(roots.size());
+        for (size_t index = 0; index < roots.size(); ++index)
+            initial.push_back({roots[index].get(), {}, constraints[index]});
+        expand_and_backup(initial);
+        if (root_noise) {
+            for (auto& root : roots) add_root_noise(*root);
+        }
+
+        /* v7 Stage 0 item 0.2: per-root, per-seat forced-selection counts, owned by this search
+           call (NOT Node - only roots ever need this bookkeeping, so it lives here rather than
+           bloating every node in the tree). Persists ACROSS the whole simulation loop below
+           (declared outside it), since a forced floor is re-checked against the CURRENT
+           accumulated visit count on every simulation. Zero-initialized (std::array<int,
+           kActions>{} default), so a root that never triggers forcing (root_noise==false, or
+           forced_playouts_k<=0, or simply no action ever qualifies) reports all-zero - exactly
+           the "off" SearchResult contract. */
+        std::vector<std::array<int, kActions>> forced_counts0(roots.size());
+        std::vector<std::array<int, kActions>> forced_counts1(roots.size());
+        const bool forcing_enabled = root_noise && config_.forced_playouts_k > 0.0;
+        /* v7 Stage 0 item 0.4: frozen-snapshot side map, scoped to THIS search() call only -
+           see contempt_snapshots_'s own doc comment for why a shared map (not a per-root vector
+           like forced_counts0/1 above) is an accepted, documented tradeoff here. Cleared
+           unconditionally (cheap - a fresh gates search's tree does not pre-populate it) rather
+           than only when contempt is active, so there is exactly one invariant to reason about
+           regardless of any given root's constraint. */
+        contempt_snapshots_.clear();
+
+        for (int simulation = 0; simulation < std::max(simulation_count, 1); ++simulation) {
+            std::vector<LeafJob> leaves;
+            leaves.reserve(roots.size());
+            std::vector<std::optional<LeafJob>> leaf_slots(roots.size());
+#ifdef AI_BOMBER_NATIVE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int64_t root_index = 0;
+                 root_index < static_cast<int64_t>(roots.size()); ++root_index) {
+                Node* node = roots[root_index].get();
+                std::vector<std::pair<Node*, int>> path;
+                /* v7 Stage 0 item 0.4: per-root, computed once outside the descent while-loop
+                   below (contempt_seat is fixed for a root's whole search() call - see its own
+                   doc comment) - contempt_active reduces the descent loop's selection ternary to
+                   its pre-existing two-branch form byte-for-byte whenever false, which covers
+                   every call site that never sets contempt_seat (self-play/league/evaluate/
+                   promotion, and every gates call that omits --gates-search-contempt) and every
+                   call with search_contempt_nscl<=0 (the compiled default). */
+                const int contempt_seat = constraints[root_index].contempt_seat;
+                const bool contempt_active =
+                    contempt_seat >= 0 && config_.search_contempt_nscl > 0;
+                while (node->expanded && !node->terminal) {
+                    /* Root-only hook: path.empty() is true exactly on this while loop's FIRST
+                       iteration, i.e. exactly when `node` is still the root this simulation
+                       started from - forcing must never apply at any deeper ply (hard
+                       constraint; select_joint() itself is never modified, so every non-root
+                       selection - and every selection at all when forcing_enabled is false,
+                       which covers every eval/gates/promotion call and every
+                       forced_playouts_k<=0 collection call - takes the IDENTICAL call it took
+                       before this feature existed). Contempt (v7 Stage 0 item 0.4), unlike
+                       forcing, applies at ANY node - root or interior - whenever contempt_active,
+                       so it is checked at every ply, not just at_root; forcing_enabled and
+                       contempt_active can never both be true in the same search() call (forcing
+                       requires root_noise==true, contempt requires root_noise==false - see the
+                       throw near the top of search()), so the two never actually compete for
+                       the same selection. */
+                    const bool at_root = path.empty();
+                    const int action = (at_root && forcing_enabled)
+                        ? select_joint_root_forced(*node, forced_counts0[root_index],
+                                                   forced_counts1[root_index])
+                        : (contempt_active ? select_joint_contempt(*node, contempt_seat)
+                                           : select_joint(*node));
+                    path.emplace_back(node, action);
+                    if (!node->children[action]) {
+                        BomberEnv child_env;
+                        env_copy(&child_env, &node->env);
+                        child_env.opponent = nullptr;
+                        const Action actions[2] = {
+                            static_cast<Action>(action / kActions),
+                            static_cast<Action>(action % kActions)};
+                        const StepResult step = env_step_joint(&child_env, actions, 2);
+                        node->children[action] = std::make_unique<Node>(child_env, step.done != 0);
+                    }
+                    node = node->children[action].get();
+                }
+                if (node->terminal) {
+                    /* Back up each seat's own terminal value so a draw (negative for both)
+                       actually steers the search away, not just the value head. */
+                    backup(path,
+                           terminal_training_value(node->env, 0, config_.timeout_draw_value,
+                                                   config_.mutual_death_value,
+                                                   config_.arena_crush_win_value,
+                                                   config_.selfkill_win_value),
+                           terminal_training_value(node->env, 1, config_.timeout_draw_value,
+                                                   config_.mutual_death_value,
+                                                   config_.arena_crush_win_value,
+                                                   config_.selfkill_win_value));
+                } else {
+                    leaf_slots[root_index] = LeafJob{
+                        node, std::move(path), constraints[root_index]};
+                }
+            }
+            for (auto& slot : leaf_slots)
+                if (slot) leaves.push_back(std::move(*slot));
+            expand_and_backup(leaves);
+        }
+
+        if (fixed_opponent_violation_count) {
+            for (size_t index = 0; index < roots.size(); ++index) {
+                const auto& constraint = constraints[index];
+                if (constraint.fixed_opponent_action >= 0)
+                    count_fixed_opponent_violations(
+                        *roots[index], constraint.fixed_opponent_seat,
+                        constraint.fixed_opponent_action, *fixed_opponent_violation_count);
+            }
+        }
+
+        std::vector<SearchResult> results(roots.size());
+        for (size_t index = 0; index < roots.size(); ++index) {
+            results[index].visits = roots[index]->visits;
+            results[index].priors = roots[index]->priors;
+            results[index].value_sum0 = roots[index]->value_sum0;
+            results[index].value_sum1 = roots[index]->value_sum1;
+            /* v7 Stage 0 item 0.2: forced_counts0/1 default-initialize to all-zero and are only
+               ever written inside the at_root&&forcing_enabled branch above, so this assignment
+               is unconditionally safe (and correctly all-zero) whenever forcing never fired this
+               call. floor_violations is left at SearchResult's own zero default unless forcing
+               was actually enabled this call - root_floor_violations() is meaningless (and its
+               own kPriorEpsilon-gated loop would just report 0 anyway) when forced_playouts_k<=0
+               or root_noise==false, so skip the redundant pass entirely rather than rely on that
+               coincidence. */
+            results[index].forced0 = forced_counts0[index];
+            results[index].forced1 = forced_counts1[index];
+            if (forcing_enabled)
+                results[index].floor_violations = root_floor_violations(*roots[index]);
+        }
+        return results;
+    }
+
+private:
+    int select_joint(const Node& node) const {
+        return select_seat_puct(node, 0) * kActions + select_seat_puct(node, 1);
+    }
+
+    /* v7 Stage 0 item 0.4 (SEARCH-CONTEMPT PROTOTYPE): extracted out of select_joint's
+       previously fully-inlined body (a single loop over `action` computed BOTH seats' visits/
+       values/priors together) so the contempt descent wrapper (select_joint_contempt() below)
+       can compute ONE seat's ordinary PUCT argmax in isolation without duplicating this
+       arithmetic - contempt must never touch the other seat's selection, so that seat has to be
+       callable on its own. Bit-for-bit equivalence proof for select_joint's two calls above:
+       node.visits is never mutated between them, so `total`/`scale` are identical both times;
+       each call's inner accumulation loop (visits/values/priors) is a self-contained float
+       accumulator chain walking `opponent` in the same 0..kActions-1 order the original
+       interleaved version used for that seat - splitting the two seats into separate calls
+       cannot reassociate either chain's own floating-point additions, it only removes the OTHER
+       seat's unrelated statements from between them. Same strict `>` tie-break, same
+       "only actions with positive prior are ever considered" guard. So
+       select_seat_puct(node, 0) == the pre-refactor selected_zero and
+       select_seat_puct(node, 1) == the pre-refactor selected_one, exactly - select_joint's own
+       compiled OUTPUT is unchanged; the byte-identical gates reruns
+       (test_native_alphazero_gates_check.py) are the guard. */
+    int select_seat_puct(const Node& node, int seat) const {
+        const int total = std::accumulate(node.visits.begin(), node.visits.end(), 0);
+        const float scale = std::sqrt(static_cast<float>(total) + 1.0f);
+        int selected = 0;
+        float best = -std::numeric_limits<float>::infinity();
+        for (int action = 0; action < kActions; ++action) {
+            int visits = 0;
+            float values = 0.0f;
+            float priors = 0.0f;
+            for (int opponent = 0; opponent < kActions; ++opponent) {
+                const int index = seat == 0 ? action * kActions + opponent
+                                            : opponent * kActions + action;
+                visits += node.visits[index];
+                /* Seat 1 maximizes its OWN accumulated value (no negation): value_sum1
+                   already stores seat 1's perspective - same as select_joint carried inline
+                   before this extraction. */
+                values += seat == 0 ? node.value_sum0[index] : node.value_sum1[index];
+                priors += node.priors[index];
+            }
+            if (priors > 0.0f) {
+                const float q = visits ? values / visits : 0.0f;
+                const float score = q + static_cast<float>(config_.c_puct) * priors *
+                                          scale / (1.0f + visits);
+                if (score > best) { best = score; selected = action; }
+            }
+        }
+        return selected;
+    }
+
+    /* v7 Stage 0 item 0.4 (docs/experiment-memory/14-v7-from-scratch-design.md; SEARCH-CONTEMPT
+       PROTOTYPE, Joshi 2025 arXiv:2504.07757, adapted to decoupled simultaneous PUCT; our H3a):
+       descent-loop replacement for select_joint(), called exactly when search()'s descent loop
+       sees a root whose constraint.contempt_seat is s>=0 AND config_.search_contempt_nscl>0 -
+       never otherwise (see search()'s own guard, which reduces to the pre-existing
+       `select_joint(*node)` call byte-for-byte whenever contempt is not active for this root).
+       Unlike select_joint_root_forced (root-only), this fires at ANY node along the descent -
+       root and interior alike - matching the mechanism's "per node, not per root" contract.
+
+       contempt_seat s's marginal action is frozen once this NODE's total visits (summed over
+       ALL prior simulations that passed through it - the same `total` select_seat_puct itself
+       computes) first exceed search_contempt_nscl: the seat's CURRENT marginal visit
+       distribution is snapshotted into contempt_snapshots_ (a side map owned by this
+       BatchedMcts instance, keyed by Node*, cleared at the top of every search() call - see
+       search()'s own clear and its doc comment on why a shared side map is safe here rather
+       than Node ABI growth) the first time this happens, and every simulation THEREAFTER
+       (including this one) samples seat s's action proportionally from that frozen snapshot via
+       rng_, instead of recomputing PUCT. Below/at the threshold, seat s still goes through
+       select_seat_puct - identical to what select_joint itself would compute for that seat. The
+       OTHER seat (1-s) is NEVER modified by any of this: it always goes through
+       select_seat_puct, unconditionally - exactly what select_joint would compute for it.
+
+       The snapshot is guaranteed non-degenerate whenever it is taken: total > search_contempt_
+       nscl >= 1 (search()'s guard already requires the config field positive) implies total>=2,
+       and marginal_visits(node, s) sums to exactly `total` (marginalizing regroups the same
+       visit count, it does not lose or add any), so std::discrete_distribution always has at
+       least one positive weight - no all-zero-weights edge case is possible here. */
+    int select_joint_contempt(const Node& node, int contempt_seat) {
+        const int other_seat = 1 - contempt_seat;
+        const int other_action = select_seat_puct(node, other_seat);
+        const int total = std::accumulate(node.visits.begin(), node.visits.end(), 0);
+        int contempt_action;
+        if (total > config_.search_contempt_nscl) {
+            auto [entry, inserted] = contempt_snapshots_.try_emplace(&node);
+            if (inserted) entry->second = marginal_visits(node, contempt_seat);
+            std::discrete_distribution<int> choose(entry->second.begin(), entry->second.end());
+            contempt_action = choose(rng_);
+        } else {
+            contempt_action = select_seat_puct(node, contempt_seat);
+        }
+        return contempt_seat == 0 ? contempt_action * kActions + other_action
+                                  : other_action * kActions + contempt_action;
+    }
+
+    /* Shared by select_joint_contempt (the frozen-snapshot source) - same accumulation pattern
+       as select_seat_puct/marginal_distribution (the KL-107 tracing helper defined later in
+       this file, out of reach from here since it is declared textually AFTER this class), typed
+       as int (visits, not the general numeric template tracing needs). */
+    static std::array<int, kActions> marginal_visits(const Node& node, int seat) {
+        std::array<int, kActions> marginal{};
+        for (int action = 0; action < kActions; ++action)
+            for (int opponent = 0; opponent < kActions; ++opponent)
+                marginal[action] += node.visits[seat == 0 ? action * kActions + opponent
+                                                           : opponent * kActions + action];
+        return marginal;
+    }
+
+    /* v7 Stage 0 item 0.2 (KataGo forced playouts, Wu arXiv:1902.10565 S4.1; independently
+       replicated by Trudeau & Bowling 2023): ROOT-ONLY replacement for select_joint(), called
+       exactly when search()'s at_root&&forcing_enabled guard is true - never at any other ply,
+       and never at all unless root_noise (collection) and config_.forced_playouts_k>0. A
+       brand-new function rather than a branch inside select_joint() itself, so select_joint()'s
+       own compiled behavior - and therefore every non-root selection, and every root selection
+       on any eval/gates/promotion/off-by-default call - is provably untouched by construction,
+       not merely by argument.
+
+       Computes the identical per-seat marginal PUCT pick select_joint() would (same
+       accumulation order, same strict-> tie-break, so this only diverges from plain PUCT when
+       forcing actually fires), then applies KataGo's forcing rule on top: seat s's action a is
+       FORCED - selected regardless of its PUCT score - whenever its marginal visit count n(a) is
+       below floor(a) = sqrt(k * P(a) * N), P(a) the seat's POST-noise marginal root prior
+       (node.priors already holds add_root_noise()'s output, since that runs once before the
+       simulation loop starts) and N this root's total visits so far (std::accumulate over
+       node.visits, exactly what select_joint() itself uses for its exploration scale). If more
+       than one action qualifies (deficit = floor(a) - n(a) > 0), the MOST starved one (largest
+       deficit, ties toward the lower action index - matching this file's >-strict tie-break
+       convention elsewhere) is forced; forcing a* itself is a no-op in practice (a* is already
+       the most-visited action by definition, so it essentially never has a positive deficit; it
+       is not special-cased here because the arithmetic already handles it, and any exclusion
+       gets reintroduced correctly at the pruning step in policy_target_pruning.h instead, which
+       DOES special-case a*, per KataGo's actual algorithm). Each seat's forced_counts array
+       (owned by the caller - see search()'s per-root forced_counts0/1 vectors) is incremented at
+       the forced action whenever forcing fires for that seat this simulation, so it accumulates
+       to exactly "how many simulations selected this action because it was forced," the count
+       policy_target_pruning.h needs. */
+    int select_joint_root_forced(const Node& node, std::array<int, kActions>& forced0,
+                                 std::array<int, kActions>& forced1) const {
+        const int total = std::accumulate(node.visits.begin(), node.visits.end(), 0);
+        const float scale = std::sqrt(static_cast<float>(total) + 1.0f);
+        const float k = static_cast<float>(config_.forced_playouts_k);
+        std::array<int, kActions> visits_zero{};
+        std::array<int, kActions> visits_one{};
+        std::array<float, kActions> values_zero{};
+        std::array<float, kActions> values_one{};
+        std::array<float, kActions> priors_zero{};
+        std::array<float, kActions> priors_one{};
+        for (int action = 0; action < kActions; ++action) {
+            for (int opponent = 0; opponent < kActions; ++opponent) {
+                const int index_zero = action * kActions + opponent;
+                visits_zero[action] += node.visits[index_zero];
+                values_zero[action] += node.value_sum0[index_zero];
+                priors_zero[action] += node.priors[index_zero];
+                const int index_one = opponent * kActions + action;
+                visits_one[action] += node.visits[index_one];
+                values_one[action] += node.value_sum1[index_one];
+                priors_one[action] += node.priors[index_one];
+            }
+        }
+        auto select_seat = [&](const std::array<int, kActions>& visits,
+                               const std::array<float, kActions>& values,
+                               const std::array<float, kActions>& priors,
+                               std::array<int, kActions>& forced_counts) {
+            int puct_action = 0;
+            float best = -std::numeric_limits<float>::infinity();
+            for (int action = 0; action < kActions; ++action) {
+                if (priors[action] <= 0.0f) continue;
+                const float q = visits[action] ? values[action] / visits[action] : 0.0f;
+                const float score = q + static_cast<float>(config_.c_puct) * priors[action] *
+                                          scale / (1.0f + visits[action]);
+                if (score > best) { best = score; puct_action = action; }
+            }
+            int forced_action = -1;
+            float best_deficit = 0.0f;
+            for (int action = 0; action < kActions; ++action) {
+                if (priors[action] <= 0.0f) continue;
+                const float required =
+                    std::sqrt(k * priors[action] * static_cast<float>(total));
+                const float deficit = required - static_cast<float>(visits[action]);
+                if (deficit > best_deficit) { best_deficit = deficit; forced_action = action; }
+            }
+            if (forced_action >= 0) {
+                ++forced_counts[forced_action];
+                return forced_action;
+            }
+            return puct_action;
+        };
+        const int selected_zero = select_seat(visits_zero, values_zero, priors_zero, forced0);
+        const int selected_one = select_seat(visits_one, values_one, priors_one, forced1);
+        return selected_zero * kActions + selected_one;
+    }
+
+    /* v7 Stage 0 item 0.2 telemetry: post-hoc invariant check, run once per root AFTER the whole
+       simulation budget for this search() call (NOT per-simulation) - counts how many root
+       actions, across both seats, with non-negligible post-noise marginal prior ended up below
+       their forced-playouts floor by more than one simulation's slack. kPriorEpsilon excludes
+       actions with essentially no prior mass (safe-action-masked to exactly 0, or renormalized
+       to a negligible sliver) - those can never be forced in the first place (their own floor is
+       ~0 too), so they are not a meaningful test of whether forcing did its job. The "-1" slack
+       accounts for the floor being a monotonically-growing function of N (including N from the
+       very last simulation) checked against an integer visit count that can only integrate whole
+       simulations - see select_joint_root_forced() above, which computes N and the floor
+       identically. Expected 0 whenever forcing is active; surfaced into metrics.jsonl as
+       forced_floor_violations (see collect_self_play/collect_league_play) so this invariant is
+       always-on telemetry, not a silent assumption. */
+    int root_floor_violations(const Node& root) const {
+        const int total = std::accumulate(root.visits.begin(), root.visits.end(), 0);
+        const float k = static_cast<float>(config_.forced_playouts_k);
+        constexpr float kPriorEpsilon = 1e-3f;
+        int violations = 0;
+        for (int seat = 0; seat < 2; ++seat) {
+            std::array<int, kActions> visits{};
+            std::array<float, kActions> priors{};
+            for (int action = 0; action < kActions; ++action) {
+                for (int opponent = 0; opponent < kActions; ++opponent) {
+                    const int joint = seat == 0 ? action * kActions + opponent
+                                                : opponent * kActions + action;
+                    visits[action] += root.visits[joint];
+                    priors[action] += root.priors[joint];
+                }
+            }
+            for (int action = 0; action < kActions; ++action) {
+                if (priors[action] < kPriorEpsilon) continue;
+                const int required = static_cast<int>(std::floor(
+                    std::sqrt(k * priors[action] * static_cast<float>(total)))) - 1;
+                if (visits[action] < required) ++violations;
+            }
+        }
+        return violations;
+    }
+
+    static void backup(const std::vector<std::pair<Node*, int>>& path,
+                       float value0, float value1) {
+        for (auto it = path.rbegin(); it != path.rend(); ++it) {
+            ++it->first->visits[it->second];
+            it->first->value_sum0[it->second] += value0;
+            it->first->value_sum1[it->second] += value1;
+        }
+    }
+
+    /* KL-110 Phase B: recursive proof that a fixed-opponent constraint held at EVERY expanded
+       node in the tree, not just the root - expand_and_backup one-hots the fixed seat's policy
+       on every node it expands (root batch and every later leaf batch alike, since LeafJob
+       carries the same constraint unchanged for a whole root's subtree), so this is expected to
+       find zero violations structurally; it exists to catch a future regression (e.g. a leaf
+       job losing its constraint) rather than to detect an expected failure mode. A node
+       "violates" if ANY joint cell puts nonzero prior or visit mass on a fixed-seat action other
+       than fixed_action - counted once per violating NODE (not once per violating cell), mirrors
+       "count any expanded node whose joint visits or priors put mass on..." Terminal/unexpanded
+       nodes are skipped (expand_and_backup never ran on them, so they carry no policy at all)
+       but their children (if any) are still visited - recursion, not early return, so a
+       violation several plies down is never masked by an unexpanded node above it. */
+    static void count_fixed_opponent_violations(const Node& node, int fixed_seat, int fixed_action,
+                                                int& count) {
+        if (node.expanded) {
+            bool violated = false;
+            for (int zero = 0; zero < kActions && !violated; ++zero) {
+                for (int one = 0; one < kActions; ++one) {
+                    const int fixed_component = fixed_seat == 0 ? zero : one;
+                    if (fixed_component == fixed_action) continue;
+                    const int joint = zero * kActions + one;
+                    if (node.priors[joint] > 0.0f || node.visits[joint] > 0) {
+                        violated = true;
+                        break;
+                    }
+                }
+            }
+            if (violated) ++count;
+        }
+        for (const auto& child : node.children)
+            if (child) count_fixed_opponent_violations(*child, fixed_seat, fixed_action, count);
+    }
+
+    void add_root_noise(Node& root) {
+        std::gamma_distribution<float> gamma(static_cast<float>(config_.dirichlet_alpha), 1.0f);
+        std::array<float, kJointActions> noise{};
+        float total = 0.0f;
+        for (int index = 0; index < kJointActions; ++index) {
+            if (root.priors[index] > 0.0f) {
+                noise[index] = gamma(rng_);
+                total += noise[index];
+            }
+        }
+        if (total <= 0.0f) return;
+        const float fraction = static_cast<float>(config_.dirichlet_fraction);
+        float normalized = 0.0f;
+        for (int index = 0; index < kJointActions; ++index) {
+            if (root.priors[index] > 0.0f) {
+                root.priors[index] = (1.0f - fraction) * root.priors[index] +
+                                     fraction * noise[index] / total;
+                normalized += root.priors[index];
+            }
+        }
+        for (auto& prior : root.priors) prior /= normalized;
+    }
+
+    void expand_and_backup(std::vector<LeafJob>& jobs) {
+        if (jobs.empty()) return;
+        std::vector<float> encoded(jobs.size() * 2 * kObservationSize);
+        for (size_t index = 0; index < jobs.size(); ++index) {
+            for (int seat = 0; seat < 2; ++seat) {
+                float* destination = encoded.data() + (index * 2 + seat) * kObservationSize;
+                if (bomber_training_encode_env(&jobs[index].leaf->env, seat, destination,
+                                               kObservationSize) != kObservationSize)
+                    throw std::runtime_error("C observation encoder failed during MCTS");
+            }
+        }
+        auto input = torch::from_blob(encoded.data(),
+            {static_cast<int64_t>(jobs.size() * 2), BOMBER_TRAINING_CHANNELS,
+             BOMBER_TRAINING_VIEW_SIZE, BOMBER_TRAINING_VIEW_SIZE}, torch::kFloat32)
+            .to(device_);
+        torch::Tensor logits;
+        torch::Tensor values;
+        model_->eval();
+        {
+            torch::InferenceMode inference;
+            AutocastGuard autocast;
+            std::tie(logits, values) = model_->forward(input);
+        }
+        auto probabilities = torch::softmax(logits.to(torch::kFloat32), 1).to(torch::kCPU);
+        auto values_cpu = values.to(torch::kFloat32).to(torch::kCPU);
+        const auto policy = probabilities.accessor<float, 2>();
+        const auto value = values_cpu.accessor<float, 1>();
+
+        const double bootstrap_progress = std::min(
+            static_cast<double>(iteration_) /
+                std::max(config_.bootstrap_value_iterations, 1), 1.0);
+        const float heuristic_weight = bootstrap_enabled_ ? static_cast<float>(
+            config_.bootstrap_value_weight * (1.0 - bootstrap_progress)) : 0.0f;
+        for (size_t index = 0; index < jobs.size(); ++index) {
+            Node& node = *jobs[index].leaf;
+            std::array<std::array<float, kActions>, 2> seat_policy{};
+            for (int seat = 0; seat < 2; ++seat) {
+                int count = 0;
+                const auto safe = safe_action_mask_for(node.env, seat, count);
+                float total = 0.0f;
+                for (int action = 0; action < kActions; ++action) {
+                    seat_policy[seat][action] = safe[action] ?
+                        policy[static_cast<int64_t>(index * 2 + seat)][action] : 0.0f;
+                    total += seat_policy[seat][action];
+                }
+                if (jobs[index].constraint.fixed_opponent_seat == seat) {
+                    seat_policy[seat].fill(0.0f);
+                    /* KL-110 Phase B: fixed_opponent_action >= 0 (gates "aligned" opponent
+                       model, NONE/CONSTANT scenarios) one-hots that EXACT action instead of
+                       asking a scripted Agent - the scenario's real opponent this step is
+                       already known and deterministic (fed ACTION_WAIT or a fixed CONSTANT
+                       action by run_gate_scenario's outer loop), so there is no agent decision
+                       to reproduce, and baseline_action() would need to be a real stateful
+                       agent_act() call to match a general opponent - fine for AGENT(type), not
+                       meaningful for NONE/CONSTANT. -1 (everything else: self-play/league/
+                       evaluate, and gates AGENT-mode alignment) keeps the existing
+                       baseline_action() path unchanged. */
+                    const int action = jobs[index].constraint.fixed_opponent_action >= 0
+                        ? jobs[index].constraint.fixed_opponent_action
+                        : baseline_action(
+                              jobs[index].constraint.fixed_opponent_type, node.env, seat,
+                              jobs[index].constraint.opponent_seed ^ env_state_hash(&node.env));
+                    seat_policy[seat][action] = 1.0f;
+                } else if (total > 0.0f) {
+                    for (auto& probability : seat_policy[seat]) probability /= total;
+                } else {
+                    const float uniform = 1.0f / std::max(count, 1);
+                    for (int action = 0; action < kActions; ++action)
+                        seat_policy[seat][action] = safe[action] ? uniform : 0.0f;
+                }
+            }
+            float prior_total = 0.0f;
+            for (int zero = 0; zero < kActions; ++zero) {
+                for (int one = 0; one < kActions; ++one) {
+                    const int joint = zero * kActions + one;
+                    node.priors[joint] = seat_policy[0][zero] * seat_policy[1][one];
+                    prior_total += node.priors[joint];
+                }
+            }
+            if (prior_total > 0.0f)
+                for (auto& prior : node.priors) prior /= prior_total;
+            node.expanded = true;
+            float value0 = value[index * 2];
+            float value1 = value[index * 2 + 1];
+            if (heuristic_weight > 0.0f) {
+                const float tactical_zero = std::tanh(tactical_value(node.env, 0) / 250.0f);
+                const float tactical_one = std::tanh(tactical_value(node.env, 1) / 250.0f);
+                value0 = (1.0f - heuristic_weight) * value0 + heuristic_weight * tactical_zero;
+                value1 = (1.0f - heuristic_weight) * value1 + heuristic_weight * tactical_one;
+            }
+            backup(jobs[index].path, value0, value1);
+        }
+    }
+
+    PolicyValueNet model_;
+    torch::Device device_;
+    const TrainConfig& config_;
+    std::mt19937_64& rng_;
+    int iteration_;
+    bool bootstrap_enabled_;
+    /* v7 Stage 0 item 0.4 (SEARCH-CONTEMPT PROTOTYPE): frozen-snapshot side map for
+       select_joint_contempt() above - deliberately NOT a Node member (contempt is
+       prototype/gates-scale; a map of a few hundred nodes per search() call is fine, and this
+       keeps every other call site's Node ABI/memory footprint completely untouched). Cleared at
+       the top of every search() call (see search()'s own clear), so a Node* is never looked up
+       against a stale snapshot from a PRIOR search() call - only relevant across gates()'s
+       repeated per-step search() calls, each of which builds a brand-new tree from scratch
+       anyway (search() itself constructs fresh `roots` every call), so a stale hit would only
+       ever be a wasted lookup at worst, never a correctness bug - the clear is nonetheless the
+       documented, provable invariant rather than relying on that coincidence.
+       THREAD SAFETY: the root_index loop in search() below is `#pragma omp parallel for` when
+       compiled with AI_BOMBER_NATIVE_OPENMP, and this map is a single instance shared by the
+       whole BatchedMcts (not sharded per root_index the way forced_counts0/1 deliberately are -
+       see search()'s own comment on those). Mutating a std::map concurrently from two roots
+       that BOTH have contempt active would be a data race. This is safe today only because
+       contempt's one and only construction site (gate_search_constraint(), gated by
+       --gates-search-contempt) is only ever reached through run_gate_scenario, which always
+       calls search() with a SINGLE-element root vector (`std::vector<BomberEnv*> active{&env}`)
+       - the parallel-for loop's trip count is 1, so no concurrent access to this map can ever
+       occur in practice. A hypothetical future caller that batches multiple contempt-bearing
+       roots into one search() call would need to shard this map per root_index first (or drop
+       OpenMP for that call) before it would be safe - flagged here rather than solved
+       speculatively, since no such caller exists (self-play/league/evaluate/promotion never set
+       contempt_seat at all, and mirror-training adoption, if it ever happens, is explicitly out
+       of scope for this prototype - see doc 14 item 0.4's "NOT this unit's problem"). */
+    std::map<const Node*, std::array<int, kActions>> contempt_snapshots_;
+};
+
+/* v7 Stage 0 item 0.1+0.3 (docs/experiment-memory/14-v7-from-scratch-design.md): resolves the
+   sampling temperature for self-play/league collection at a given step - the single place both
+   collect_self_play() and collect_league_play() must call, so the two call sites can never
+   drift apart on this logic. temperature_anneal=false (default) reproduces EXACTLY the
+   pre-existing step-function behavior bit for bit - unconditional early-return before anneal is
+   even consulted, so a legacy checkpoint (or any run that never passes --temperature-anneal)
+   sees zero behavioral change. temperature_anneal=true linearly interpolates from
+   config.temperature at step 0 toward config.temperature_final at step config.temperature_steps
+   (validate_config guarantees temperature_steps > 0 whenever anneal is requested, so this
+   division is always safe), then argmax from temperature_steps on - identical cutover point to
+   the step function, just a sloped ramp instead of a flat one beforehand. */
+float resolve_temperature(int step, const TrainConfig& config) {
+    if (step >= config.temperature_steps) return 0.0f;
+    if (!config.temperature_anneal) return static_cast<float>(config.temperature);
+    const double fraction = static_cast<double>(step) /
+        static_cast<double>(config.temperature_steps);
+    const double value = config.temperature +
+        (config.temperature_final - config.temperature) * fraction;
+    return static_cast<float>(value);
+}
+
+int sample_joint_action(const std::array<int, kJointActions>& visits, float temperature,
+                        std::mt19937_64& rng) {
+    if (temperature <= 1e-6f) {
+        return static_cast<int>(std::distance(visits.begin(),
+            std::max_element(visits.begin(), visits.end())));
+    }
+    std::array<double, kJointActions> weights{};
+    for (int index = 0; index < kJointActions; ++index)
+        weights[index] = std::pow(static_cast<double>(visits[index]) + 1e-12,
+                                  1.0 / temperature);
+    std::discrete_distribution<int> choose(weights.begin(), weights.end());
+    return choose(rng);
+}
+
+double wilson_lower_bound(double score, int games, double z) {
+    if (games <= 0) return 0.0;
+    const double probability = std::clamp(score, 0.0, 1.0);
+    const double z_squared = z * z;
+    const double denominator = 1.0 + z_squared / games;
+    const double center = probability + z_squared / (2.0 * games);
+    const double spread = z * std::sqrt(
+        (probability * (1.0 - probability) + z_squared / (4.0 * games)) / games);
+    return std::clamp((center - spread) / denominator, 0.0, 1.0);
+}
+
+int marginal_action(const std::array<int, kJointActions>& visits, int seat) {
+    std::array<int, kActions> marginal{};
+    for (int action = 0; action < kActions; ++action) {
+        for (int opponent_action = 0; opponent_action < kActions; ++opponent_action) {
+            marginal[action] += seat == 0 ? visits[action * kActions + opponent_action] :
+                                            visits[opponent_action * kActions + action];
+        }
+    }
+    return static_cast<int>(std::distance(
+        marginal.begin(), std::max_element(marginal.begin(), marginal.end())));
+}
+
+/* KL-107: marginalize a joint-action array (visits or priors, whichever numeric type) down
+   to one seat's per-action distribution - same accumulation pattern as marginal_action()
+   above, generalized to return the full array (for tracing) instead of just the argmax. */
+template <typename JointArray>
+std::array<double, kActions> marginal_distribution(const JointArray& joint, int seat) {
+    std::array<double, kActions> marginal{};
+    for (int action = 0; action < kActions; ++action) {
+        for (int opponent_action = 0; opponent_action < kActions; ++opponent_action) {
+            marginal[action] += seat == 0 ? joint[action * kActions + opponent_action] :
+                                            joint[opponent_action * kActions + action];
+        }
+    }
+    return marginal;
+}
+
+double distribution_entropy(const std::array<double, kActions>& distribution) {
+    const double total = std::accumulate(distribution.begin(), distribution.end(), 0.0);
+    if (total <= 0.0) return 0.0;
+    double entropy = 0.0;
+    for (const double value : distribution) {
+        if (value <= 0.0) continue;
+        const double probability = value / total;
+        entropy -= probability * std::log(probability);
+    }
+    return entropy;
+}
+
+void atomic_replace(const std::filesystem::path& temporary,
+                    const std::filesystem::path& destination) {
+#ifdef _WIN32
+    DWORD error = ERROR_SUCCESS;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        if (MoveFileExW(temporary.c_str(), destination.c_str(),
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            return;
+        error = GetLastError();
+        if (error != ERROR_SHARING_VIOLATION && error != ERROR_ACCESS_DENIED)
+            break;
+        Sleep(static_cast<DWORD>(25 * (attempt + 1)));
+    }
+    throw std::runtime_error("atomic checkpoint replace failed: Windows error " +
+                             std::to_string(error));
+#else
+    std::filesystem::rename(temporary, destination);
+#endif
+}
+
+void durable_flush(const std::filesystem::path& path) {
+#ifdef _WIN32
+    HANDLE handle = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE)
+        throw std::runtime_error("checkpoint flush open failed: Windows error " +
+                                 std::to_string(GetLastError()));
+    const BOOL flushed = FlushFileBuffers(handle);
+    const DWORD error = flushed ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(handle);
+    if (!flushed)
+        throw std::runtime_error("checkpoint flush failed: Windows error " +
+                                 std::to_string(error));
+#else
+    const int descriptor = ::open(path.c_str(), O_RDONLY);
+    if (descriptor < 0 || ::fsync(descriptor) != 0) {
+        if (descriptor >= 0) ::close(descriptor);
+        throw std::runtime_error("checkpoint flush failed");
+    }
+    ::close(descriptor);
+#endif
+}
+
+void atomic_copy_file(const std::filesystem::path& source,
+                      const std::filesystem::path& destination) {
+    const auto temporary = destination.string() + ".tmp";
+    std::filesystem::copy_file(source, temporary,
+                               std::filesystem::copy_options::overwrite_existing);
+    durable_flush(temporary);
+    atomic_replace(temporary, destination);
+}
+
+/* KL-101 Part C: this process's own executable path, for self-hashing into fork-manifest.json
+   provenance (which exact binary produced this checkpoint). argv[0] is not reliable (may be a
+   relative path, or just "bomber_alphazero_native" if found via PATH) - query the OS directly. */
+std::filesystem::path current_executable_path() {
+#ifdef _WIN32
+    std::vector<wchar_t> buffer(MAX_PATH);
+    for (;;) {
+        const DWORD length = GetModuleFileNameW(nullptr, buffer.data(),
+                                                 static_cast<DWORD>(buffer.size()));
+        if (length == 0)
+            throw std::runtime_error("GetModuleFileNameW failed: Windows error " +
+                                     std::to_string(GetLastError()));
+        if (length < buffer.size()) return std::filesystem::path(buffer.data());
+        buffer.resize(buffer.size() * 2);
+    }
+#else
+    return std::filesystem::read_symlink("/proc/self/exe");
+#endif
+}
+
+/* KL-101 Part D: OS-level exclusive lock, held for the process's lifetime, auto-released on
+   any exit (normal, crash, or kill) because it's a raw OS handle, not an advisory file the
+   process has to remember to delete. Opened with zero share mode - a second process trying to
+   open the same path fails immediately with a clear "already running" error instead of the
+   two processes silently contending for the GPU, which crashed training twice earlier in this
+   session. Every train/evaluate process takes the global lock; training also takes a run-dir
+   lock so the ownership rules remain explicit. */
+class ProcessLock {
+public:
+    explicit ProcessLock(const std::filesystem::path& lock_path) : path_(lock_path) {
+#ifdef _WIN32
+        handle_ = CreateFileW(lock_path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                              0 /* no sharing - exclusive */, nullptr, OPEN_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle_ == INVALID_HANDLE_VALUE) {
+            const DWORD error = GetLastError();
+            throw std::runtime_error(
+                "cannot acquire exclusive lock " + lock_path.string() +
+                " (Windows error " + std::to_string(error) + ", commonly "
+                "ERROR_SHARING_VIOLATION=32 - another bomber_alphazero_native.exe train or "
+                "evaluate process is already running; native processes must not contend for "
+                "the same GPU)");
+        }
+        const std::string pid_line = "pid=" + std::to_string(GetCurrentProcessId()) + "\n";
+        DWORD written = 0;
+        WriteFile(handle_, pid_line.data(), static_cast<DWORD>(pid_line.size()),
+                  &written, nullptr);
+        FlushFileBuffers(handle_);
+#else
+        descriptor_ = ::open(lock_path.c_str(), O_CREAT | O_RDWR, 0644);
+        if (descriptor_ < 0 || ::flock(descriptor_, LOCK_EX | LOCK_NB) != 0) {
+            if (descriptor_ >= 0) ::close(descriptor_);
+            descriptor_ = -1;
+            throw std::runtime_error(
+                "cannot acquire exclusive lock " + lock_path.string() +
+                " - another bomber_alphazero_native.exe train or evaluate process is already "
+                "running");
+        }
+        const std::string pid_line = "pid=" + std::to_string(::getpid()) + "\n";
+        (void)::write(descriptor_, pid_line.data(), pid_line.size());
+#endif
+    }
+    ~ProcessLock() {
+#ifdef _WIN32
+        if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_);
+#else
+        if (descriptor_ >= 0) { ::flock(descriptor_, LOCK_UN); ::close(descriptor_); }
+#endif
+    }
+    ProcessLock(const ProcessLock&) = delete;
+    ProcessLock& operator=(const ProcessLock&) = delete;
+
+private:
+    std::filesystem::path path_;
+#ifdef _WIN32
+    HANDLE handle_{INVALID_HANDLE_VALUE};
+#else
+    int descriptor_{-1};
+#endif
+};
+
+torch::Tensor string_tensor(const std::string& value) {
+    return torch::from_blob(const_cast<char*>(value.data()),
+                            {static_cast<int64_t>(value.size())}, torch::kUInt8).clone();
+}
+
+std::string tensor_string(torch::Tensor value) {
+    value = value.to(torch::kCPU, torch::kUInt8).contiguous();
+    return std::string(reinterpret_cast<const char*>(value.data_ptr<uint8_t>()), value.numel());
+}
+
+std::string config_signature(const TrainConfig& config) {
+    std::ostringstream output;
+    output << kFormatVersion << '|' << config.width << '|' << config.height << '|'
+           << config.max_steps << '|' << config.crate_density << '|' << config.channels
+           << '|' << config.residual_blocks << '|' << config.replay_capacity;
+    return output.str();
+}
+
+std::string runtime_config_signature(const TrainConfig& config) {
+    std::ostringstream output;
+    output << "games=" << config.self_play_games
+           << ";simulations=" << config.simulations
+           << ";train_steps=" << config.train_steps
+           << ";batch_size=" << config.batch_size
+           << ";learning_rate=" << config.learning_rate
+           << ";min_learning_rate=" << config.min_learning_rate
+           << ";lr_schedule_start=" << config.learning_rate_schedule_start_update
+           << ";lr_schedule_updates=" << config.learning_rate_schedule_updates
+           << ";weight_decay=" << config.weight_decay
+           << ";c_puct=" << config.c_puct
+           << ";dirichlet_alpha=" << config.dirichlet_alpha
+           << ";dirichlet_fraction=" << config.dirichlet_fraction
+           << ";forced_playouts_k=" << config.forced_playouts_k
+           << ";search_contempt_nscl=" << config.search_contempt_nscl
+           << ";temperature=" << config.temperature
+           << ";temperature_steps=" << config.temperature_steps
+           << ";temperature_final=" << config.temperature_final
+           << ";temperature_anneal=" << (config.temperature_anneal ? "true" : "false")
+           << ";teacher_agents=" << config.teacher_agents
+           << ";teacher_games=" << config.teacher_games
+           << ";teacher_iterations=" << config.teacher_iterations
+           << ";bootstrap_weight=" << config.bootstrap_value_weight
+           << ";bootstrap_iterations=" << config.bootstrap_value_iterations
+           << ";evaluation_games=" << config.evaluation_games
+           << ";evaluation_simulations=" << config.evaluation_simulations
+           << ";promotion_games=" << config.promotion_games
+           << ";promotion_simulations=" << config.promotion_simulations
+           << ";baseline_mcts_simulations=" << config.baseline_mcts_simulations
+           << ";baseline_mcts_depth=" << config.baseline_mcts_depth
+           << ";seed=" << config.seed
+           << ";replay_cause_balance_cap=" << config.replay_cause_balance_cap
+           << ";policy_entropy_bonus=" << config.policy_entropy_bonus
+           << ";value_only_iterations=" << config.value_only_iterations;
+    return output.str();
+}
+
+/* KL-101: fields that change what a checkpoint's WEIGHTS or SEARCH mean - reward shaping,
+   league composition, mechanics timing, the resolved LR schedule horizon, and
+   exploration/search settings that shape self-play's data distribution - as opposed to (a)
+   pure shape/ABI fields (width/height/channels/... - still hard-gated by config_signature()
+   above; untouched by this) or (b) pure search-BUDGET fields that legitimately differ
+   between training and evaluation by design (simulations, eval-games, batch-size...).
+   {internal_key, CLI flag} so load_checkpoint() can both serialize/parse these by name and
+   tell whether a field was explicitly requested on this process's own command line. */
+const std::vector<std::pair<std::string, std::string>>& semantic_field_flags() {
+    static const std::vector<std::pair<std::string, std::string>> fields = {
+        {"flame_duration", "--flame-duration"},
+        {"sudden_death_start", "--sudden-death-start"},
+        {"shrink_interval", "--shrink-interval"},
+        {"timeout_draw_value", "--timeout-draw-value"},
+        {"mutual_death_value", "--mutual-death-value"},
+        {"arena_crush_win_value", "--arena-crush-win-value"},
+        {"selfkill_win_value", "--selfkill-win-value"},
+        {"league_heuristic_fraction", "--league-heuristic-fraction"},
+        {"c_puct", "--c-puct"},
+        {"dirichlet_alpha", "--dirichlet-alpha"},
+        {"dirichlet_fraction", "--dirichlet-fraction"},
+        {"forced_playouts_k", "--forced-playouts-k"},
+        {"search_contempt_nscl", "--search-contempt-nscl"},
+        {"temperature", "--temperature"},
+        {"temperature_steps", "--temperature-steps"},
+        {"temperature_final", "--temperature-final"},
+        {"temperature_anneal", "--temperature-anneal"},
+        {"learning_rate", "--learning-rate"},
+        {"min_learning_rate", "--min-learning-rate"},
+        {"learning_rate_schedule_start_update", "--lr-schedule-start-update"},
+        {"learning_rate_schedule_updates", "--lr-schedule-updates"},
+        {"seed", "--seed"},
+        {"replay_cause_balance_cap", "--replay-cause-balance-cap"},
+        {"teacher_agents", "--teacher-agents"},
+        {"policy_entropy_bonus", "--policy-entropy-bonus"},
+        {"value_only_iterations", "--value-only-iterations"},
+    };
+    return fields;
+}
+
+std::string semantic_manifest_string(const TrainConfig& config) {
+    std::ostringstream output;
+    output << "flame_duration=" << config.flame_duration
+           << ";sudden_death_start=" << config.sudden_death_start
+           << ";shrink_interval=" << config.shrink_interval
+           << ";timeout_draw_value=" << config.timeout_draw_value
+           << ";mutual_death_value=" << config.mutual_death_value
+           << ";arena_crush_win_value=" << config.arena_crush_win_value
+           << ";selfkill_win_value=" << config.selfkill_win_value
+           << ";league_heuristic_fraction=" << config.league_heuristic_fraction
+           << ";c_puct=" << config.c_puct
+           << ";dirichlet_alpha=" << config.dirichlet_alpha
+           << ";dirichlet_fraction=" << config.dirichlet_fraction
+           << ";forced_playouts_k=" << config.forced_playouts_k
+           << ";search_contempt_nscl=" << config.search_contempt_nscl
+           << ";temperature=" << config.temperature
+           << ";temperature_steps=" << config.temperature_steps
+           << ";temperature_final=" << config.temperature_final
+           << ";temperature_anneal=" << (config.temperature_anneal ? "true" : "false")
+           << ";learning_rate=" << config.learning_rate
+           << ";min_learning_rate=" << config.min_learning_rate
+           << ";learning_rate_schedule_start_update="
+           << config.learning_rate_schedule_start_update
+           << ";learning_rate_schedule_updates=" << config.learning_rate_schedule_updates
+           << ";seed=" << config.seed
+           << ";replay_cause_balance_cap=" << config.replay_cause_balance_cap
+           << ";teacher_agents=" << config.teacher_agents
+           << ";policy_entropy_bonus=" << config.policy_entropy_bonus
+           << ";value_only_iterations=" << config.value_only_iterations;
+    return output.str();
+}
+
+std::map<std::string, std::string> parse_key_value(const std::string& raw) {
+    std::map<std::string, std::string> result;
+    std::istringstream stream(raw);
+    std::string pair;
+    while (std::getline(stream, pair, ';')) {
+        const auto separator = pair.find('=');
+        if (separator == std::string::npos) continue;
+        result[pair.substr(0, separator)] = pair.substr(separator + 1);
+    }
+    return result;
+}
+
+/* Reconcile config's semantic fields against a checkpoint's stored manifest: a field left at
+   its CLI default is OVERWRITTEN with the checkpoint's stored value (inheritance - this is
+   what makes resume/evaluate load semantics from the checkpoint rather than the trainer's
+   struct defaults). A field the CLI explicitly requested is left as the CLI's value, and any
+   difference from the checkpoint is returned as a human-readable fork line rather than passed
+   through silently. Returns the fork lines (empty = pure inheritance, no explicit overrides
+   diverged). */
+std::vector<std::string> apply_semantic_manifest(TrainConfig& config,
+                                                  const std::string& stored_manifest) {
+    const auto stored = parse_key_value(stored_manifest);
+    std::vector<std::string> forks;
+    auto reconcile_int = [&](const char* key, int TrainConfig::* field) {
+        const auto it = stored.find(key);
+        if (it == stored.end()) return;
+        const int stored_value = std::stoi(it->second);
+        if (config.explicit_semantic_flags.count(key)) {
+            if (config.*field != stored_value) {
+                std::ostringstream fork;
+                fork << key << ": checkpoint=" << stored_value
+                     << " -> explicit CLI=" << (config.*field);
+                forks.push_back(fork.str());
+            }
+        } else {
+            config.*field = stored_value;
+        }
+    };
+    auto reconcile_int64 = [&](const char* key, int64_t TrainConfig::* field) {
+        const auto it = stored.find(key);
+        if (it == stored.end()) return;
+        const int64_t stored_value = std::stoll(it->second);
+        if (config.explicit_semantic_flags.count(key)) {
+            if (config.*field != stored_value) {
+                std::ostringstream fork;
+                fork << key << ": checkpoint=" << stored_value
+                     << " -> explicit CLI=" << (config.*field);
+                forks.push_back(fork.str());
+            }
+        } else {
+            config.*field = stored_value;
+        }
+    };
+    auto reconcile_double = [&](const char* key, double TrainConfig::* field) {
+        const auto it = stored.find(key);
+        if (it == stored.end()) return;
+        const double stored_value = std::stod(it->second);
+        if (config.explicit_semantic_flags.count(key)) {
+            if (std::abs(config.*field - stored_value) > 1e-9) {
+                std::ostringstream fork;
+                fork << key << ": checkpoint=" << stored_value
+                     << " -> explicit CLI=" << (config.*field);
+                forks.push_back(fork.str());
+            }
+        } else {
+            config.*field = stored_value;
+        }
+    };
+    /* v7 Stage 0 item 0.1+0.3: same shape as the numeric reconcilers above, serialized as the
+       literal tokens "true"/"false" (matching every bool this file already writes into JSON -
+       write_result/write_config/etc.) rather than "0"/"1", so a hand-read manifest string is
+       unambiguous. temperature_anneal is currently the only bool semantic field. */
+    auto reconcile_bool = [&](const char* key, bool TrainConfig::* field) {
+        const auto it = stored.find(key);
+        if (it == stored.end()) return;
+        const bool stored_value = it->second == "true";
+        if (config.explicit_semantic_flags.count(key)) {
+            if (config.*field != stored_value) {
+                std::ostringstream fork;
+                fork << key << ": checkpoint=" << (stored_value ? "true" : "false")
+                     << " -> explicit CLI=" << (config.*field ? "true" : "false");
+                forks.push_back(fork.str());
+            }
+        } else {
+            config.*field = stored_value;
+        }
+    };
+    /* v7 Stage-1 IL: same shape as the reconcilers above, for a std::string semantic field
+       (teacher_agents - currently the only one). The stored value is a comma-separated roster
+       token that never contains a ';' or '=' (the parse_key_value delimiters), so it round-trips
+       through the manifest string verbatim; an exact string compare is the right divergence test
+       for a categorical roster (no float slack, unlike reconcile_double). */
+    auto reconcile_string = [&](const char* key, std::string TrainConfig::* field) {
+        const auto it = stored.find(key);
+        if (it == stored.end()) return;
+        const std::string& stored_value = it->second;
+        if (config.explicit_semantic_flags.count(key)) {
+            if (config.*field != stored_value) {
+                std::ostringstream fork;
+                fork << key << ": checkpoint=" << stored_value
+                     << " -> explicit CLI=" << (config.*field);
+                forks.push_back(fork.str());
+            }
+        } else {
+            config.*field = stored_value;
+        }
+    };
+    reconcile_int("flame_duration", &TrainConfig::flame_duration);
+    reconcile_int("sudden_death_start", &TrainConfig::sudden_death_start);
+    reconcile_int("shrink_interval", &TrainConfig::shrink_interval);
+    reconcile_double("timeout_draw_value", &TrainConfig::timeout_draw_value);
+    reconcile_double("mutual_death_value", &TrainConfig::mutual_death_value);
+    reconcile_double("arena_crush_win_value", &TrainConfig::arena_crush_win_value);
+    reconcile_double("selfkill_win_value", &TrainConfig::selfkill_win_value);
+    reconcile_double("league_heuristic_fraction", &TrainConfig::league_heuristic_fraction);
+    reconcile_double("c_puct", &TrainConfig::c_puct);
+    reconcile_double("dirichlet_alpha", &TrainConfig::dirichlet_alpha);
+    reconcile_double("dirichlet_fraction", &TrainConfig::dirichlet_fraction);
+    /* v7 Stage 0 item 0.2: forced_playouts_k did not exist before this manifest schema
+       addition - same situation as temperature_final/temperature_anneal and
+       replay_cause_balance_cap above. The generic absent-key handling in reconcile_double
+       already does the right thing behaviorally (config is left at whatever CLI parsing
+       resolved - forced_playouts_k=0.0 unless explicitly overridden), but stays silent; this
+       gets the same one-line NOTE those additions did. Inheriting 0.0 is faithful, not a
+       substitution: it reproduces the unforced root-selection behavior this checkpoint was
+       actually trained under. */
+    if (!stored.count("forced_playouts_k"))
+        std::cerr << "NOTE - checkpoint manifest predates forced_playouts_k (v7 Stage 0 item "
+                     "0.2); inheriting the compiled default 0.0 (off), which reproduces the "
+                     "unforced root-selection behavior this checkpoint was trained under.\n";
+    reconcile_double("forced_playouts_k", &TrainConfig::forced_playouts_k);
+    /* v7 Stage 0 item 0.4 (SEARCH-CONTEMPT PROTOTYPE): search_contempt_nscl did not exist before
+       this manifest schema addition - same situation as forced_playouts_k's own addition
+       directly above. Inheriting 0 (off) is faithful, not a substitution: no training call site
+       ever sets contempt_seat (see SearchConstraint::contempt_seat's own doc comment), so this
+       checkpoint was never trained under anything else regardless of this field's value. */
+    if (!stored.count("search_contempt_nscl"))
+        std::cerr << "NOTE - checkpoint manifest predates search_contempt_nscl (v7 Stage 0 item "
+                     "0.4); inheriting the compiled default 0 (off).\n";
+    reconcile_int("search_contempt_nscl", &TrainConfig::search_contempt_nscl);
+    reconcile_double("temperature", &TrainConfig::temperature);
+    reconcile_int("temperature_steps", &TrainConfig::temperature_steps);
+    /* v7 Stage 0 item 0.1+0.3: temperature_final/temperature_anneal did not exist before this
+       manifest schema addition, so - exactly like replay_cause_balance_cap's own addition
+       above - a checkpoint saved earlier has a fully valid, modern manifest that simply lacks
+       these two keys. The generic absent-key handling in reconcile_double/reconcile_bool
+       already does the right thing behaviorally (config is left at whatever CLI parsing
+       resolved - temperature_final=0.0, temperature_anneal=false unless explicitly overridden)
+       but stays silent; one combined NOTE covers both keys since they were added together in
+       the same schema change. Inheriting anneal=false is faithful, not a substitution: it
+       reproduces the OLD step-function temperature() behavior bit for bit, the only behavior
+       such a checkpoint was ever trained under. */
+    if (!stored.count("temperature_anneal"))
+        std::cerr << "NOTE - checkpoint manifest predates temperature_final/temperature_anneal "
+                     "(v7 Stage 0 item 0.1+0.3); inheriting the compiled defaults "
+                     "(temperature_final=0.0, temperature_anneal=false), which reproduce the "
+                     "step-function temperature behavior this checkpoint was trained under.\n";
+    reconcile_double("temperature_final", &TrainConfig::temperature_final);
+    reconcile_bool("temperature_anneal", &TrainConfig::temperature_anneal);
+    reconcile_double("learning_rate", &TrainConfig::learning_rate);
+    reconcile_double("min_learning_rate", &TrainConfig::min_learning_rate);
+    reconcile_int64("learning_rate_schedule_start_update",
+                    &TrainConfig::learning_rate_schedule_start_update);
+    reconcile_int64("learning_rate_schedule_updates",
+                    &TrainConfig::learning_rate_schedule_updates);
+    reconcile_int("seed", &TrainConfig::seed);
+    /* KL-105 Phase 3: replay_cause_balance_cap did not exist before this manifest schema
+       addition, so a checkpoint saved earlier has a fully valid, modern (post-KL-101) manifest
+       string that simply lacks this one key - a different situation from "predates the whole
+       manifest" (legacy_accept_unverified_semantics, handled entirely separately and much
+       louder) and from every other field's absent-key case (which, for fields that have
+       existed since KL-101, would mean a corrupt/truncated manifest, not an expected event).
+       reconcile_double's generic absent-key handling already does the right thing behaviorally
+       (config.replay_cause_balance_cap is left at whatever CLI parsing already resolved -
+       0.0 unless explicitly overridden), but stays silent; this is exactly the field where
+       "absent" is the COMMON case for a long transition period (every checkpoint saved before
+       this change), so it gets its own one-line note instead of reconcile_double's silence -
+       inheriting 0.0 is faithful, not a substitution, because cap=0.0 is the only sampling
+       behavior that has ever existed for such a checkpoint. */
+    if (!stored.count("replay_cause_balance_cap"))
+        std::cerr << "NOTE - checkpoint manifest predates replay_cause_balance_cap (KL-105 "
+                     "Phase 3); inheriting the compiled default 0.0 (off), which is exactly "
+                     "the sampling behavior this checkpoint was trained under.\n";
+    reconcile_double("replay_cause_balance_cap", &TrainConfig::replay_cause_balance_cap);
+    /* v7 Stage-1 IL: teacher_agents did not exist before this manifest schema addition - same
+       situation as forced_playouts_k / temperature_final / replay_cause_balance_cap above. The
+       generic absent-key handling in reconcile_string already does the right thing behaviorally
+       (config is left at whatever CLI parsing resolved - the compiled default "heuristic" unless
+       explicitly overridden), but stays silent; this gets the same one-line NOTE those additions
+       did. Inheriting "heuristic" is faithful, not a substitution: v7 Stage 1 IS the feature that
+       introduced a configurable roster, so any checkpoint whose manifest predates this key was
+       necessarily trained under the compiled teacher behavior, and "heuristic" is that compiled
+       default. */
+    if (!stored.count("teacher_agents"))
+        std::cerr << "NOTE - checkpoint manifest predates teacher_agents (v7 Stage 1); inheriting "
+                     "the compiled default \"heuristic\", the teacher roster this checkpoint was "
+                     "trained under.\n";
+    reconcile_string("teacher_agents", &TrainConfig::teacher_agents);
+    /* v7 Stage-1 IL Bombing-Collapse guards: policy_entropy_bonus / value_only_iterations did
+       not exist before this manifest schema addition - same situation as forced_playouts_k /
+       teacher_agents above. reconcile_double/reconcile_int's generic absent-key handling already
+       does the right thing behaviorally (config is left at whatever CLI parsing resolved - the
+       compiled defaults 0.0 / 0, both "off"), but stays silent; one combined NOTE covers both
+       keys since they were added together in the same schema change. Inheriting the defaults is
+       faithful, not a substitution: off reproduces exactly the ce+value loss (no entropy floor,
+       policy active from iteration 0) this checkpoint was trained under. */
+    if (!stored.count("policy_entropy_bonus"))
+        std::cerr << "NOTE - checkpoint manifest predates policy_entropy_bonus/"
+                     "value_only_iterations (v7 Stage 1 Bombing-Collapse guards); inheriting the "
+                     "compiled defaults (policy_entropy_bonus=0.0, value_only_iterations=0, both "
+                     "off), which reproduce the ce+value loss this checkpoint was trained under.\n";
+    reconcile_double("policy_entropy_bonus", &TrainConfig::policy_entropy_bonus);
+    reconcile_int("value_only_iterations", &TrainConfig::value_only_iterations);
+    return forks;
+}
+
+std::string json_escape(std::string_view value) {
+    std::string result;
+    for (const char character : value) {
+        if (character == '\\' || character == '"') result.push_back('\\');
+        result.push_back(character);
+    }
+    return result;
+}
+
+std::string utc_timestamp() {
+    const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    std::tm utc_time{};
+#ifdef _WIN32
+    gmtime_s(&utc_time, &now);
+#else
+    gmtime_r(&now, &utc_time);
+#endif
+    std::ostringstream output;
+    output << std::put_time(&utc_time, "%Y-%m-%dT%H:%M:%SZ");
+    return output.str();
+}
+
+std::vector<std::string> invocation_arguments(int argc, char** argv) {
+    std::vector<std::string> result;
+    result.reserve(static_cast<size_t>(argc));
+    for (int index = 0; index < argc; ++index) result.emplace_back(argv[index]);
+    return result;
+}
+
+template <typename T>
+T parse_number(int argc, char** argv, int first, const std::string& option, T fallback) {
+    for (int index = first; index < argc; ++index) {
+        if (argv[index] == option) {
+            if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
+                throw std::invalid_argument("missing value for " + option);
+            std::istringstream input(argv[index + 1]);
+            T result{};
+            input >> result;
+            if (!input || !input.eof()) throw std::invalid_argument("invalid value for " + option);
+            return result;
+        }
+    }
+    return fallback;
+}
+
+std::string parse_string(int argc, char** argv, int first, const std::string& option,
+                         std::string fallback) {
+    for (int index = first; index < argc; ++index) {
+        if (argv[index] == option) {
+            if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
+                throw std::invalid_argument("missing value for " + option);
+            return argv[index + 1];
+        }
+    }
+    return fallback;
+}
+
+bool has_flag(int argc, char** argv, int first, const std::string& option) {
+    for (int index = first; index < argc; ++index)
+        if (argv[index] == option) return true;
+    return false;
+}
+
+void validate_train_cli_options(int argc, char** argv, int first) {
+    static const std::set<std::string_view> value_options = {
+        "--run-dir", "--checkpoint", "--output", "--per-match-output", "--trace-output",
+        "--replay-out", "--replay-incumbent", "--incumbent-eval-games", "--width",
+        "--height", "--max-steps", "--crate-density", "--flame-duration",
+        "--sudden-death-start", "--shrink-interval", "--iterations", "--games",
+        "--simulations", "--train-steps", "--batch-size", "--replay-capacity",
+        "--channels", "--blocks", "--teacher-games", "--teacher-iterations",
+        "--teacher-agents", "--teacher-threads",
+        "--eval-interval", "--eval-games", "--eval-simulations", "--promotion-games",
+        "--promotion-simulations", "--mcts-eval-interval", "--mcts-eval-games",
+        "--baseline-mcts-simulations", "--baseline-mcts-depth", "--eval-seed-base",
+        "--promotion-seed-base", "--mcts-eval-seed-base", "--snapshot-interval",
+        "--temperature-steps", "--seed", "--learning-rate", "--min-learning-rate",
+        "--lr-schedule-start-update", "--lr-schedule-updates", "--weight-decay",
+        "--c-puct", "--dirichlet-alpha", "--dirichlet-fraction", "--temperature",
+        "--bootstrap-weight", "--bootstrap-iterations", "--draw-value",
+        "--timeout-draw-value", "--mutual-death-value", "--arena-crush-win-value",
+        "--selfkill-win-value", "--league-heuristic-fraction", "--promotion-margin",
+        "--promotion-confidence-z", "--random-score-floor", "--heuristic-score-floor",
+        "--heuristic-regression-margin", "--fork-from", "--dirty-diff-digest",
+        "--gates-agent", "--gates-opponent-model", "--replay-cause-balance-cap",
+        "--temperature-final", "--forced-playouts-k", "--search-contempt-nscl",
+        "--policy-entropy-bonus", "--value-only-iterations",
+    };
+    static const std::set<std::string_view> flag_options = {
+        "--fresh", "--no-progress", "--eval-mcts", "--overwrite-evidence",
+        "--legacy-accept-unverified-semantics", "--fork-reset-champion",
+        "--temperature-anneal", "--gates-search-contempt",
+    };
+    for (int index = first; index < argc; ++index) {
+        const std::string_view option(argv[index]);
+        if (flag_options.count(option)) continue;
+        if (!value_options.count(option))
+            throw std::invalid_argument("unknown native AlphaZero option: " +
+                                        std::string(option));
+        if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
+            throw std::invalid_argument("missing value for " + std::string(option));
+        ++index;
+    }
+}
+
+/* Forward declaration: parse_teacher_agents is defined below (after parse_gate_agent_name, whose
+   whitelist it reuses), but validate_config - which fails closed on a bad roster at startup -
+   comes first. */
+std::vector<AgentType> parse_teacher_agents(const std::string& raw);
+
+void validate_config(const TrainConfig& config) {
+    if (config.width < 5 || config.width > 31 || config.width % 2 == 0 ||
+        config.height < 5 || config.height > 31 || config.height % 2 == 0)
+        throw std::invalid_argument("map dimensions must be odd values from 5 through 31");
+    if (config.iterations < 0 || config.self_play_games <= 0 || config.simulations <= 0 ||
+        config.train_steps < 0 || config.batch_size <= 0 || config.replay_capacity <= 0 ||
+        config.channels <= 0 || config.residual_blocks <= 0 || config.max_steps <= 0 ||
+        config.flame_duration <= 0 ||
+        config.evaluation_interval <= 0 || config.evaluation_games <= 0 ||
+        config.evaluation_simulations <= 0 || config.mcts_evaluation_interval <= 0 ||
+        config.mcts_evaluation_games <= 0 || config.promotion_games <= 0 ||
+        config.promotion_simulations <= 0 || config.baseline_mcts_simulations <= 0 ||
+        config.baseline_mcts_depth <= 0 || config.baseline_mcts_depth > 24 ||
+        config.snapshot_interval <= 0)
+        throw std::invalid_argument("training counts and model dimensions must be positive");
+    if (config.crate_density < 0 || config.crate_density > 100)
+        throw std::invalid_argument("crate density must be from 0 through 100");
+    if (config.timeout_draw_value < -1.0 || config.timeout_draw_value > 0.0 ||
+        config.mutual_death_value < -1.0 || config.mutual_death_value > 0.0)
+        throw std::invalid_argument("draw value targets must lie in [-1, 0]");
+    if (config.arena_crush_win_value <= 0.0 || config.arena_crush_win_value > 1.0 ||
+        config.selfkill_win_value <= 0.0 || config.selfkill_win_value > 1.0)
+        throw std::invalid_argument("arena crush / selfkill win values must lie in (0, 1]");
+    if (config.league_heuristic_fraction < 0.0 || config.league_heuristic_fraction > 1.0)
+        throw std::invalid_argument("league heuristic fraction must lie in [0, 1]");
+    if (config.replay_cause_balance_cap < 0.0 || config.replay_cause_balance_cap > 0.9)
+        throw std::invalid_argument("replay cause-balance cap must lie in [0, 0.9]");
+    /* v7 Stage-1 IL: the teacher roster must parse (every comma-separated name in the strict
+       whitelist, at least one entry) even when this run never collects a teacher game - a typo
+       or empty string is a semantic-field mistake that must fail closed at startup, not surface
+       mid-run. parse_teacher_agents throws a listing-valid-names message; the result is discarded
+       here (collect_teacher rebuilds the live roster when it actually runs). */
+    parse_teacher_agents(config.teacher_agents);
+    /* v7 Stage-1 IL (D3): teacher_threads is an OpenMP thread COUNT, so negative is meaningless;
+       256 is a generous upper bound (well above any real machine's core count this project runs
+       on) wide enough to catch an obvious typo/unit confusion while never constraining a real
+       run. This range check is what collect_teacher's `resolved_teacher_threads` (0 -> auto,
+       N -> exactly N) can rely on without a second bounds check of its own - see
+       TrainConfig::teacher_threads in trainer.h for why the field itself is deliberately kept
+       OUT of the semantic manifest despite being validated here just like every other field in
+       this function. */
+    if (config.teacher_threads < 0 || config.teacher_threads > 256)
+        throw std::invalid_argument("teacher-threads must lie in [0, 256]");
+    /* v7 Stage 0 item 0.2: forced_playouts_k is a multiplier inside a sqrt(k*P*N) visit floor
+       (BatchedMcts::select_joint_root_forced), so negative is meaningless; 10 is a generous
+       upper bound (KataGo's own k~=2 default) wide enough for experimentation while still
+       catching an obvious typo/unit confusion (e.g. a value meant for a different knob). */
+    if (config.forced_playouts_k < 0.0 || config.forced_playouts_k > 10.0)
+        throw std::invalid_argument("forced-playouts-k must lie in [0, 10]");
+    /* v7 Stage 0 item 0.4 (SEARCH-CONTEMPT PROTOTYPE): search_contempt_nscl is a per-node visit
+       threshold (BatchedMcts::select_joint_contempt), so negative is meaningless; 10000 is a
+       generous upper bound - well above any simulation budget this project runs (baseline MCTS
+       tops out at baseline_mcts_simulations, itself unbounded but never run anywhere near
+       10000 in practice) - wide enough for experimentation while still catching an obvious
+       typo/unit confusion. */
+    if (config.search_contempt_nscl < 0 || config.search_contempt_nscl > 10000)
+        throw std::invalid_argument("search-contempt-nscl must lie in [0, 10000]");
+    /* v7 Stage 0 item 0.1+0.3: temperature_final must be a valid endpoint for the linear anneal
+       to land on - below 0 is not a probability-like temperature, above `temperature` would be
+       annealing UP, not down. temperature_anneal's linear fraction (resolve_temperature() in
+       this file) divides by temperature_steps, so annealing requires a positive span; a
+       zero-length anneal (temperature_steps<=0) has no defined meaning and is rejected instead
+       of silently degenerating. */
+    if (config.temperature_final < 0.0 || config.temperature_final > config.temperature)
+        throw std::invalid_argument("temperature-final must lie in [0, temperature]");
+    if (config.temperature_anneal && config.temperature_steps <= 0)
+        throw std::invalid_argument("temperature-anneal requires temperature-steps > 0");
+    /* v7 Stage-1 IL Bombing-Collapse guards: policy_entropy_bonus scales an entropy bonus
+       SUBTRACTED from the policy CE; negative would penalize entropy (collapse harder, the
+       opposite of the guard's purpose) and 0.5 is already a generous upper bound relative to a
+       CE loss on kActions logits (Meisheri et al.'s floor is ~1e-2), wide enough for
+       experimentation while catching an obvious typo. value_only_iterations is an iteration
+       count (0-based window, like teacher_iterations), so negative is meaningless and 10000 is a
+       generous upper bound - well above any real bootstrap horizon this project runs. */
+    if (config.policy_entropy_bonus < 0.0 || config.policy_entropy_bonus > 0.5)
+        throw std::invalid_argument("policy-entropy-bonus must lie in [0, 0.5]");
+    if (config.value_only_iterations < 0 || config.value_only_iterations > 10000)
+        throw std::invalid_argument("value-only-iterations must lie in [0, 10000]");
+    if (config.gates_opponent_model != "self" && config.gates_opponent_model != "aligned")
+        throw std::invalid_argument(
+            "--gates-opponent-model must be 'self' or 'aligned', got '" +
+            config.gates_opponent_model + "'");
+    if (config.learning_rate <= 0.0 || config.min_learning_rate <= 0.0 ||
+        config.min_learning_rate > config.learning_rate)
+        throw std::invalid_argument("learning rates are invalid");
+    if (config.learning_rate_schedule_start_update < 0 ||
+        config.learning_rate_schedule_updates < 0)
+        throw std::invalid_argument("learning-rate schedule updates cannot be negative");
+    if (!config.fork_from.empty() && !config.fresh)
+        throw std::invalid_argument(
+            "--fork-from requires --fresh (a fork establishes a new lineage/run-dir, "
+            "it is not an ordinary resume)");
+    if (config.fork_reset_champion && config.fork_from.empty())
+        throw std::invalid_argument(
+            "--fork-reset-champion is only meaningful at fork time (--fresh --fork-from); "
+            "on a resume it would mean rewriting an existing lineage's champion history, "
+            "which is exactly what the champion-consistency checks exist to prevent");
+    if (config.promotion_margin < 0.0 || config.promotion_margin >= 0.5 ||
+        config.promotion_confidence_z < 0.0 || config.random_score_floor < 0.0 ||
+        config.random_score_floor > 1.0 || config.heuristic_score_floor < 0.0 ||
+        config.heuristic_score_floor > 1.0 || config.heuristic_regression_margin < 0.0 ||
+        config.heuristic_regression_margin > 1.0)
+        throw std::invalid_argument("promotion gate values are invalid");
+    const auto overlaps = [](uint64_t first_base, int first_count,
+                             uint64_t second_base, int second_count) {
+        const uint64_t first_end = first_base + static_cast<uint64_t>(first_count);
+        const uint64_t second_end = second_base + static_cast<uint64_t>(second_count);
+        return first_base < second_end && second_base < first_end;
+    };
+    if (overlaps(config.evaluation_seed_base, config.evaluation_games,
+                 config.promotion_seed_base, config.promotion_games) ||
+        overlaps(config.evaluation_seed_base, config.evaluation_games,
+                 config.mcts_evaluation_seed_base, config.mcts_evaluation_games) ||
+        overlaps(config.promotion_seed_base, config.promotion_games,
+                 config.mcts_evaluation_seed_base, config.mcts_evaluation_games))
+        throw std::invalid_argument("evaluation, promotion, and MCTS seed blocks overlap");
+}
+
+/* ============================================================================================
+   KL-105 Phase 2b: deterministic tactical gates ("gates" subcommand).
+
+   Six hand-constructed scenarios probe specific tactical competencies (bomb-and-escape,
+   corridor-clear, trap, chase, flame-timing, stall-break) directly, independent of any
+   training run's self-play statistics. Every scenario is built on the SAME crate_density=0
+   lattice env_reset() already produces - border walls plus a solid-wall pillar at every
+   internal (even x, even y) intersection, see map_generate() in src/env/bomber_map.c - with a
+   handful of hand-placed crates/walls layered on top; nothing here fights the generated
+   lattice. All coordinates below assume the project's standard 13x11 board (width=13,
+   height=11 - the TrainConfig/config_battle default, and the only size any of this project's
+   real checkpoints can load under, since width/height are part of the checkpoint ABI signature
+   checked at load time). Learner is always seat 0. */
+
+enum class GateOpponentMode { kNone, kConstant, kAgent };
+enum class GateLearnerMode { kSearch, kRaw, kAgent };
+
+struct GateScenarioSpec {
+    std::string name;
+    int k_steps{};
+    std::function<void(BomberEnv&)> build;
+    GateOpponentMode opponent_mode{GateOpponentMode::kNone};
+    Action opponent_constant_action{ACTION_WAIT};
+    AgentType opponent_agent_type{AGENT_RANDOM};
+    /* Evaluated on the state AFTER each step (post env_step_joint). */
+    std::function<bool(const BomberEnv&)> pass_predicate;
+};
+
+/* KL-110 Phase B: per-step search telemetry recorded in gates evidence, search modes only (both
+   "self" and "aligned" opponent models - never raw or agent mode, which never call
+   BatchedMcts::search at all). prior_after_safety_mask_marginal/visit_marginal/root_q are the
+   LEARNER seat's (seat 0 - the gates learner is always seat 0) marginals via
+   marginal_distribution() - same "already safety-masked, not the raw policy head; a search
+   backup average, not raw value head output" caveat the KL-107 evaluate trace already carries
+   for its own identically-derived fields, hence the identical field name
+   prior_after_safety_mask_marginal (this project has a history of mislabeled "raw" priors - see
+   the Trace-language rule). opp_visit_marginal is the OPPONENT seat's (seat 1) visit marginal -
+   in "aligned" mode with fixed_opponent_action>=0 this must be a one-hot spike on that action
+   (asserted by the gates CI check); in "self" mode it is the search's ordinary unconstrained
+   marginal for whatever the network would do as seat 1. */
+struct GateStepRecord {
+    int step{};
+    int chosen{};
+    int opponent_executed_action{};
+    std::array<double, kActions> prior_after_safety_mask_marginal{};
+    std::array<double, kActions> visit_marginal{};
+    std::array<double, kActions> root_q{};
+    std::array<double, kActions> opp_visit_marginal{};
+};
+
+struct GateResult {
+    bool passed{};
+    int steps_used{};
+    std::string terminal{};
+    std::string note{};
+    /* Populated only for GateLearnerMode::kSearch (both opponent models); stays empty/0 for
+       kRaw and kAgent, neither of which ever calls BatchedMcts::search. */
+    std::vector<GateStepRecord> steps{};
+    int fixed_opponent_internal_violations{};
+};
+
+/* v7 Stage 0 item 0.5 (docs/experiment-memory/14-v7-from-scratch-design.md): "the drift
+   canary" - aggregates one run_gate_canary() pass (all six scenarios, search mode only)
+   into exactly what metrics.jsonl records: how many of the six passed, the trap scenario's
+   step-0 BOMB prior (the H3a starvation signal - see doc 14 section 1 item 3, "truthful
+   opponent model instantly restores the trap kill wherever BOMB prior >= ~0.10, starved
+   below ~0.08"), and a per-scenario pass/fail breakdown. Declared here (anonymous namespace,
+   alongside its sibling GateResult) rather than nested in Trainer::Impl because
+   append_metrics() - which needs this type complete - is declared far EARLIER in the Impl
+   class body than run_gate_canary() itself; every type used across Impl member function
+   signatures in this file follows the same "declare in the anonymous namespace before Impl
+   begins" convention for exactly this reason. */
+struct GateCanaryResult {
+    int passed_search{};
+    double trap_bomb_prior_step0{};
+    std::vector<std::pair<std::string, bool>> per_scenario;
+};
+
+/* Human-readable label for env_step_joint's own terminal classification. rules_check_terminal
+   is always evaluated from seat 0 - the learner's - perspective (src/env/bomber_rules.c), so
+   TERMINAL_WIN means the learner won and TERMINAL_AGENT_DEAD means the learner itself died.
+   Only used when a scenario's pass_predicate did NOT already fire on the same step - the
+   runner checks pass_predicate first, so e.g. scenario 3's opponent death is reported as
+   "pass," not this generic terminal label, even though it is simultaneously TERMINAL_WIN. */
+const char* gate_terminal_label(TerminalReason reason) {
+    switch (reason) {
+        case TERMINAL_NONE: return "none";
+        case TERMINAL_AGENT_DEAD: return "learner_dead";
+        case TERMINAL_ENEMY_DEAD: return "opponent_dead";
+        case TERMINAL_WIN: return "learner_win";
+        case TERMINAL_LOSS: return "learner_loss";
+        case TERMINAL_DRAW: return "mutual_death";
+        case TERMINAL_TIMEOUT: return "timeout";
+        default: return "unknown";
+    }
+}
+
+/* Explicit whitelist rather than delegating to agent_parse_type() directly: that helper
+   silently maps any unrecognized name to AGENT_RANDOM (src/agents/agent.c) - exactly the kind
+   of silent-wrong-value failure this codebase otherwise fails loudly on (KL-101 discipline).
+   --gates-agent is a deliberate, named choice; a typo must be rejected, not quietly become
+   "random." */
+AgentType parse_gate_agent_name(const std::string& name) {
+    static const std::vector<std::pair<std::string, AgentType>> known = {
+        {"random", AGENT_RANDOM}, {"scripted", AGENT_SCRIPTED},
+        {"heuristic", AGENT_HEURISTIC}, {"greedy", AGENT_GREEDY_CRATE},
+        {"greedy_crate", AGENT_GREEDY_CRATE}, {"enemy", AGENT_ENEMY_BOT},
+        {"enemy-bot", AGENT_ENEMY_BOT}, {"enemy_bot", AGENT_ENEMY_BOT},
+        {"external", AGENT_EXTERNAL}, {"alphabeta", AGENT_ALPHABETA},
+        {"alpha-beta", AGENT_ALPHABETA}, {"mcts", AGENT_MCTS},
+        {"evasive", AGENT_EVASIVE}, {"survivor", AGENT_EVASIVE},
+    };
+    for (const auto& [candidate, type] : known)
+        if (candidate == name) return type;
+    throw std::runtime_error(
+        "unknown --gates-agent '" + name + "'; known names: random, scripted, heuristic, "
+        "greedy (or greedy_crate), enemy-bot (or enemy/enemy_bot), external, alpha-beta (or "
+        "alphabeta), mcts, evasive (or survivor)");
+}
+
+/* v7 Stage-1 IL: parse config.teacher_agents (comma-separated) into the expert roster
+   collect_teacher() draws BOTH seats from. Same strict-whitelist discipline as
+   parse_gate_agent_name above (which it delegates each token to, so the two can never drift on
+   valid names) - an empty roster or any name that helper rejects throws a --teacher-agents-
+   specific message rather than silently falling back to AGENT_RANDOM the way agent_parse_type
+   would. Called at startup by validate_config (fail closed on a typo) and again by
+   collect_teacher (build the live roster). */
+std::vector<AgentType> parse_teacher_agents(const std::string& raw) {
+    std::vector<AgentType> roster;
+    std::istringstream stream(raw);
+    std::string token;
+    while (std::getline(stream, token, ',')) {
+        /* Trim surrounding whitespace so "mcts, heuristic" works as a user plainly intends,
+           and name an empty segment (double/trailing comma) for what it is - otherwise the
+           error would quote a confusing ' heuristic' or '' as the unknown name. */
+        token.erase(0, token.find_first_not_of(" \t\r\n"));
+        token.erase(token.find_last_not_of(" \t\r\n") + 1);
+        if (token.empty())
+            throw std::invalid_argument(
+                "--teacher-agents: empty segment (double or trailing comma) in the roster");
+        try {
+            roster.push_back(parse_gate_agent_name(token));
+        } catch (const std::exception&) {
+            throw std::invalid_argument(
+                "unknown --teacher-agents name '" + token + "'; known names: random, scripted, "
+                "heuristic, greedy (or greedy_crate), enemy-bot (or enemy/enemy_bot), external, "
+                "alpha-beta (or alphabeta), mcts, evasive (or survivor)");
+        }
+    }
+    if (roster.empty())
+        throw std::invalid_argument(
+            "--teacher-agents must list at least one agent name (comma-separated, e.g. "
+            "\"mcts,heuristic\"); got an empty roster");
+    return roster;
+}
+
+/* KL-110 Phase B: builds the SearchConstraint run_gate_scenario's kSearch branch hands to
+   BatchedMcts::search for one step of one scenario. "self" (config.gates_opponent_model, the
+   default) reproduces exactly today's uniform self-model - {-1, AGENT_RANDOM, seed} - unchanged
+   regardless of the scenario's real opponent_mode. "aligned" instead fixes seat 1 (the fixed
+   seat; the gates learner is ALWAYS seat 0) to match the scenario's real opponent this step:
+     - kNone:     the real opponent is fed ACTION_WAIT every step (see run_gate_scenario) -
+                  fixed_opponent_action pins that EXACT action, action-exact alignment.
+     - kConstant: the real opponent is fed opponent_constant_action every step - same
+                  action-exact treatment, just a different fixed action.
+     - kAgent:    the real opponent is a live, possibly-stateful/RNG-driven scripted Agent
+                  (agent_act via env_observe/env_get_debug_snapshot) - there is no single fixed
+                  action to pin in advance, so this only aligns the search's per-node baseline
+                  TYPE (fixed_opponent_type = the scenario's real AgentType, fixed_opponent_action
+                  stays -1, existing baseline_action() path) - a stateless per-node
+                  recomputation, not a reproduction of the rollout agent's own state/RNG
+                  trajectory. This asymmetry is exactly why doc 13's alignment-kind label
+                  distinguishes "action_exact" (kNone/kConstant) from "type_aligned" (kAgent) -
+                  see gate_opponent_alignment_kind() below.
+
+   v7 Stage 0 item 0.4 (SEARCH-CONTEMPT PROTOTYPE): gates_search_contempt (--gates-search-
+   contempt, default false) sets contempt_seat=1 (the scenario opponent; the gates learner is
+   ALWAYS seat 0) on the returned constraint, INDEPENDENTLY of the self/aligned branch above -
+   composing with gates_opponent_model rather than being exclusive to either: under "self" this
+   is the interesting case (freezes the self-model's seat-1 PUCT adaptation past
+   config.search_contempt_nscl visits per node); under "aligned" it is a documented no-op
+   (fixed_opponent_seat==1 already one-hots seat 1's policy to a single fixed action at every
+   node - see SearchConstraint::fixed_opponent_action's doc comment - so seat 1's marginal visit
+   distribution is already a point mass regardless of whether contempt snapshots it). false
+   (default) leaves contempt_seat at -1 (off) on both branches - unchanged from before this
+   parameter existed. */
+SearchConstraint gate_search_constraint(const std::string& gates_opponent_model,
+                                        GateOpponentMode opponent_mode,
+                                        Action opponent_constant_action,
+                                        AgentType opponent_agent_type, uint64_t seed,
+                                        bool gates_search_contempt) {
+    if (gates_opponent_model != "aligned") {
+        SearchConstraint constraint{-1, AGENT_RANDOM, seed};
+        constraint.contempt_seat = gates_search_contempt ? 1 : -1;
+        return constraint;
+    }
+    SearchConstraint constraint;
+    constraint.fixed_opponent_seat = 1;
+    constraint.opponent_seed = seed;
+    switch (opponent_mode) {
+        case GateOpponentMode::kNone:
+            constraint.fixed_opponent_type = AGENT_RANDOM;
+            constraint.fixed_opponent_action = static_cast<int>(ACTION_WAIT);
+            break;
+        case GateOpponentMode::kConstant:
+            constraint.fixed_opponent_type = AGENT_RANDOM;
+            constraint.fixed_opponent_action = static_cast<int>(opponent_constant_action);
+            break;
+        case GateOpponentMode::kAgent:
+            constraint.fixed_opponent_type = opponent_agent_type;
+            constraint.fixed_opponent_action = -1;
+            break;
+    }
+    if (constraint.fixed_opponent_action < -1 || constraint.fixed_opponent_action >= kActions)
+        throw std::runtime_error("gates: aligned fixed_opponent_action out of range");
+    constraint.contempt_seat = gates_search_contempt ? 1 : -1;
+    return constraint;
+}
+
+/* KL-110 Phase B, reviewer-mandated distinction (doc 13 amendment): NONE/CONSTANT aligned
+   modeling pins the search's opponent to the EXACT action the scenario actually feeds it
+   ("action_exact") - a genuine reproduction, not an approximation. AGENT aligned modeling can
+   only match the opponent's TYPE ("type_aligned") - search recomputes a stateless per-node
+   baseline_action() call, while the real rollout agent carries its own persistent state/RNG
+   across steps (agent_reset once, then agent_act repeatedly) - so it is aligned in kind, not in
+   the exact action a stateful agent might take from accumulated history. "self" mode is neither -
+   the search does not attempt to match the real opponent at all. */
+const char* gate_opponent_alignment_kind(const std::string& gates_opponent_model,
+                                         GateOpponentMode opponent_mode) {
+    if (gates_opponent_model != "aligned") return "self";
+    return opponent_mode == GateOpponentMode::kAgent ? "type_aligned" : "action_exact";
+}
+
+/* Defensive sanity check on a hand-built scenario, run immediately after construction (before
+   any search/agent decision touches it) - catches a mis-keyed tile coordinate or an agent
+   accidentally parked on a wall/crate loudly and immediately, rather than producing a
+   confusing downstream rejected-move/invalid-action symptom many steps later. This IS the
+   "construction-validity assertion" doc 13 section 2 calls for. */
+void validate_gate_scenario_construction(const BomberEnv& env, const std::string& name) {
+    const BomberState& state = env.state;
+    if (state.agent_count != 2)
+        throw std::runtime_error("gates scenario '" + name + "': expected agent_count==2");
+    for (int seat = 0; seat < 2; ++seat) {
+        const auto& agent = state.agents[seat];
+        if (!agent.alive)
+            throw std::runtime_error("gates scenario '" + name + "': seat " +
+                                     std::to_string(seat) + " is not alive at construction");
+        if (agent.x < 1 || agent.x >= state.width - 1 || agent.y < 1 ||
+            agent.y >= state.height - 1)
+            throw std::runtime_error("gates scenario '" + name + "': seat " +
+                                     std::to_string(seat) + " position out of interior bounds");
+        if (!map_is_walkable(&state, agent.x, agent.y))
+            throw std::runtime_error("gates scenario '" + name + "': seat " +
+                                     std::to_string(seat) +
+                                     " is standing on a non-walkable tile");
+    }
+    if (state.agents[0].x == state.agents[1].x && state.agents[0].y == state.agents[1].y)
+        throw std::runtime_error("gates scenario '" + name + "': both seats on the same tile");
+    for (int index = 0; index < MAX_BOMBS; ++index) {
+        if (!state.bombs[index].active) continue;
+        const auto& bomb = state.bombs[index];
+        if (bomb.x < 1 || bomb.x >= state.width - 1 || bomb.y < 1 || bomb.y >= state.height - 1)
+            throw std::runtime_error("gates scenario '" + name + "': active bomb out of bounds");
+        if (state.tiles[bomb.y][bomb.x] == TILE_SOLID_WALL ||
+            state.tiles[bomb.y][bomb.x] == TILE_CRATE)
+            throw std::runtime_error("gates scenario '" + name +
+                                     "': active bomb sits on a wall/crate tile");
+    }
+}
+
+/* -------------------------------------------------------------------------------------------
+   Scenario 1: bomb-and-escape. Learner beside a 3-crate cluster with clear floor to retreat
+   into; opponent parked idle in the far corner. Pass = destroy at least one crate and survive
+   the learner's own blast.
+
+       y\x 0 1 2 3 4 5 6 7 8 9 10 11 12
+        0  # # # # # # # # # # #  #  #
+        1  # . . . . L C C . . .  .  #
+        2  # . # . # . # C # . #  .  #
+        3  # . . . . . . . . . .  .  #
+        4  # . # . # . # . # . #  .  #
+       ...            (unchanged interior lattice)
+        9  # . . . . . . . . . .  O  #
+       10  # # # # # # # # # # #  #  #
+
+   L=(5,1) learner. Crates at (6,1),(7,1),(7,2) - the "3-crate cluster" beside L; a bomb
+   dropped at (5,1) reaches and destroys (6,1) (blast range 2 stops at the first crate hit, so
+   (7,1)/(7,2) are never reached by that single bomb - fine, the pass predicate only needs
+   >=1 crate destroyed). West of L, (4,1)/(3,1)/(2,1)/(1,1) are open floor - verified escape:
+   bombing from (5,1) blasts {(5,1),(6,1),(4,1),(3,1),(5,2),(5,3)}; (2,1) is reachable in 3
+   hops (west three times) and is outside that blast mask, matching the 3 free movement ticks
+   available before the bomb's 4-tick fuse (danger_would_trap_agent, src/env/bomber_danger.c,
+   independently confirms this position is not a trap). O=(11,9), fed ACTION_WAIT every step
+   (NONE opponent mode) - present but irrelevant. */
+void build_gate_scenario_bomb_and_escape(BomberEnv& env) {
+    BomberState& state = env.state;
+    state.agents[0].x = 5; state.agents[0].y = 1;
+    state.agents[1].x = 11; state.agents[1].y = 9;
+    state.tiles[1][6] = TILE_CRATE;
+    state.tiles[1][7] = TILE_CRATE;
+    state.tiles[2][7] = TILE_CRATE;
+}
+
+/* -------------------------------------------------------------------------------------------
+   Scenario 2: corridor-clear. Learner starts deep inside a hand-built L-shaped dead-end pocket
+   whose only connection to the rest of the board is a single crate-sealed mouth. Opponent
+   parked idle in the far corner. Pass = learner reaches open floor outside the pocket, alive.
+
+       y\x 0 1 2 3 4 5 ...       11 12
+        0  # # # # # # ...       #  #
+        1  # . . C . . ...       .  #
+        2  # L # . # . ...       .  #
+        3  # # . . . . ...       .  #
+        4  # . # . # . ...       .  #
+       ...
+        9  # . . . . . ...       O  #
+       10  # # # # # # ...       #  #
+
+   Pocket = {(1,1),(2,1),(1,2)}, an L-tromino hugging the top-left corner: border walls close
+   3 of its outer sides and the natural pillar at (2,2) closes a 4th. Two extra tiles close the
+   two boundary gaps the natural lattice otherwise leaves open: (1,3) becomes a permanent
+   SOLID_WALL (closes the south exit of the (1,2) arm) and (3,1) becomes a CRATE - THE seal,
+   closing the east exit of the (2,1) arm; this is the one crate the learner must clear.
+   Verified escape: bombing from (2,1) blasts only {(2,1),(3,1),(1,1)} (west arm hits the elbow
+   then the border; east arm hits the crate and stops) - (1,2) is off both the bomb's row and
+   its column, so retreating (2,1)->(1,1)->(1,2) (2 moves, inside the 3-tick fuse window) is
+   safe. The engine's own tactical-safety BFS agrees, and also correctly flags the OTHER
+   plausible firing spot as unsafe: bombing from the elbow (1,1) instead blasts all three
+   pocket cells simultaneously (no safe retreat exists inside the pocket), and
+   danger_would_trap_agent (src/env/bomber_danger.c) masks PLACE_BOMB unsafe there - this
+   scenario exercises finding the one safe firing position, not just "bomb from wherever you
+   are." L starts at (1,2), the far arm - genuinely "inside" the corridor. */
+void build_gate_scenario_corridor_clear(BomberEnv& env) {
+    BomberState& state = env.state;
+    state.agents[0].x = 1; state.agents[0].y = 2;
+    state.agents[1].x = 11; state.agents[1].y = 9;
+    state.tiles[3][1] = TILE_SOLID_WALL;
+    state.tiles[1][3] = TILE_CRATE;
+}
+
+/* -------------------------------------------------------------------------------------------
+   Scenario 3: trap. A static opponent (NONE mode - fed ACTION_WAIT every step, never resists)
+   sits in a 1-tile dead end; the learner starts at the mouth with its spawn bomb_ammo (1,
+   unmodified). Pass = the opponent is dead and death_owner is the learner's own seat (a
+   demonstrated kill, not attrition) - the doc's literal predicate does not additionally
+   require the learner to survive, though the constructed position makes a clean survivable
+   kill straightforwardly reachable too.
+
+       y\x 0 1 2 3 4 5 6 7 8 9 10 11 12
+        8  # . . . . . . . . . #  #  #
+        9  # . . . . . . . . L .  O  #
+       10  # # # # # # # # # # #  #  #
+
+   O=(11,9). Its two naturally-open sides are north (11,8) and west (10,9); north is converted
+   to a permanent SOLID_WALL (extra, beyond the lattice) so the only connection is the west
+   mouth - "opponent in a dead-end." L=(9,9), two tiles west along the open row. Bombing from
+   (10,9) (one step toward O) reaches O's cell directly (east arm, range 2, unobstructed)
+   while the learner's own retreat (west along the row, then off-axis once clear of the
+   blast's row/column) is unobstructed. */
+void build_gate_scenario_trap(BomberEnv& env) {
+    BomberState& state = env.state;
+    state.agents[0].x = 9; state.agents[0].y = 9;
+    state.agents[1].x = 11; state.agents[1].y = 9;
+    state.tiles[8][11] = TILE_SOLID_WALL;
+}
+
+/* -------------------------------------------------------------------------------------------
+   Scenario 4: chase. Pure pursuit on the untouched natural lattice - no hand-placed crates or
+   walls. Learner starts at its usual spawn corner; the opponent is AGENT_EVASIVE, a real
+   scripted agent that actively scores candidate moves for exits + distance from the nearest
+   enemy + safety (src/agents/evasive_agent.c) - it will actually try to run. Pass = the
+   learner ever gets within Manhattan distance <=2 of the opponent while both are alive.
+
+       y\x 0 1 2 3 4 5 6 7 8 9 10 11 12
+        0  # # # # # # # # # # #  #  #
+        1  # L . . . . . . . . .  .  #
+       ...            (open lattice, unchanged)
+        9  # . . . . . . . . . .  O  #
+       10  # # # # # # # # # # #  #  #
+
+   L=(1,1) (natural seat-0 spawn), O=(11,9) (natural seat-1 spawn) - "across the board." */
+void build_gate_scenario_chase(BomberEnv& env) {
+    BomberState& state = env.state;
+    state.agents[0].x = 1; state.agents[0].y = 1;
+    state.agents[1].x = 11; state.agents[1].y = 9;
+}
+
+/* -------------------------------------------------------------------------------------------
+   Scenario 5: flame-timing. Row y=5 is converted to a solid wall for its entire width except
+   one gap at x=5 - the only corridor forward between the north and south halves of the board.
+   An opponent-owned bomb (timer=2, already ticking) sits exactly in that gap tile, physically
+   blocking passage before it detonates and lethally flaming it for flame_duration ticks after.
+   The opponent agent itself (NONE mode, parked south) never acts - the bomb is placed directly
+   into env.state, not via agent_act. Pass = learner alive AND south of the wall line (past the
+   blast tile) once the flame has cleared.
+
+       y\x 0 1 2 3 4 5 6 7 8 9 10 11 12
+        1  # . . . . L . . . . .  .  #
+       ...            (open north half, unchanged lattice)
+        5  # # # # # b # # # # #  #  #   b = opponent bomb, timer=2, in the one gap (x=5)
+        6  # . . . . . . . . . .  .  #
+       ...            (open south half, unchanged lattice)
+        7  # . . . . . . . . O .  .  #
+       10  # # # # # # # # # # #  #  #
+
+   L=(5,1), four tiles north of the gap along the fully-open column x=5 (x odd => that column
+   never has a pillar). The gap tile (5,5)'s east/west neighbors (6,5)/(4,5) are themselves
+   part of the new row-5 wall, so a bomb dropped at (5,5) is blocked immediately in both
+   directions; only the north/south arms (open column x=5) propagate, so the blast (range 2)
+   stays confined to {(5,3),(5,4),(5,5),(5,6),(5,7)} - it does not breach the wall row
+   anywhere else. O=(9,7), safely outside that blast, uninvolved. */
+void build_gate_scenario_flame_timing(BomberEnv& env) {
+    BomberState& state = env.state;
+    for (int x = 1; x <= 11; ++x)
+        if (x != 5) state.tiles[5][x] = TILE_SOLID_WALL;
+    state.agents[0].x = 5; state.agents[0].y = 1;
+    state.agents[1].x = 9; state.agents[1].y = 7;
+    BombState& bomb = state.bombs[0];
+    bomb.x = 5; bomb.y = 5;
+    bomb.owner_id = 1;
+    bomb.timer = 2;
+    bomb.range = state.agents[1].blast_range;
+    bomb.active = 1;
+    state.agents[1].bomb_ammo = 0;
+    state.agents[1].bombs_active = 1;
+}
+
+/* -------------------------------------------------------------------------------------------
+   Scenario 6: stall-break. Same row-5 wall technique as flame-timing, but with TWO gaps: x=5
+   (gap A, the contested chokepoint - learner and opponent start adjacent to it on opposite
+   sides) and x=7 (gap B, sealed by one crate - the alternate route). Opponent action is
+   CONSTANT(ACTION_UP): every step it blindly tries to move north through gap A regardless of
+   outcome, reproducing the mutual-rejection stall (simultaneous-move collision resolution
+   rejects both movers when they contest the same destination tile - env_step_joint,
+   src/env/bomber_env.c) if the learner naively contests the same tile back every step. Pass =
+   learner alive AND (past the wall line at gap A OR the gap-B crate destroyed) - either
+   demonstrates the learner did not just freeze against the stalemate - OR the opponent is dead
+   with death_owner == learner (a demonstrated bomb kill, same standard as the trap gate).
+   The kill path was added at planner review after the executor flagged that both the heuristic
+   and MCTS reference agents independently bomb the defenseless CONSTANT blocker, which under
+   the original two-condition predicate registered as terminal learner_win with passed=false:
+   killing the thing blocking the chokepoint is decisive aggression - emphatically NOT the
+   passive-stall failure mode this gate exists to probe - so it counts as breaking the stall,
+   not as a miss. Crush/self-kill deaths still don't count (death_owner check), and the
+   learner-alive requirement applies to the movement/crate paths but deliberately not the kill
+   path (mirroring the trap gate's literal predicate).
+
+       y\x 0 1 2 3 4 5 6 7 8 9 10 11 12
+        4  # . . . . L . . . . .  .  #
+        5  # # # # # . # C # # #  #  #   gap A (x=5, contested) | gap B (x=7, crated)
+        6  # . . . . O . . . . .  .  #
+       ...
+       10  # # # # # # # # # # #  #  #
+
+   L=(5,4) (one tile north of gap A), O=(5,6) (one tile south of gap A), CONSTANT=ACTION_UP.
+   Crate at (7,5) (gap B); bombing it from (7,4) blasts only {(7,2),(7,3),(7,4),(7,5)} (north
+   arm open, south arm stops at the crate, east/west blocked by the natural pillars at
+   (8,4)/(6,4)) - a 2-move retreat off that line (e.g. (7,4)->(7,3)->(6,3)) is safe, mirroring
+   scenario 2's verified pattern. */
+void build_gate_scenario_stall_break(BomberEnv& env) {
+    BomberState& state = env.state;
+    for (int x = 1; x <= 11; ++x)
+        if (x != 5 && x != 7) state.tiles[5][x] = TILE_SOLID_WALL;
+    state.tiles[5][7] = TILE_CRATE;
+    state.agents[0].x = 5; state.agents[0].y = 4;
+    state.agents[1].x = 5; state.agents[1].y = 6;
+}
+
+std::vector<GateScenarioSpec> build_gate_scenarios() {
+    std::vector<GateScenarioSpec> specs;
+
+    GateScenarioSpec bomb_and_escape;
+    bomb_and_escape.name = "bomb-and-escape";
+    bomb_and_escape.k_steps = 20;
+    bomb_and_escape.build = build_gate_scenario_bomb_and_escape;
+    bomb_and_escape.opponent_mode = GateOpponentMode::kNone;
+    bomb_and_escape.pass_predicate = [](const BomberEnv& env) {
+        return env.state.agents[0].alive != 0 && env.state.agents[0].crates_destroyed > 0;
+    };
+    specs.push_back(std::move(bomb_and_escape));
+
+    GateScenarioSpec corridor_clear;
+    corridor_clear.name = "corridor-clear";
+    corridor_clear.k_steps = 30;
+    corridor_clear.build = build_gate_scenario_corridor_clear;
+    corridor_clear.opponent_mode = GateOpponentMode::kNone;
+    corridor_clear.pass_predicate = [](const BomberEnv& env) {
+        if (env.state.agents[0].alive == 0) return false;
+        const int x = env.state.agents[0].x;
+        const int y = env.state.agents[0].y;
+        const bool inside_pocket =
+            (x == 1 && y == 1) || (x == 2 && y == 1) || (x == 1 && y == 2);
+        return !inside_pocket;
+    };
+    specs.push_back(std::move(corridor_clear));
+
+    GateScenarioSpec trap;
+    trap.name = "trap";
+    trap.k_steps = 20;
+    trap.build = build_gate_scenario_trap;
+    trap.opponent_mode = GateOpponentMode::kNone;
+    trap.pass_predicate = [](const BomberEnv& env) {
+        return env.state.death_owner[1] == 0;
+    };
+    specs.push_back(std::move(trap));
+
+    GateScenarioSpec chase;
+    chase.name = "chase";
+    chase.k_steps = 30;
+    chase.build = build_gate_scenario_chase;
+    chase.opponent_mode = GateOpponentMode::kAgent;
+    chase.opponent_agent_type = AGENT_EVASIVE;
+    chase.pass_predicate = [](const BomberEnv& env) {
+        if (env.state.agents[0].alive == 0 || env.state.agents[1].alive == 0) return false;
+        const int dx = env.state.agents[0].x - env.state.agents[1].x;
+        const int dy = env.state.agents[0].y - env.state.agents[1].y;
+        const int manhattan = (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy);
+        return manhattan <= 2;
+    };
+    specs.push_back(std::move(chase));
+
+    GateScenarioSpec flame_timing;
+    flame_timing.name = "flame-timing";
+    flame_timing.k_steps = 15;
+    flame_timing.build = build_gate_scenario_flame_timing;
+    flame_timing.opponent_mode = GateOpponentMode::kNone;
+    flame_timing.pass_predicate = [](const BomberEnv& env) {
+        return env.state.agents[0].alive != 0 && env.state.agents[0].y > 5;
+    };
+    specs.push_back(std::move(flame_timing));
+
+    GateScenarioSpec stall_break;
+    stall_break.name = "stall-break";
+    stall_break.k_steps = 25;
+    stall_break.build = build_gate_scenario_stall_break;
+    stall_break.opponent_mode = GateOpponentMode::kConstant;
+    stall_break.opponent_constant_action = ACTION_UP;
+    stall_break.pass_predicate = [](const BomberEnv& env) {
+        if (env.state.death_owner[1] == 0) return true;
+        if (env.state.agents[0].alive == 0) return false;
+        const bool reached_far_side = env.state.agents[0].y > 5;
+        const bool alt_path_opened = env.state.tiles[5][7] != TILE_CRATE;
+        return reached_far_side || alt_path_opened;
+    };
+    specs.push_back(std::move(stall_break));
+
+    return specs;
+}
+
+}  // namespace
+
+struct Trainer::Impl {
+    explicit Impl(TrainConfig requested)
+        : config(std::move(requested)), device(torch::kCUDA, 0),
+          model(BOMBER_TRAINING_CHANNELS, config.channels, config.residual_blocks,
+                kActions, BOMBER_TRAINING_VIEW_SIZE),
+          optimizer(model->parameters(), torch::optim::AdamWOptions(config.learning_rate)
+              .weight_decay(config.weight_decay)),
+          replay(static_cast<size_t>(config.replay_capacity)), rng(config.seed) {
+        validate_config(config);
+        std::filesystem::create_directories(config.run_dir);
+        latest_path = config.run_dir / "latest.pt";
+        best_path = config.run_dir / "best.pt";
+        requested_checkpoint_path = config.run_dir / config.checkpoint;
+        metrics_path = config.run_dir / "metrics.jsonl";
+        /* Every native train/evaluate path consumes the same GPU. Keep one global native
+           process at a time: an evaluation is read-only with respect to the checkpoint, but
+           it still contends for CUDA memory/compute and can invalidate timing or kill a
+           trainer. Training additionally owns its run directory. Locks are acquired before
+           any evidence/config write so refusal leaves no partial artifact. */
+        system_lock = std::make_unique<ProcessLock>(
+            /* Keep the deployed filename so a repaired evaluator also excludes an older
+               trainer binary that only knew the original training-only lock name. */
+            std::filesystem::temp_directory_path() / "bomber-alphazero-native-trainer.lock");
+        if (!config.evaluation_only) {
+            run_dir_lock = std::make_unique<ProcessLock>(config.run_dir / ".trainer.lock");
+        }
+        model->to(device);
+        bool forked = false;
+        if (config.fresh) {
+            /* KL-110 hygiene: semantic-fork-log.jsonl must be truncated here exactly like
+               metrics.jsonl/config-history.jsonl - otherwise repeated --fresh (--fork-from)
+               runs into the same run-dir accumulate every past run's fork entries into one
+               file, and a reader has no way to tell which entries belong to the CURRENT run
+               (discovered during the cause-balance fork work; the existing check script had to
+               work around it by reading only the last entry - see
+               test_native_alphazero_cause_balance_fork_legacy_check.py). */
+            for (const auto& entry : std::filesystem::directory_iterator(config.run_dir)) {
+                const auto name = entry.path().filename().string();
+                if (entry.is_regular_file() &&
+                    (entry.path().extension() == ".pt" || name == "metrics.jsonl" ||
+                     name == "config-history.jsonl" || name == "semantic-fork-log.jsonl" ||
+                     name.ends_with(".tmp")))
+                    std::filesystem::remove(entry.path());
+            }
+            if (!config.fork_from.empty()) {
+                /* KL-101 Part C: explicit fork - load the parent's weights/optimizer/replay/
+                   RNG/semantics/champion-lineage into this fresh run, then record full
+                   provenance. Reuses load_checkpoint() so a fork gets the exact same ABI
+                   hard-fail, semantic inheritance, and legacy-checkpoint handling as an
+                   ordinary resume - a fork is not a special, less-verified code path. */
+                if (!std::filesystem::exists(config.fork_from))
+                    throw std::runtime_error("--fork-from checkpoint not found: " +
+                                             config.fork_from.string());
+                load_checkpoint(config.fork_from);
+                forked = true;
+                std::cout << "Forked from " << config.fork_from.string()
+                          << " at iteration " << iteration
+                          << " with " << replay.size() << " replay samples\n";
+            }
+        } else if (std::filesystem::exists(requested_checkpoint_path)) {
+            load_checkpoint(requested_checkpoint_path);
+            std::cout << "Loaded " << requested_checkpoint_path.string()
+                      << " at iteration " << iteration
+                      << " with " << replay.size() << " replay samples\n";
+        }
+        /* A legacy checkpoint with schedule_updates=0 does not contain enough information to
+           recover the horizon that produced its optimizer history. Deriving from this
+           process's short bootstrap target created a false "matched" control at 1e-5 while
+           its treatment ran near 1e-4. Evaluation may accept the uncertainty because LR is
+           unused there; any resumed/forked TRAIN must supply the absolute horizon explicitly. */
+        if (loaded_legacy_checkpoint && !config.evaluation_only && iteration > 0 &&
+            config.learning_rate_schedule_updates <= 0) {
+            throw std::runtime_error(
+                "legacy checkpoint has no verified learning-rate schedule horizon; training "
+                "or forking it requires a positive explicit --lr-schedule-updates (derive it from the "
+                "original run evidence, not the new --iterations target)");
+        }
+        /* Resolve all semantics BEFORE writing best.pt, fork-manifest.json, or config.json.
+           Earlier code wrote a fork manifest and a synthetic champion with horizon 0, then
+           silently changed the live run to a nonzero horizon. */
+        if (config.learning_rate_schedule_updates <= 0 &&
+            !(loaded_legacy_checkpoint && config.evaluation_only)) {
+            config.learning_rate_schedule_updates = std::max<int64_t>(
+                static_cast<int64_t>(config.iterations) * config.train_steps, 1);
+        }
+        if (forked) {
+            if (config.fork_reset_champion) reset_champion_to_fork_point();
+            else inherit_champion_artifact(config.fork_from);
+            write_fork_manifest();
+        } else if (!config.evaluation_only) {
+            reconcile_or_restore_champion(requested_checkpoint_path);
+        }
+        if (!config.evaluation_only) {
+            write_config();
+            append_config_history();
+        }
+    }
+
+    struct Evaluation {
+        int wins{};
+        int draws{};
+        int losses{};
+        std::array<int, 2> wins_by_seat{};
+        std::array<int, 2> draws_by_seat{};
+        std::array<int, 2> losses_by_seat{};
+        double score{};
+        double lower_confidence_bound{};
+        double mean_steps{};
+        /* Honest "how did it win/lose" breakdown (win = opponent died, loss = learner died):
+           bomb = died to the OTHER side's bomb (a real tactical kill); selfkill = died to its
+           own bomb (a blunder by whoever died); crush = died to the closing sudden-death arena
+           (attrition, not a tactical kill). Distinguishes real tactical wins from wins that are
+           just "survive until the opponent gets crushed by the shrinking arena." */
+        int win_by_bomb{};
+        int win_by_selfkill{};
+        int win_by_crush{};
+        int loss_by_bomb{};
+        int loss_by_selfkill{};
+        int loss_by_crush{};
+        int draw_mutual_death{};
+        int draw_timeout_alive{};
+        /* Fraction of the LEARNER's own action choices that were WAIT (idling). High WAIT,
+           especially once sudden death starts, is a sign of passively waiting for the arena
+           to do the work rather than forcing the position. */
+        int64_t learner_wait_steps{};
+        int64_t learner_total_steps{};
+    };
+
+    struct OptimizationMetrics {
+        double loss{};
+        double policy_loss{};
+        double value_loss{};
+        double entropy{};
+        double learning_rate{};
+        /* KL-105 Phase 3: mean, over this iteration's train_steps batches, of the FORCED
+           pool-A (bomb_win_side==1) fraction ReplayBuffer::batch() drew - what the sampler was
+           compelled to draw from pool A, not just what --replay-cause-balance-cap asked for. 0
+           whenever the cap is 0 or pool A was empty for the whole iteration (the batch()
+           cap<=0/empty-pool path always reports 0.0). KL-110 hygiene: this field's name is a
+           pre-existing misnomer ("realized" reads as "how much of the batch was pool A", but
+           it only ever counted the FORCED draws) kept as-is for cross-run metric continuity -
+           uniform draws over the whole buffer can also land in pool A, so this alone
+           understates the batch's true pool-A representation; see total_pool_a_batch_fraction
+           below for the honest total. */
+        double realized_pool_a_batch_fraction{};
+        /* KL-110 hygiene: mean, over this iteration's train_steps batches, of the fraction of
+           EACH batch's SELECTED rows (forced or drawn from the uniform remainder) that were
+           actually in pool A - the number realized_pool_a_batch_fraction's name always implied
+           but did not report. Always >= realized_pool_a_batch_fraction. */
+        double total_pool_a_batch_fraction{};
+        /* v7 Stage-1 IL Bombing-Collapse guards: exactly what THIS iteration's loss graph
+           contained, so a metrics reader can reconstruct it without re-deriving the iteration
+           window. policy_loss_applied_weight is 1.0 when the policy CE contributed to the loss,
+           0.0 during the value-only warmup (iteration < config.value_only_iterations).
+           policy_entropy_bonus_applied is the beta actually subtracted as an entropy floor this
+           iteration (config.policy_entropy_bonus when the policy term is active AND beta>0, else
+           0.0). Both default 0.0 - the value a reader sees if optimize() early-returned (empty
+           replay / train_steps==0), i.e. nothing trained. */
+        double policy_loss_applied_weight{};
+        double policy_entropy_bonus_applied{};
+    };
+
+    struct SelfPlayMetrics {
+        int wins{};
+        int draws{};
+        int losses{};
+        double mean_steps{};
+        /* Honest win-cause breakdown for TRAINING self-play itself (see Evaluation::
+           win_by_bomb for field meanings) - decisive games only, either seat. Answers
+           "is the training signal itself crush-dominated, or is that only an eval-time
+           behavior against opponents that don't understand the closing arena?" */
+        int win_by_bomb{};
+        int win_by_selfkill{};
+        int win_by_crush{};
+        int draw_mutual_death{};
+        int draw_timeout_alive{};
+        int64_t wait_steps{};
+        int64_t total_steps{};
+    };
+
+    /* v7 Stage 0 item 0.2: KataGo forced-playouts telemetry (docs/experiment-memory/
+       14-v7-from-scratch-design.md), accumulated across BOTH collect_self_play() and
+       collect_league_play() for one iteration - reset ONCE per iteration in run(), right before
+       collection starts, unlike last_self_play/last_league_play which are each reset inside
+       their OWN single collect_* call (this one deliberately is not, since it must span both
+       calls). All-zero whenever config.forced_playouts_k<=0 (off, default) - both collection
+       functions only touch these fields inside their own `config.forced_playouts_k > 0.0`
+       branch. */
+    struct ForcedPlayoutMetrics {
+        /* Seat-decisions observed this iteration - 2 per root search in mirror self-play (seat 0
+           and seat 1 each build their own policy target), 1 per root search in league play (the
+           learner seat only). Matches how many times prune_policy_target_visits() was called. */
+        int64_t moves{};
+        /* Sum, over `moves`, of that move's forced-simulation count (sum of the seat's forced0/
+           forced1 array from SearchResult) - mean_forced_per_move = forced_visits_sum/moves. */
+        int64_t forced_visits_sum{};
+        /* Sum, over `moves`, of (visits removed by pruning)/total_visits for that move -
+           mean_pruned_visit_fraction = pruned_fraction_sum/moves. */
+        double pruned_fraction_sum{};
+        /* Sum of SearchResult::floor_violations across every root search this iteration (both
+           collection calls) - expected 0; see BatchedMcts::root_floor_violations(). */
+        int64_t floor_violations{};
+    };
+
+    TrainConfig config;
+    torch::Device device;
+    PolicyValueNet model;
+    torch::optim::AdamW optimizer;
+    ReplayBuffer replay;
+    std::mt19937_64 rng;
+    int iteration{};
+    int64_t global_updates{};
+    double best_score{-std::numeric_limits<double>::infinity()};
+    int best_iteration{-1};
+    int64_t promotion_count{};
+    std::filesystem::path latest_path;
+    std::filesystem::path best_path;
+    std::filesystem::path requested_checkpoint_path;
+    std::filesystem::path metrics_path;
+    SelfPlayMetrics last_self_play;
+    Evaluation last_league_play;
+    ForcedPlayoutMetrics last_forced_playouts;
+    /* KL-101 Part D: global native-GPU lock is held by train and evaluate for the object's
+       lifetime; the run-dir lock is training-only. OS handles release on every exit path. */
+    std::unique_ptr<ProcessLock> system_lock;
+    std::unique_ptr<ProcessLock> run_dir_lock;
+    bool loaded_legacy_checkpoint{};
+    std::filesystem::path inherited_champion_source{};
+    /* KL-101 Part E: phase timings for the current iteration (reset at loop top) and a
+       cumulative action histogram across the whole run (the network's own moves only - both
+       seats during mirror self-play, the network-controlled seat only during league play;
+       never the scripted opponent's actions). */
+    PhaseTimings last_phase_timings;
+    std::array<int64_t, kActions> action_histogram{};
+    /* v7 Stage-1 IL: this iteration's teacher-action histogram - every action played by BOTH
+       teacher seats during collect_teacher(), reset at the top of each collect_teacher() call
+       (unlike action_histogram, which is cumulative). Deliberately SEPARATE from action_histogram
+       so the network's-own-moves invariant of that field is preserved: these are the demonstrated
+       expert moves IL clones, not the network's. Emitted as "teacher_actions" in append_metrics()
+       only on iterations where teacher games actually ran (the block is ABSENT from other
+       iterations' rows, not present-as-zeros). */
+    std::array<int64_t, kActions> last_teacher_actions{};
+    /* v7 Stage-1 IL (D3): determinism oracle for the OpenMP-parallelized collect_teacher(). A
+       stable 64-bit FNV-1a hash over every teacher Sample IN game_index/step ORDER (policy argmax
+       byte, value's IEEE-754 bits, outcome_cause, bomb_win_side - NOT the encoded state planes,
+       which are pinned by action determinism given the seeded env). Computed in the ordered
+       post-region concatenation pass so it is order-proof, emitted as a hex string
+       "teacher_sample_digest" alongside teacher_actions. Equal digests at threads=1 vs N prove the
+       parallel path is bit-identical to serial - the license for teacher_threads being
+       non-semantic. Set only on iterations where collect_teacher() ran. */
+    std::string last_teacher_sample_digest{};
+
+    /* KL-101 Part C: immutable fork provenance, written once at fork time (--fresh
+       --fork-from PATH). Deliberately a SEPARATE file from config.json/config-history.jsonl
+       (which describe THIS run's own evolving config) - a fork record answers "where did
+       this lineage's starting point come from and can I trust it," which needs to survive
+       and stay unambiguous even as config.json is later overwritten iteration after
+       iteration. Any semantic differences between the parent and this run's explicit CLI
+       overrides at fork time are already captured by load_checkpoint()'s own
+       semantic-fork-log.jsonl (called just before this) - referenced here, not duplicated. */
+    void write_fork_manifest() const {
+        const auto destination = config.run_dir / "fork-manifest.json";
+        const std::string parent_sha256 = sha256_file(config.fork_from);
+        const std::string executable_path = current_executable_path().string();
+        const std::string executable_sha256 = sha256_file(executable_path);
+        const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        std::tm utc_time{};
+#ifdef _WIN32
+        gmtime_s(&utc_time, &now);
+#else
+        gmtime_r(&now, &utc_time);
+#endif
+        std::ostringstream timestamp;
+        timestamp << std::put_time(&utc_time, "%Y-%m-%dT%H:%M:%SZ");
+
+        std::ofstream output(destination, std::ios::trunc);
+        output << std::setprecision(9) << "{\n"
+               << "  \"forked_at_utc\": \"" << timestamp.str() << "\",\n"
+               << "  \"source_checkpoint\": \""
+               << json_escape(config.fork_from.string()) << "\",\n"
+               << "  \"source_checkpoint_sha256\": \"" << parent_sha256 << "\",\n"
+               << "  \"source_champion_checkpoint\": \""
+               << json_escape(inherited_champion_source.string()) << "\",\n"
+               << "  \"source_champion_sha256\": \""
+               << (inherited_champion_source.empty() ? std::string{} :
+                   sha256_file(inherited_champion_source)) << "\",\n"
+               << "  \"source_run_dir\": \""
+               << json_escape(config.fork_from.parent_path().string()) << "\",\n"
+               << "  \"target_run_dir\": \"" << json_escape(config.run_dir.string()) << "\",\n"
+               << "  \"target_iteration_at_fork\": " << iteration << ",\n"
+               << "  \"executable_path\": \"" << json_escape(executable_path) << "\",\n"
+               << "  \"executable_sha256\": \"" << executable_sha256 << "\",\n"
+               << "  \"git_commit\": \"" << AI_BOMBER_GIT_SHA << "\",\n"
+               << "  \"dirty_diff_digest\": \""
+               << json_escape(config.dirty_diff_digest) << "\",\n"
+               << "  \"seed\": " << config.seed << ",\n"
+               << "  \"champion_reset\": " << (config.fork_reset_champion ? "true" : "false")
+               << ",\n"
+               << "  \"inherited_champion_lineage\": {\"best_iteration\": " << best_iteration
+               << ", \"best_score\": " << best_score
+               << ", \"promotion_count\": " << promotion_count << "},\n"
+               << "  \"resolved_semantics\": \"" << json_escape(semantic_manifest_string(config))
+               << "\",\n"
+               << "  \"semantic_forks_note\": \"any explicit CLI overrides that diverged from "
+                  "the parent at fork time are in semantic-fork-log.jsonl, not duplicated here\""
+               << "\n}\n";
+    }
+
+    void write_config() const {
+        const auto temporary = config.run_dir / "config.json.tmp";
+        const auto destination = config.run_dir / "config.json";
+        std::ofstream output(temporary, std::ios::trunc);
+        output << "{\n"
+               << "  \"format_version\": " << kFormatVersion << ",\n"
+               << "  \"git_sha\": \"" << AI_BOMBER_GIT_SHA << "\",\n"
+               << "  \"torch_version\": \"" << TORCH_VERSION << "\",\n"
+               << "  \"architecture\": \"native-cpp-libtorch-resnet\",\n"
+               << "  \"precision\": {\"inference\": \"bf16\", \"optimization\": \"fp32\"},\n"
+               << "  \"observation\": {\"channels\": " << BOMBER_TRAINING_CHANNELS
+               << ", \"view_size\": " << BOMBER_TRAINING_VIEW_SIZE
+               << ", \"actions\": " << kActions << "},\n"
+               << "  \"map\": {\"width\": " << config.width
+               << ", \"height\": " << config.height
+               << ", \"max_steps\": " << config.max_steps
+               << ", \"crate_density\": " << config.crate_density
+               << ", \"flame_duration\": " << config.flame_duration
+               << ", \"sudden_death_start\": " << config.sudden_death_start
+               << ", \"shrink_interval\": " << config.shrink_interval << "},\n"
+               << "  \"channels\": " << config.channels << ",\n"
+               << "  \"residual_blocks\": " << config.residual_blocks << ",\n"
+               << "  \"parameters\": " << model->parameter_count() << ",\n"
+               << "  \"iterations\": " << config.iterations << ",\n"
+               << "  \"self_play_games\": " << config.self_play_games << ",\n"
+               << "  \"simulations\": " << config.simulations << ",\n"
+               << "  \"train_steps\": " << config.train_steps << ",\n"
+               << "  \"batch_size\": " << config.batch_size << ",\n"
+               << "  \"replay_capacity\": " << config.replay_capacity << ",\n"
+               << "  \"learning_rate\": " << config.learning_rate << ",\n"
+               << "  \"min_learning_rate\": " << config.min_learning_rate << ",\n"
+               << "  \"learning_rate_schedule_start_update\": "
+               << config.learning_rate_schedule_start_update << ",\n"
+               << "  \"learning_rate_schedule_updates\": "
+               << config.learning_rate_schedule_updates << ",\n"
+               << "  \"weight_decay\": " << config.weight_decay << ",\n"
+               << "  \"c_puct\": " << config.c_puct << ",\n"
+               << "  \"dirichlet_alpha\": " << config.dirichlet_alpha << ",\n"
+               << "  \"dirichlet_fraction\": " << config.dirichlet_fraction << ",\n"
+               << "  \"forced_playouts_k\": " << config.forced_playouts_k << ",\n"
+               << "  \"search_contempt_nscl\": " << config.search_contempt_nscl << ",\n"
+               << "  \"temperature\": " << config.temperature << ",\n"
+               << "  \"temperature_steps\": " << config.temperature_steps << ",\n"
+               << "  \"temperature_final\": " << config.temperature_final << ",\n"
+               << "  \"temperature_anneal\": "
+               << (config.temperature_anneal ? "true" : "false") << ",\n"
+               << "  \"teacher_agents\": \"" << json_escape(config.teacher_agents) << "\",\n"
+               << "  \"teacher_games\": " << config.teacher_games << ",\n"
+               << "  \"teacher_iterations\": " << config.teacher_iterations << ",\n"
+               /* Non-semantic (see TrainConfig::teacher_threads in trainer.h) but still recorded
+                  here like other non-semantic fields (e.g. evaluation_games below) - config.json
+                  is a full run-configuration dump, not just the semantic manifest. */
+               << "  \"teacher_threads\": " << config.teacher_threads << ",\n"
+               << "  \"bootstrap_value_weight\": " << config.bootstrap_value_weight << ",\n"
+               << "  \"bootstrap_value_iterations\": " << config.bootstrap_value_iterations << ",\n"
+               << "  \"timeout_draw_value\": " << config.timeout_draw_value << ",\n"
+               << "  \"mutual_death_value\": " << config.mutual_death_value << ",\n"
+               << "  \"arena_crush_win_value\": " << config.arena_crush_win_value << ",\n"
+               << "  \"selfkill_win_value\": " << config.selfkill_win_value << ",\n"
+               << "  \"league_heuristic_fraction\": " << config.league_heuristic_fraction << ",\n"
+               << "  \"replay_cause_balance_cap\": " << config.replay_cause_balance_cap << ",\n"
+               << "  \"policy_entropy_bonus\": " << config.policy_entropy_bonus << ",\n"
+               << "  \"value_only_iterations\": " << config.value_only_iterations << ",\n"
+               << "  \"evaluation_interval\": " << config.evaluation_interval << ",\n"
+               << "  \"evaluation_games\": " << config.evaluation_games << ",\n"
+               << "  \"evaluation_simulations\": " << config.evaluation_simulations << ",\n"
+               << "  \"evaluation_seed_base\": " << config.evaluation_seed_base << ",\n"
+               << "  \"promotion_games\": " << config.promotion_games << ",\n"
+               << "  \"promotion_simulations\": " << config.promotion_simulations << ",\n"
+               << "  \"promotion_seed_base\": " << config.promotion_seed_base << ",\n"
+               << "  \"promotion_margin\": " << config.promotion_margin << ",\n"
+               << "  \"promotion_confidence_z\": " << config.promotion_confidence_z << ",\n"
+               << "  \"random_score_floor\": " << config.random_score_floor << ",\n"
+               << "  \"heuristic_score_floor\": " << config.heuristic_score_floor << ",\n"
+               << "  \"heuristic_regression_margin\": "
+               << config.heuristic_regression_margin << ",\n"
+               << "  \"mcts_evaluation_interval\": " << config.mcts_evaluation_interval << ",\n"
+               << "  \"mcts_evaluation_games\": " << config.mcts_evaluation_games << ",\n"
+               << "  \"baseline_mcts_simulations\": "
+               << config.baseline_mcts_simulations << ",\n"
+               << "  \"baseline_mcts_depth\": " << config.baseline_mcts_depth << ",\n"
+               << "  \"mcts_evaluation_seed_base\": "
+               << config.mcts_evaluation_seed_base << ",\n"
+               << "  \"snapshot_interval\": " << config.snapshot_interval << ",\n"
+               << "  \"seed\": " << config.seed << "\n"
+               << "}\n";
+        output.close();
+        atomic_replace(temporary, destination);
+    }
+
+    void append_config_history() const {
+        std::ofstream output(config.run_dir / "config-history.jsonl", std::ios::app);
+        output << "{\"iteration\":" << iteration
+               << ",\"global_updates\":" << global_updates
+               << ",\"checkpoint\":\""
+               << json_escape(config.checkpoint.string()) << "\""
+               << ",\"runtime_config\":\""
+               << json_escape(runtime_config_signature(config)) << "\"}\n";
+        output.flush();
+    }
+
+    /* v7 Stage-1 IL (docs/experiment-memory/14-v7-from-scratch-design.md Stage 1): the imitation-
+       learning teacher collector. Every game is now EXPERT-vs-EXPERT (no AGENT_RANDOM filler -
+       random suicides in ~6 steps and poisoned the value targets under the old heuristic-vs-random
+       harvest, doc 14 Stage 1) and BOTH seats are harvested, so the one-hot policy targets clone
+       both experts' moves and the per-seat value targets follow mirror parity exactly like
+       collect_self_play. The roster (config.teacher_agents) drives seat assignment; a multi-entry
+       roster rotates matchups across games, a single-entry roster is expert-vs-itself.
+       v7 Stage-1 IL (D3): the GAME loop below is `#pragma omp parallel for schedule(dynamic)`
+       (config.teacher_threads threads - see TrainConfig::teacher_threads in trainer.h). Each
+       game_index iteration writes ONLY its own per_game/per_game_actions slot - zero shared
+       mutable state is touched inside the region (env/agents/trajectory are per-iteration locals;
+       base/config/roster are read-only; the module-level stop_requested is only ever read here).
+       All cross-game aggregation - last_teacher_actions, teacher_sample_digest, result, progress -
+       is finished in the ordered serial pass AFTER the region. That ordering is what makes the
+       output bit-identical for any thread count, proven by
+       tests/test_native_alphazero_teacher_threads_check.py (threads=1 vs 4). */
+    std::vector<Sample> collect_teacher(int count) {
+        std::vector<Sample> result;
+        last_teacher_actions = {};
+        last_teacher_sample_digest.clear();
+        const std::vector<AgentType> roster = parse_teacher_agents(config.teacher_agents);
+        const int roster_size = static_cast<int>(roster.size());
+        PhaseProgress progress("teacher", count, config.progress);
+        const BomberConfig base = game_config(config);
+
+        /* Per-game slots. A skipped or not-yet-run game leaves its slot at its value-initialized
+           default (empty vector<Sample>, all-zero histogram array) - the fill constructors below
+           value-initialize every element, so no separate "was this game skipped" bookkeeping is
+           needed by the reduction pass at the bottom of this function. */
+        std::vector<std::vector<Sample>> per_game(static_cast<size_t>(count));
+        std::vector<std::array<int64_t, kActions>> per_game_actions(static_cast<size_t>(count));
+        /* An exception thrown from inside an OpenMP parallel region must never propagate out of
+           it (undefined behavior - typically an immediate std::terminate rather than the clear
+           error message the caller would otherwise see). The two throwing calls in the per-game
+           body below (an invalid MCTS teacher budget, or an observation-encoder ABI mismatch) are
+           both effectively invariant checks that should never fire in a correctly built binary
+           (validate_config already rejects a bad baseline_mcts_simulations/depth before any run
+           starts), but this project's determinism work does not take "should never fire" on
+           faith - so any exception is caught per-game, the first one wins (under a critical
+           section - std::exception_ptr assignment is not itself thread-safe), and it is rethrown
+           here once the parallel region has fully joined, preserving the same fail-loud behavior
+           and message the pre-parallelization serial loop had, just relocated to a safe point. */
+        std::exception_ptr first_error;
+        /* Live progress, reported as each game actually FINISHES - NOT in game_index order, which
+           schedule(dynamic) does not preserve (a straggler mcts game_index can finish long after
+           later, cheaper heuristic/random game_indices already have). games_completed is a plain
+           int, never touched outside the critical section below, so that section alone is
+           sufficient synchronization (no separate atomic needed). A DISTINCT critical section
+           name from the error one above, so a thread reporting progress never blocks a thread
+           recording an error, or vice versa - they guard unrelated shared state. */
+        int games_completed = 0;
+
+#ifdef AI_BOMBER_NATIVE_OPENMP
+        /* config.teacher_threads: 0 = auto (omp_get_max_threads()), N = exactly N threads,
+           including N==1. The SAME omp construct runs for every positive value (no separate
+           "skip the pragma" code path to keep in sync with this one): a team of exactly one
+           thread executes game_index 0..count-1 in order on the encountering thread, which is
+           output-identical to a plain serial for for this loop's purposes - every iteration
+           writes only its own disjoint slot, and no floating-point accumulation ever crosses a
+           game boundary (the only cross-game aggregation, the histogram sum and the digest, is
+           exact-integer / explicitly-ordered and proven below regardless of thread count). */
+        const int resolved_teacher_threads =
+            config.teacher_threads > 0 ? config.teacher_threads : omp_get_max_threads();
+        /* schedule(dynamic), unlike BatchedMcts::search's root loop above (schedule(static)):
+           mcts teacher games cost ~20-40s each vs ~1s for heuristic/random, so a static split
+           would let one thread's straggler mcts games stall the whole region while other threads
+           idle on an already-finished static share. Dynamic scheduling changes WHICH thread
+           claims WHICH game_index and WHEN, but never which slot a given game_index writes to -
+           it has no bearing on the ordering guarantee, which comes entirely from the serial
+           concatenation pass below, never from execution/completion order. */
+#pragma omp parallel for schedule(dynamic) num_threads(resolved_teacher_threads)
+#endif
+        for (int game_index = 0; game_index < count; ++game_index) {
+            /* Per-GAME stop check (not per-step): the old serial loop's `&& !stop_requested.load()`
+               continuation guard stopped STARTING new games the moment the flag flipped, while
+               letting the in-flight game finish. A parallel-for has no early-break, so the
+               equivalent is "skip any game not yet claimed by a thread"; a game a thread has
+               already started always runs to completion - same per-game granularity as before,
+               just distributed instead of sequential. */
+            if (stop_requested.load()) continue;
+            try {
+                const uint64_t seed = static_cast<uint64_t>(config.seed) * 1'000'003ULL +
+                                      static_cast<uint64_t>(iteration + 1) * 10'007ULL + game_index;
+                BomberEnv env{};
+                env_init(&env, &base);
+                env_reset(&env, seed);
+                /* Seat roster assignment: seat0 rotates through the roster per game, seat1 takes
+                   the NEXT entry so a >1-entry roster plays every ordered matchup as game_index
+                   advances; a single-entry roster puts the same expert on both seats
+                   (expert-vs-itself). */
+                const AgentType seat_types[2] = {
+                    roster[game_index % roster_size],
+                    roster_size > 1 ? roster[(game_index + 1) % roster_size] : roster[0]};
+                Agent agents[2];
+                for (int seat = 0; seat < 2; ++seat) {
+                    agent_init(&agents[seat], seat_types[seat]);
+                    agent_reset(&agents[seat], seed * 2 + static_cast<uint64_t>(seat));
+                    /* An MCTS teacher seat needs its search budget configured before it acts - the
+                       same guard evaluate_baseline uses for its MCTS baseline opponent (a bare
+                       agent_init leaves the search unconfigured), failing loudly on a bad budget
+                       (via the catch below, once the parallel region has finished). */
+                    if (seat_types[seat] == AGENT_MCTS &&
+                        !mcts_agent_configure(&agents[seat], config.baseline_mcts_simulations,
+                                              config.baseline_mcts_depth))
+                        throw std::runtime_error("invalid native MCTS teacher configuration");
+                }
+                std::vector<Sample> trajectory;
+                std::array<int64_t, kActions>& game_actions =
+                    per_game_actions[static_cast<size_t>(game_index)];
+                bool done = false;
+                while (!done) {
+                    Observation observations[2];
+                    DebugSnapshot snapshot;
+                    env_observe(&env, 0, &observations[0]);
+                    env_observe(&env, 1, &observations[1]);
+                    env_get_debug_snapshot(&env, &snapshot);
+                    const Action actions[2] = {agent_act(&agents[0], &observations[0], &snapshot),
+                                               agent_act(&agents[1], &observations[1], &snapshot)};
+                    /* Harvest BOTH seats every step - seat 0 sample then seat 1 sample, so
+                       sample_index%2 == seat at finalization, matching collect_self_play's parity
+                       convention exactly (the value/cause split below relies on it). */
+                    for (int seat = 0; seat < 2; ++seat) {
+                        Sample sample;
+                        encode_state(env, seat, sample.state);
+                        sample.policy[static_cast<int>(actions[seat])] = 1.0f;
+                        trajectory.push_back(std::move(sample));
+                        /* Per-game histogram slot, NOT the shared last_teacher_actions member -
+                           see the reduction in the serial pass below. */
+                        game_actions[static_cast<size_t>(actions[seat])]++;
+                    }
+                    done = env_step_joint(&env, actions, 2).done != 0;
+                }
+                /* Per-seat terminal values (mirror parity, independent per seat - a
+                   both-seat-negative draw must not be antisymmetrized), and the KL-105 cause
+                   tags: teacher games ARE tagged as of v7 Stage 1 (they contain exactly the
+                   demonstrated kills IL exists to clone), replicating collect_self_play's
+                   finalization - game-level outcome_cause on every sample, bomb_win_side=1 only
+                   on the WINNING seat's samples of a bomb-decisive game (the loser seat gets the
+                   cause tag but shows a death, not a kill). */
+                const float value_seat0 = terminal_training_value(env, 0,
+                    config.timeout_draw_value, config.mutual_death_value,
+                    config.arena_crush_win_value, config.selfkill_win_value);
+                const float value_seat1 = terminal_training_value(env, 1,
+                    config.timeout_draw_value, config.mutual_death_value,
+                    config.arena_crush_win_value, config.selfkill_win_value);
+                const int game_outcome = outcome(env, 0);
+                auto outcome_cause = static_cast<uint8_t>(OutcomeCause::kTimeoutDraw);
+                int bomb_winner_seat = -1;
+                if (game_outcome != 0) {
+                    const int winner_seat = game_outcome > 0 ? 0 : 1;
+                    const int loser_seat = 1 - winner_seat;
+                    const int died_owner = env.state.death_owner[loser_seat];
+                    if (died_owner == loser_seat) {
+                        outcome_cause = static_cast<uint8_t>(OutcomeCause::kSelfkill);
+                    } else if (died_owner == winner_seat) {
+                        outcome_cause = static_cast<uint8_t>(OutcomeCause::kBomb);
+                        bomb_winner_seat = winner_seat;
+                    } else {
+                        outcome_cause = static_cast<uint8_t>(OutcomeCause::kArenaCrush);
+                    }
+                } else {
+                    const bool seat0_alive = env.state.agents[0].alive != 0;
+                    const bool seat1_alive = env.state.agents[1].alive != 0;
+                    outcome_cause = static_cast<uint8_t>(
+                        (!seat0_alive && !seat1_alive) ? OutcomeCause::kMutualDeath
+                                                       : OutcomeCause::kTimeoutDraw);
+                }
+                for (size_t sample_index = 0; sample_index < trajectory.size(); ++sample_index) {
+                    const int sample_seat = static_cast<int>(sample_index % 2);
+                    trajectory[sample_index].value =
+                        sample_seat == 0 ? value_seat0 : value_seat1;
+                    trajectory[sample_index].outcome_cause = outcome_cause;
+                    trajectory[sample_index].bomb_win_side =
+                        bomb_winner_seat == sample_seat ? 1 : 0;
+                }
+                /* This game's own slot only - never `result` directly (concurrent push_back into
+                   a shared vector from multiple threads is a data race). result/
+                   last_teacher_actions/last_teacher_sample_digest/progress are all finished in
+                   the ordered serial pass below instead. */
+                per_game[static_cast<size_t>(game_index)] = std::move(trajectory);
+            } catch (...) {
+#ifdef AI_BOMBER_NATIVE_OPENMP
+#pragma omp critical(teacher_collect_error)
+#endif
+                {
+                    if (!first_error) first_error = std::current_exception();
+                }
+            }
+        }
+        if (first_error) std::rethrow_exception(first_error);
+
+        /* Ordered serial pass: concatenate per-game slots IN game_index ORDER (the rule that
+           makes output bit-identical for any thread count - see this function's own doc comment
+           above), reduce the per-game histograms into last_teacher_actions (plain int64 addition
+           - associative/commutative, so summation order never affects the total), fold the
+           digest in the same order, and drive `progress` - matching how collect_self_play never
+           touches PhaseProgress from inside BatchedMcts::search's own `#pragma omp parallel for`
+           region; this collector keeps the same discipline for its own parallel region. */
+        uint64_t digest = kFnvOffsetBasis64;
+        for (int game_index = 0; game_index < count; ++game_index) {
+            const auto index = static_cast<size_t>(game_index);
+            for (int action = 0; action < kActions; ++action) {
+                last_teacher_actions[static_cast<size_t>(action)] +=
+                    per_game_actions[index][static_cast<size_t>(action)];
+            }
+            for (auto& sample : per_game[index]) {
+                hash_teacher_sample(digest, sample);
+                result.push_back(std::move(sample));
+            }
+            progress.update(game_index + 1);
+        }
+        last_teacher_sample_digest = hex_digest64(digest);
+        return result;
+    }
+
+    std::vector<Sample> collect_self_play(int games_count) {
+        struct Game {
+            BomberEnv env{};
+            std::vector<Sample> trajectory;
+            bool done{};
+        };
+        const BomberConfig base = game_config(config);
+        std::vector<Game> games(games_count);
+        for (int index = 0; index < games_count; ++index) {
+            const uint64_t seed = static_cast<uint64_t>(config.seed) * 100'000'007ULL +
+                                  static_cast<uint64_t>(iteration + 1) * 100'003ULL + index;
+            env_init(&games[index].env, &base);
+            env_reset(&games[index].env, seed);
+        }
+        std::vector<Sample> result;
+        last_self_play = {};
+        int64_t total_game_steps = 0;
+        PhaseProgress progress("self-play", games_count, config.progress);
+        BatchedMcts search(model, device, config, rng, iteration);
+        int completed = 0;
+        while (completed < games_count && !stop_requested.load()) {
+            std::vector<BomberEnv*> active;
+            std::vector<int> indices;
+            std::vector<SearchConstraint> constraints;
+            for (int index = 0; index < games_count; ++index) {
+                if (!games[index].done) {
+                    active.push_back(&games[index].env);
+                    indices.push_back(index);
+                    constraints.emplace_back();
+                }
+            }
+            auto searches = search.search(active, constraints, true);
+            for (size_t active_index = 0; active_index < active.size(); ++active_index) {
+                Game& game = games[indices[active_index]];
+                const auto& visits = searches[active_index].visits;
+                const int total_visits = std::accumulate(visits.begin(), visits.end(), 0);
+                Sample zero;
+                Sample one;
+                encode_state(game.env, 0, zero.state);
+                encode_state(game.env, 1, one.state);
+                std::array<int, kActions> marginal_zero{};
+                std::array<int, kActions> marginal_one{};
+                for (int action = 0; action < kActions; ++action) {
+                    for (int opponent = 0; opponent < kActions; ++opponent) {
+                        marginal_zero[action] += visits[action * kActions + opponent];
+                        marginal_one[action] += visits[opponent * kActions + action];
+                    }
+                }
+                /* v7 Stage 0 item 0.2 (KataGo forced playouts + policy-target pruning): ACTION
+                   SELECTION below (sample_joint_action, on the raw joint `visits`) always uses
+                   the UNPRUNED marginals - only the POLICY TRAINING TARGET built here is pruned,
+                   and only when forcing is active. config.forced_playouts_k<=0 (off, default)
+                   never enters this branch, so zero.policy/one.policy are built from
+                   marginal_zero/marginal_one exactly as before this feature existed - bit for
+                   bit (see policy_target_pruning.h for the pruning arithmetic, and
+                   ForcedPlayoutMetrics above for what this records). */
+                std::array<int, kActions> policy_visits_zero = marginal_zero;
+                std::array<int, kActions> policy_visits_one = marginal_one;
+                int policy_total_zero = total_visits;
+                int policy_total_one = total_visits;
+                if (config.forced_playouts_k > 0.0) {
+                    auto record_forced_playout_move = [&](
+                            const std::array<int, kActions>& marginal,
+                            const std::array<int, kActions>& forced,
+                            std::array<int, kActions>& policy_visits_out, int& policy_total_out) {
+                        policy_visits_out = prune_policy_target_visits(marginal, forced);
+                        policy_total_out = std::accumulate(
+                            policy_visits_out.begin(), policy_visits_out.end(), 0);
+                        const int forced_sum = std::accumulate(forced.begin(), forced.end(), 0);
+                        ++last_forced_playouts.moves;
+                        last_forced_playouts.forced_visits_sum += forced_sum;
+                        last_forced_playouts.pruned_fraction_sum += total_visits > 0
+                            ? static_cast<double>(total_visits - policy_total_out) / total_visits
+                            : 0.0;
+                    };
+                    record_forced_playout_move(marginal_zero, searches[active_index].forced0,
+                                               policy_visits_zero, policy_total_zero);
+                    record_forced_playout_move(marginal_one, searches[active_index].forced1,
+                                               policy_visits_one, policy_total_one);
+                    last_forced_playouts.floor_violations +=
+                        searches[active_index].floor_violations;
+                }
+                for (int action = 0; action < kActions; ++action) {
+                    zero.policy[action] = static_cast<float>(policy_visits_zero[action]) /
+                                          std::max(policy_total_zero, 1);
+                    one.policy[action] = static_cast<float>(policy_visits_one[action]) /
+                                         std::max(policy_total_one, 1);
+                }
+                game.trajectory.push_back(std::move(zero));
+                game.trajectory.push_back(std::move(one));
+                const float temperature = resolve_temperature(game.env.state.step, config);
+                const int joint = sample_joint_action(visits, temperature, rng);
+                const Action actions[2] = {static_cast<Action>(joint / kActions),
+                                           static_cast<Action>(joint % kActions)};
+                last_self_play.total_steps += 2;
+                if (actions[0] == ACTION_WAIT) last_self_play.wait_steps++;
+                if (actions[1] == ACTION_WAIT) last_self_play.wait_steps++;
+                action_histogram[static_cast<size_t>(actions[0])]++;
+                action_histogram[static_cast<size_t>(actions[1])]++;
+                game.done = env_step_joint(&game.env, actions, 2).done != 0;
+                if (game.done) {
+                    /* Per-seat terminal values: decisive games are antisymmetric (+1/-1),
+                       but a timeout/mutual-death draw is negative for BOTH seats, so the
+                       two trajectories must be valued independently rather than negated. */
+                    const float value_seat0 = terminal_training_value(game.env, 0,
+                        config.timeout_draw_value, config.mutual_death_value,
+                        config.arena_crush_win_value, config.selfkill_win_value);
+                    const float value_seat1 = terminal_training_value(game.env, 1,
+                        config.timeout_draw_value, config.mutual_death_value,
+                        config.arena_crush_win_value, config.selfkill_win_value);
+                    const int game_outcome = outcome(game.env, 0);
+                    last_self_play.wins += game_outcome > 0;
+                    last_self_play.losses += game_outcome < 0;
+                    last_self_play.draws += game_outcome == 0;
+                    /* Classify HOW the game was decided, either seat, same convention as
+                       Evaluation's win_by_bomb/selfkill/crush. KL-105 Phase 3: outcome_cause
+                       mirrors that same classification onto every sample of this game
+                       (game-level tag, both seats); bomb_winner_seat stays -1 unless the game
+                       was bomb-decisive, in which case only that seat's samples get
+                       bomb_win_side=1 below - the loser seat of a bomb game gets the cause tag
+                       but is not pool A. */
+                    auto outcome_cause = static_cast<uint8_t>(OutcomeCause::kTimeoutDraw);
+                    int bomb_winner_seat = -1;
+                    if (game_outcome != 0) {
+                        const int winner_seat = game_outcome > 0 ? 0 : 1;
+                        const int loser_seat = 1 - winner_seat;
+                        const int died_owner = game.env.state.death_owner[loser_seat];
+                        if (died_owner == loser_seat) {
+                            last_self_play.win_by_selfkill++;
+                            outcome_cause = static_cast<uint8_t>(OutcomeCause::kSelfkill);
+                        } else if (died_owner == winner_seat) {
+                            last_self_play.win_by_bomb++;
+                            outcome_cause = static_cast<uint8_t>(OutcomeCause::kBomb);
+                            bomb_winner_seat = winner_seat;
+                        } else {
+                            last_self_play.win_by_crush++;
+                            outcome_cause = static_cast<uint8_t>(OutcomeCause::kArenaCrush);
+                        }
+                    } else {
+                        const bool seat0_alive = game.env.state.agents[0].alive != 0;
+                        const bool seat1_alive = game.env.state.agents[1].alive != 0;
+                        if (!seat0_alive && !seat1_alive) {
+                            last_self_play.draw_mutual_death++;
+                            outcome_cause = static_cast<uint8_t>(OutcomeCause::kMutualDeath);
+                        } else {
+                            last_self_play.draw_timeout_alive++;
+                            outcome_cause = static_cast<uint8_t>(OutcomeCause::kTimeoutDraw);
+                        }
+                    }
+                    total_game_steps += game.env.state.step;
+                    for (size_t sample_index = 0; sample_index < game.trajectory.size(); ++sample_index) {
+                        const int sample_seat = static_cast<int>(sample_index % 2);
+                        game.trajectory[sample_index].value =
+                            sample_index % 2 == 0 ? value_seat0 : value_seat1;
+                        game.trajectory[sample_index].outcome_cause = outcome_cause;
+                        game.trajectory[sample_index].bomb_win_side =
+                            bomb_winner_seat == sample_seat ? 1 : 0;
+                        result.push_back(std::move(game.trajectory[sample_index]));
+                    }
+                    ++completed;
+                    progress.update(completed, "samples=" + std::to_string(result.size()));
+                }
+            }
+        }
+        if (completed > 0)
+            last_self_play.mean_steps = static_cast<double>(total_game_steps) / completed;
+        return result;
+    }
+
+    /* League self-play: one seat is the network (searched, contributes training samples),
+       the other is a scripted agent (real moves via agent_act, never MCTS-searched) — a
+       deterministic-mode search opponent per game via SearchConstraint so lookahead treats
+       the opponent seat's hypothetical future moves as opponent_type would actually play,
+       not as another copy of the network. root_noise stays ON (true): this is real training
+       data, not evaluation, so dirichlet exploration must not be dropped. Which seat is the
+       learner is balanced per game (SD-off diagnostic showed a hard seat asymmetry — a
+       fixed-seat league would only teach half the game). */
+    std::vector<Sample> collect_league_play(int games_count, AgentType opponent_type) {
+        struct Game {
+            BomberEnv env{};
+            Agent opponent{};
+            int learner_seat{};
+            std::vector<Sample> trajectory;
+            bool done{};
+        };
+        const BomberConfig base = game_config(config);
+        std::vector<Game> games(games_count);
+        for (int index = 0; index < games_count; ++index) {
+            const uint64_t seed = static_cast<uint64_t>(config.seed) * 100'000'007ULL +
+                                  static_cast<uint64_t>(iteration + 1) * 100'003ULL +
+                                  5'000'000ULL + index;
+            Game& game = games[index];
+            game.learner_seat = static_cast<int>(rng() % 2);
+            env_init(&game.env, &base);
+            env_reset(&game.env, seed);
+            agent_init(&game.opponent, opponent_type);
+            agent_reset(&game.opponent, seed * 2 + static_cast<uint64_t>(1 - game.learner_seat));
+        }
+        std::vector<Sample> result;
+        last_league_play = {};
+        int64_t total_game_steps = 0;
+        PhaseProgress progress("league-" + std::string(agent_type_name(opponent_type)),
+                               games_count, config.progress);
+        BatchedMcts search(model, device, config, rng, iteration);
+        int completed = 0;
+        while (completed < games_count && !stop_requested.load()) {
+            std::vector<BomberEnv*> active;
+            std::vector<int> indices;
+            std::vector<SearchConstraint> constraints;
+            for (int index = 0; index < games_count; ++index) {
+                if (!games[index].done) {
+                    active.push_back(&games[index].env);
+                    indices.push_back(index);
+                    const int opponent_seat = 1 - games[index].learner_seat;
+                    /* Do not recursively invoke a full MCTS baseline at every search leaf
+                       (mirrors evaluate_baseline's identical guard); irrelevant while the
+                       only caller passes AGENT_HEURISTIC, kept for future opponent types. */
+                    const int modeled_seat = opponent_type == AGENT_MCTS ? -1 : opponent_seat;
+                    constraints.push_back({modeled_seat, opponent_type,
+                                           800'001ULL + static_cast<uint64_t>(index)});
+                }
+            }
+            auto searches = search.search(active, constraints, true);
+            for (size_t active_index = 0; active_index < active.size(); ++active_index) {
+                Game& game = games[indices[active_index]];
+                const int learner_seat = game.learner_seat;
+                const int opponent_seat = 1 - learner_seat;
+                const auto& visits = searches[active_index].visits;
+                const int total_visits = std::accumulate(visits.begin(), visits.end(), 0);
+                Sample sample;
+                encode_state(game.env, learner_seat, sample.state);
+                std::array<int, kActions> marginal{};
+                for (int action = 0; action < kActions; ++action) {
+                    for (int opponent_action = 0; opponent_action < kActions; ++opponent_action)
+                        marginal[action] += learner_seat == 0
+                            ? visits[action * kActions + opponent_action]
+                            : visits[opponent_action * kActions + action];
+                }
+                /* v7 Stage 0 item 0.2: same "unpruned for action selection, pruned only for the
+                   policy target" split as collect_self_play() above - see that function's own
+                   comment for the full rationale. Only the LEARNER seat's marginal/forced array
+                   is relevant here (the opponent seat is scripted, never trained on). */
+                std::array<int, kActions> policy_visits = marginal;
+                int policy_total = total_visits;
+                if (config.forced_playouts_k > 0.0) {
+                    const auto& forced = learner_seat == 0 ? searches[active_index].forced0
+                                                           : searches[active_index].forced1;
+                    policy_visits = prune_policy_target_visits(marginal, forced);
+                    policy_total = std::accumulate(policy_visits.begin(), policy_visits.end(), 0);
+                    const int forced_sum = std::accumulate(forced.begin(), forced.end(), 0);
+                    ++last_forced_playouts.moves;
+                    last_forced_playouts.forced_visits_sum += forced_sum;
+                    last_forced_playouts.pruned_fraction_sum += total_visits > 0
+                        ? static_cast<double>(total_visits - policy_total) / total_visits
+                        : 0.0;
+                    last_forced_playouts.floor_violations +=
+                        searches[active_index].floor_violations;
+                }
+                for (int action = 0; action < kActions; ++action)
+                    sample.policy[action] = static_cast<float>(policy_visits[action]) /
+                                            std::max(policy_total, 1);
+                game.trajectory.push_back(std::move(sample));
+
+                const float temperature = resolve_temperature(game.env.state.step, config);
+                const int joint = sample_joint_action(visits, temperature, rng);
+                const int learner_action = learner_seat == 0 ? joint / kActions : joint % kActions;
+
+                Observation observation;
+                DebugSnapshot snapshot;
+                env_observe(&game.env, opponent_seat, &observation);
+                env_get_debug_snapshot(&game.env, &snapshot);
+                const int opponent_action = static_cast<int>(
+                    agent_act(&game.opponent, &observation, &snapshot));
+
+                Action actions[2];
+                actions[learner_seat] = static_cast<Action>(learner_action);
+                actions[opponent_seat] = static_cast<Action>(opponent_action);
+
+                last_league_play.learner_total_steps++;
+                if (learner_action == static_cast<int>(ACTION_WAIT))
+                    last_league_play.learner_wait_steps++;
+                action_histogram[static_cast<size_t>(learner_action)]++;
+
+                const StepResult step_result = env_step_joint(&game.env, actions, 2);
+                game.done = step_result.done != 0;
+                if (game.done) {
+                    const float value = terminal_training_value(game.env, learner_seat,
+                        config.timeout_draw_value, config.mutual_death_value,
+                        config.arena_crush_win_value, config.selfkill_win_value);
+                    const int game_outcome = outcome(game.env, learner_seat);
+                    last_league_play.wins += game_outcome > 0;
+                    last_league_play.losses += game_outcome < 0;
+                    last_league_play.draws += game_outcome == 0;
+                    const bool learner_alive = game.env.state.agents[learner_seat].alive != 0;
+                    const bool opp_alive = game.env.state.agents[opponent_seat].alive != 0;
+                    /* KL-105 Phase 3: same cause taxonomy as the mirror site above - "how the
+                       game ended", not "who won" - so a learner LOSS to the opponent's bomb
+                       still classifies as kBomb (the enum tracks the decisive death, whichever
+                       seat it belongs to), just with bomb_win_side left 0 since the learner
+                       (the only seat this trajectory samples) was not the winner. The whole
+                       trajectory is the learner seat, so unlike the mirror site there is no
+                       per-sample seat split - one cause/bomb_win_side pair applies to every
+                       sample of this game. */
+                    auto outcome_cause = static_cast<uint8_t>(OutcomeCause::kTimeoutDraw);
+                    uint8_t bomb_win_side = 0;
+                    if (game_outcome > 0) {
+                        const int died_owner = game.env.state.death_owner[opponent_seat];
+                        if (died_owner == opponent_seat) {
+                            last_league_play.win_by_selfkill++;
+                            outcome_cause = static_cast<uint8_t>(OutcomeCause::kSelfkill);
+                        } else if (died_owner == learner_seat) {
+                            last_league_play.win_by_bomb++;
+                            outcome_cause = static_cast<uint8_t>(OutcomeCause::kBomb);
+                            bomb_win_side = 1;
+                        } else {
+                            last_league_play.win_by_crush++;
+                            outcome_cause = static_cast<uint8_t>(OutcomeCause::kArenaCrush);
+                        }
+                    } else if (game_outcome < 0) {
+                        const int died_owner = game.env.state.death_owner[learner_seat];
+                        if (died_owner == learner_seat) {
+                            last_league_play.loss_by_selfkill++;
+                            outcome_cause = static_cast<uint8_t>(OutcomeCause::kSelfkill);
+                        } else if (died_owner == opponent_seat) {
+                            last_league_play.loss_by_bomb++;
+                            outcome_cause = static_cast<uint8_t>(OutcomeCause::kBomb);
+                        } else {
+                            last_league_play.loss_by_crush++;
+                            outcome_cause = static_cast<uint8_t>(OutcomeCause::kArenaCrush);
+                        }
+                    } else if (!learner_alive && !opp_alive) {
+                        last_league_play.draw_mutual_death++;
+                        outcome_cause = static_cast<uint8_t>(OutcomeCause::kMutualDeath);
+                    } else {
+                        last_league_play.draw_timeout_alive++;
+                        outcome_cause = static_cast<uint8_t>(OutcomeCause::kTimeoutDraw);
+                    }
+                    total_game_steps += game.env.state.step;
+                    for (auto& s : game.trajectory) {
+                        s.value = value;
+                        s.outcome_cause = outcome_cause;
+                        s.bomb_win_side = bomb_win_side;
+                        result.push_back(std::move(s));
+                    }
+                    ++completed;
+                    progress.update(completed, "samples=" + std::to_string(result.size()));
+                }
+            }
+        }
+        if (completed > 0)
+            last_league_play.mean_steps = static_cast<double>(total_game_steps) / completed;
+        return result;
+    }
+
+    double learning_rate() const {
+        const int64_t schedule_updates = config.learning_rate_schedule_updates > 0 ?
+            config.learning_rate_schedule_updates :
+            std::max<int64_t>(static_cast<int64_t>(config.iterations) *
+                              config.train_steps, 1);
+        const double progress = std::clamp(
+            static_cast<double>(global_updates -
+                config.learning_rate_schedule_start_update) / schedule_updates,
+            0.0, 1.0);
+        const double cosine = 0.5 * (1.0 + std::cos(std::numbers::pi * progress));
+        return config.min_learning_rate +
+               (config.learning_rate - config.min_learning_rate) * cosine;
+    }
+
+    OptimizationMetrics optimize() {
+        OptimizationMetrics metrics;
+        if (replay.size() == 0 || config.train_steps == 0) return metrics;
+        PhaseProgress progress("optimize", config.train_steps, config.progress);
+        model->train();
+        /* v7 Stage-1 IL Bombing-Collapse guards (docs/experiment-memory/14 Stage 1). Both read
+           the member `iteration`, which optimize() sees at the SAME 0-based value run()'s
+           teacher window compares (optimize() is called BEFORE run()'s ++iteration, exactly like
+           the `iteration < config.teacher_iterations` collection guard). value_only_iterations K:
+           the first K iterations (indices 0..K-1) train value only, so the policy term is active
+           iff iteration >= K. These are constant across this call's train_steps (they depend
+           only on iteration + config), so they are computed once and recorded verbatim in
+           metrics for observability - policy_loss below is still accumulated UNSCALED for the
+           reader regardless. */
+        const bool policy_active = iteration >= config.value_only_iterations;
+        const bool entropy_bonus_active = policy_active && config.policy_entropy_bonus > 0.0;
+        metrics.policy_loss_applied_weight = policy_active ? 1.0 : 0.0;
+        metrics.policy_entropy_bonus_applied =
+            entropy_bonus_active ? config.policy_entropy_bonus : 0.0;
+        int steps_completed = 0;
+        /* Once optimization starts, finish the phase. A partial optimizer phase
+           would require persisting an intra-iteration cursor and would replay
+           the same self-play samples after resume. */
+        for (int step = 0; step < config.train_steps; ++step) {
+            const double rate = learning_rate();
+            for (auto& group : optimizer.param_groups())
+                static_cast<torch::optim::AdamWOptions&>(group.options()).lr(rate);
+            auto [states_cpu, target_policy_cpu, target_value_cpu, forced_pool_a_fraction,
+                  total_pool_a_fraction] =
+                replay.batch(config.batch_size, rng, config.replay_cause_balance_cap);
+            metrics.realized_pool_a_batch_fraction += forced_pool_a_fraction;
+            metrics.total_pool_a_batch_fraction += total_pool_a_fraction;
+            auto states = states_cpu.to(device);
+            auto target_policy = target_policy_cpu.to(device);
+            auto target_value = target_value_cpu.to(device);
+            optimizer.zero_grad();
+            torch::Tensor logits;
+            torch::Tensor predicted_value;
+            /* Keep optimization in FP32. BF16 remains enabled for the much
+               larger inference workload; FP32 backward avoids scaler state
+               and gives exact resume semantics across driver revisions. */
+            std::tie(logits, predicted_value) = model->forward(states);
+            logits = logits.to(torch::kFloat32);
+            predicted_value = predicted_value.to(torch::kFloat32);
+            auto policy_loss = -(target_policy * torch::log_softmax(logits, 1))
+                .sum(1).mean();
+            auto value_loss = torch::mse_loss(predicted_value, target_value);
+            /* v7 Stage-1 IL Bombing-Collapse guards. Explicit branches keep the OFF path
+               (policy_active && !entropy_bonus_active - the default when both knobs are off) at
+               `policy_loss + value_loss`, bit-for-bit today's graph. During the value-only
+               warmup the policy term is dropped from the graph entirely (weight 0.0); the
+               forward is still run above and policy_loss is still reported unscaled below. When
+               the entropy floor is active the DIFFERENTIABLE entropy of the network's softmax
+               policy is subtracted (a separate, live-tensor computation - the metrics `entropy`
+               below stays on the detached softmax, unchanged). */
+            torch::Tensor loss;
+            if (!policy_active) {
+                loss = value_loss;
+            } else if (entropy_bonus_active) {
+                auto log_policy = torch::log_softmax(logits, 1);
+                auto differentiable_entropy =
+                    -(torch::softmax(logits, 1) * log_policy).sum(1).mean();
+                loss = policy_loss - config.policy_entropy_bonus * differentiable_entropy +
+                       value_loss;
+            } else {
+                loss = policy_loss + value_loss;
+            }
+            loss.backward();
+            torch::nn::utils::clip_grad_norm_(model->parameters(), 5.0);
+            optimizer.step();
+            auto probabilities = torch::softmax(logits.detach(), 1);
+            auto entropy = -(probabilities * torch::log(probabilities + 1e-8))
+                .sum(1).mean();
+            metrics.loss += loss.item<double>();
+            metrics.policy_loss += policy_loss.item<double>();
+            metrics.value_loss += value_loss.item<double>();
+            metrics.entropy += entropy.item<double>();
+            metrics.learning_rate = rate;
+            ++global_updates;
+            ++steps_completed;
+            progress.update(step + 1);
+        }
+        if (steps_completed > 0) {
+            metrics.loss /= steps_completed;
+            metrics.policy_loss /= steps_completed;
+            metrics.value_loss /= steps_completed;
+            metrics.entropy /= steps_completed;
+            metrics.realized_pool_a_batch_fraction /= steps_completed;
+            metrics.total_pool_a_batch_fraction /= steps_completed;
+        }
+        return metrics;
+    }
+
+    Evaluation evaluate_baseline(AgentType type, int games_count, int simulations,
+                                 uint64_t seed_base,
+                                 const std::filesystem::path& replay_out = {},
+                                 const std::string& candidate_label = {},
+                                 const std::filesystem::path& per_match_output = {},
+                                 const std::filesystem::path& trace_output = {}) {
+        struct Match {
+            BomberEnv env{};
+            Agent opponent{};
+            int learner_seat{};
+            bool done{};
+            uint64_t seed{};
+            int wait_steps{};
+            int total_steps{};
+        };
+        const BomberConfig base = game_config(config);
+        const int total_matches = games_count * 2;
+        std::vector<Match> matches(total_matches);
+        for (int index = 0; index < total_matches; ++index) {
+            const int seed_index = index / 2;
+            const uint64_t seed = seed_base + static_cast<uint64_t>(seed_index);
+            Match& match = matches[index];
+            match.learner_seat = index % 2;
+            match.seed = seed;
+            env_init(&match.env, &base);
+            env_reset(&match.env, seed);
+            agent_init(&match.opponent, type);
+            agent_reset(&match.opponent, seed * 2 + (1 - match.learner_seat));
+            if (type == AGENT_MCTS && !mcts_agent_configure(
+                    &match.opponent, config.baseline_mcts_simulations,
+                    config.baseline_mcts_depth))
+                throw std::runtime_error("invalid native MCTS baseline configuration");
+        }
+        /* KL-108 Brick 2: immutable per-match rows - one JSON line per completed match,
+           written as each match finishes (not buffered/reordered) so a killed process still
+           leaves a valid partial record. Aggregate Evaluation stats alone can't answer
+           per-seed/per-seat questions or be re-sliced later without rerunning the eval. */
+        std::unique_ptr<std::ofstream> per_match_log;
+        if (!per_match_output.empty()) {
+            if (!per_match_output.parent_path().empty())
+                std::filesystem::create_directories(per_match_output.parent_path());
+            per_match_log = std::make_unique<std::ofstream>(per_match_output, std::ios::trunc);
+            if (!*per_match_log)
+                throw std::runtime_error("could not open per-match evidence output: " +
+                                         per_match_output.string());
+        }
+        /* KL-107: per-LEARNER-STEP neural decision trace, one JSON line per step across all
+           matches. Stamped with checkpoint/executable hashes (reusing KL-101 Part C's
+           sha256_file/current_executable_path - the same provenance question, "what exactly
+           produced this," applies here too) so a trace file is self-describing without a
+           separate manifest lookup. Trace-off (trace_output empty, the default) means this
+           whole block never executes and nothing about the search or chosen actions changes -
+           every value read here (priors, visits, value sums) was already computed by the
+           search regardless of whether anyone is watching.
+           v3 adds a genuinely raw (pre-mask) policy/value head recomputation, the safe-action
+           mask used to derive masked_prior from it, a wait_forced flag (idling forced by the
+           mask vs chosen among alternatives), and root Q per learner action - the raw/value
+           recomputation costs one extra single-position forward pass per traced step, still
+           entirely gated behind trace_output being set.
+           v4 adds opponent_modeled_as (what the search's internal lookahead assumed for the
+           opposing seat during this step's search - "self" when SearchConstraint::
+           fixed_opponent_seat is -1, meaning expand_and_backup used the network's own policy
+           for BOTH seats internally regardless of who the outer match is actually being played
+           against, or the fixed baseline agent's type name otherwise - this is the concrete,
+           per-row form of the opponent-model-mismatch caveat already documented in
+           docs/NATIVE_ALPHAZERO.md) and learner_moved (whether the learner's board position
+           actually changed this step - false for WAIT/PLACE_BOMB by construction, and false for
+           a movement action that was blocked by a wall/crate/bomb/other agent or lost a
+           simultaneous-move collision resolution; makes "effective idle," not just explicit
+           WAIT, directly measurable from the trace). learner_moved needs the post-step position,
+           so unlike every other v4-and-earlier field it is captured and appended to the row
+           AFTER env_step_joint runs, not in this block - the row is intentionally left open
+           (no closing brace/flush) until then. */
+        std::unique_ptr<std::ofstream> trace_log;
+        if (!trace_output.empty()) {
+            if (!trace_output.parent_path().empty())
+                std::filesystem::create_directories(trace_output.parent_path());
+            trace_log = std::make_unique<std::ofstream>(trace_output, std::ios::trunc);
+            if (!*trace_log)
+                throw std::runtime_error("could not open neural trace output: " +
+                                         trace_output.string());
+            *trace_log << "{\"trace_format_version\":4,\"checkpoint_sha256\":\""
+                       << sha256_file(requested_checkpoint_path)
+                       << "\",\"executable_sha256\":\""
+                       << sha256_file(current_executable_path())
+                       << "\",\"git_commit\":\"" << AI_BOMBER_GIT_SHA
+                       << "\",\"opponent_type\":\"" << agent_type_name(type) << "\"}\n";
+        }
+        /* Optional: record match 0 (both seats' joint actions + full flame/arena state
+           each step) into a v4 replay bomber_viz can play back. Match 0 uses seed_base. */
+        std::unique_ptr<Replay> recorder;
+        if (!replay_out.empty()) {
+            recorder = std::make_unique<Replay>();
+            replay_init(recorder.get(), &base, seed_base);
+        }
+        Evaluation result;
+        /* Selection and reporting must measure the network, never the tactical
+           heuristic used only to bootstrap early self-play search. */
+        BatchedMcts search(model, device, config, rng, iteration, false);
+        PhaseProgress progress(std::string("evaluate-") + agent_type_name(type),
+                               total_matches, config.progress);
+        int completed = 0;
+        int64_t total_steps = 0;
+        while (completed < total_matches && !stop_requested.load()) {
+            std::vector<BomberEnv*> active;
+            std::vector<int> indices;
+            std::vector<SearchConstraint> constraints;
+            for (int index = 0; index < total_matches; ++index) {
+                if (!matches[index].done) {
+                    active.push_back(&matches[index].env);
+                    indices.push_back(index);
+                    /* Do not recursively invoke the native MCTS baseline at
+                       every neural-search leaf. Strong-search evaluation uses
+                       the real MCTS agent at the root game only. */
+                    const int modeled_seat = type == AGENT_MCTS ? -1 :
+                                             1 - matches[index].learner_seat;
+                    constraints.push_back({modeled_seat, type,
+                                           700'001ULL + static_cast<uint64_t>(index)});
+                }
+            }
+            auto searches = search.search(active, constraints, false, simulations);
+            for (size_t active_index = 0; active_index < active.size(); ++active_index) {
+                Match& match = matches[indices[active_index]];
+                const auto& search_result = searches[active_index];
+                const int learner_action = marginal_action(
+                    search_result.visits, match.learner_seat);
+                /* v4: pre-step position and the opponent-model assumption, both declared at
+                   loop scope (like Observation/DebugSnapshot below) so learner_moved can be
+                   computed and appended to the still-open trace row after env_step_joint runs,
+                   further down this same loop body. Trivial cost when trace_log is null - same
+                   tolerance the file already accepts for the unconditional Observation/
+                   DebugSnapshot declarations a few lines below. */
+                int pre_move_x = 0, pre_move_y = 0;
+                const char* opponent_modeled_as = "";
+                if (trace_log) {
+                    opponent_modeled_as = constraints[active_index].fixed_opponent_seat == -1
+                        ? "self" : agent_type_name(constraints[active_index].fixed_opponent_type);
+                    pre_move_x = match.env.state.agents[match.learner_seat].x;
+                    pre_move_y = match.env.state.agents[match.learner_seat].y;
+                    /* Root priors have already passed through safe-action masking and
+                       renormalization. Name them accordingly: agreement with this prior can
+                       implicate the policy+mask path, but cannot isolate the raw policy head.
+                       Search value is likewise a backed-up root average, not raw value-head
+                       output. */
+                    const auto masked_prior = marginal_distribution(
+                        search_result.priors, match.learner_seat);
+                    const auto mcts_policy = marginal_distribution(search_result.visits, match.learner_seat);
+                    const auto& value_sum = match.learner_seat == 0 ? search_result.value_sum0
+                                                                     : search_result.value_sum1;
+                    const int root_visits = std::accumulate(
+                        search_result.visits.begin(), search_result.visits.end(), 0);
+                    double value_estimate = 0.0;
+                    for (size_t joint = 0; joint < kJointActions; ++joint) value_estimate += value_sum[joint];
+                    value_estimate = root_visits > 0 ? value_estimate / root_visits : 0.0;
+
+                    /* KL-107 v3: genuinely raw (pre-mask) policy/value head output at this exact
+                       root position, via a fresh single-position forward pass. expand_and_backup
+                       masks and renormalizes every node it expands, root or interior alike, so
+                       there is no hook inside the search that ever holds the unmasked values -
+                       they are gone by the time SearchResult exists. match.env here is the same
+                       pre-step position the search evaluated (Node copies the env on construction
+                       and never mutates the original, and no step has been applied to match.env
+                       yet), so this reproduces the root evaluation rather than approximating it.
+                       Recomputed, not captured - name fields accordingly so this cannot be
+                       misread as "the policy the search used" the way v1's raw_policy was. */
+                    std::array<float, kObservationSize> encoded{};
+                    if (bomber_training_encode_env(&match.env, match.learner_seat, encoded.data(),
+                                                    kObservationSize) != kObservationSize)
+                        throw std::runtime_error("C observation encoder failed during KL-107 trace capture");
+                    auto raw_input = torch::from_blob(encoded.data(),
+                        {1, BOMBER_TRAINING_CHANNELS, BOMBER_TRAINING_VIEW_SIZE,
+                         BOMBER_TRAINING_VIEW_SIZE}, torch::kFloat32).to(device);
+                    torch::Tensor raw_logits, raw_value_tensor;
+                    model->eval();
+                    {
+                        torch::InferenceMode inference;
+                        AutocastGuard autocast;
+                        std::tie(raw_logits, raw_value_tensor) = model->forward(raw_input);
+                    }
+                    const auto raw_policy_tensor =
+                        torch::softmax(raw_logits.to(torch::kFloat32), 1).to(torch::kCPU);
+                    const auto raw_policy_accessor = raw_policy_tensor.accessor<float, 2>();
+                    std::array<double, kActions> raw_policy{};
+                    for (int action = 0; action < kActions; ++action)
+                        raw_policy[action] = raw_policy_accessor[0][action];
+                    const double raw_value_head =
+                        raw_value_tensor.to(torch::kFloat32).to(torch::kCPU).item<float>();
+
+                    /* Same safe-action computation the search itself used to build masked_prior
+                       above (shared helper, not a re-derivation) - safe_action_count==1 with
+                       that one action being WAIT means idling was the position's only SAFE
+                       action (per the tactical safety model, not plain game-rule legality - an
+                       action can be legal but tactically unsafe, e.g. walking into an active
+                       blast), not a policy preference, distinguishing forced from chosen idling. */
+                    int safe_action_count = 0;
+                    const auto safe_mask = safe_action_mask_for(
+                        match.env, match.learner_seat, safe_action_count);
+                    const bool wait_forced = safe_action_count == 1 &&
+                        safe_mask[static_cast<int>(ACTION_WAIT)] == 1;
+
+                    /* Root Q per learner action, marginalized from the same seat-aware
+                       accumulation select_joint uses internally (value_sum / visits) - reusing
+                       marginal_distribution on both arrays instead of hand-rolling the seat-
+                       dependent joint-index layout (a*kActions+opp for seat 0, opp*kActions+a
+                       for seat 1) avoids a transposed-but-plausible Q vector. */
+                    const auto q_visits = marginal_distribution(
+                        search_result.visits, match.learner_seat);
+                    const auto q_value_sums = marginal_distribution(value_sum, match.learner_seat);
+                    std::array<double, kActions> root_q{};
+                    for (int action = 0; action < kActions; ++action)
+                        root_q[action] = q_visits[action] > 0.0
+                            ? q_value_sums[action] / q_visits[action] : 0.0;
+
+                    *trace_log << "{\"seed\":" << match.seed
+                        << ",\"learner_seat\":" << match.learner_seat
+                        << ",\"step\":" << match.env.state.step
+                        << ",\"chosen_action\":" << learner_action
+                        << ",\"policy_prior_after_safety_mask\":[";
+                    for (int action = 0; action < kActions; ++action)
+                        *trace_log << (action ? "," : "") << masked_prior[action];
+                    *trace_log << "],\"policy_prior_entropy\":"
+                        << distribution_entropy(masked_prior)
+                        << ",\"mcts_policy\":[";
+                    for (int action = 0; action < kActions; ++action)
+                        *trace_log << (action ? "," : "") << mcts_policy[action];
+                    *trace_log << "],\"root_visits\":" << root_visits
+                        << ",\"search_value_estimate\":" << value_estimate
+                        << ",\"policy_head_raw_recomputed\":[";
+                    for (int action = 0; action < kActions; ++action)
+                        *trace_log << (action ? "," : "") << raw_policy[action];
+                    *trace_log << "],\"policy_head_raw_recomputed_entropy\":"
+                        << distribution_entropy(raw_policy)
+                        << ",\"value_head_raw_recomputed\":" << raw_value_head
+                        << ",\"safe_action_mask\":[";
+                    for (int action = 0; action < kActions; ++action)
+                        *trace_log << (action ? "," : "") << safe_mask[action];
+                    *trace_log << "],\"safe_action_count\":" << safe_action_count
+                        << ",\"wait_forced\":" << (wait_forced ? "true" : "false")
+                        << ",\"search_root_q_values\":[";
+                    for (int action = 0; action < kActions; ++action)
+                        *trace_log << (action ? "," : "") << root_q[action];
+                    *trace_log << "],\"running_wait_fraction\":"
+                        << (match.total_steps > 0
+                                ? static_cast<double>(match.wait_steps) / match.total_steps
+                                : 0.0)
+                        << ",\"opponent_modeled_as\":\"" << opponent_modeled_as << "\"";
+                    /* Row intentionally left open (no closing brace, no flush) - learner_moved
+                       needs the post-step position and is appended after env_step_joint below. */
+                }
+                Observation observation;
+                DebugSnapshot snapshot;
+                const int opponent_seat = 1 - match.learner_seat;
+                env_observe(&match.env, opponent_seat, &observation);
+                env_get_debug_snapshot(&match.env, &snapshot);
+                const int opponent_action = static_cast<int>(
+                    agent_act(&match.opponent, &observation, &snapshot));
+                Action actions[2];
+                actions[match.learner_seat] = static_cast<Action>(learner_action);
+                actions[opponent_seat] = static_cast<Action>(opponent_action);
+                result.learner_total_steps++;
+                match.total_steps++;
+                if (learner_action == static_cast<int>(ACTION_WAIT)) {
+                    result.learner_wait_steps++;
+                    match.wait_steps++;
+                }
+                const StepResult step_result = env_step_joint(&match.env, actions, 2);
+                match.done = step_result.done != 0;
+                if (trace_log) {
+                    /* WAIT and PLACE_BOMB never move the agent by construction (true
+                       regardless of fixture or checkpoint - asserted as a hard invariant in
+                       test_native_alphazero_trace_raw_check.py, not just expected empirically).
+                       A movement action with learner_moved==false means it was blocked - by a
+                       wall/crate/bomb/other agent, or by losing a simultaneous-move collision
+                       resolution against the opponent's chosen action - and is exactly the
+                       "effective idle" the last audit flagged as invisible to explicit-WAIT
+                       counting alone. */
+                    const bool learner_moved =
+                        match.env.state.agents[match.learner_seat].x != pre_move_x ||
+                        match.env.state.agents[match.learner_seat].y != pre_move_y;
+                    *trace_log << ",\"learner_moved\":" << (learner_moved ? "true" : "false")
+                               << "}\n";
+                    trace_log->flush();
+                }
+                if (recorder && indices[active_index] == 0) {
+                    replay_record_env(recorder.get(), &match.env, step_result);
+                    if (match.done) {
+                        replay_set_policies(recorder.get(), candidate_label.c_str(),
+                                            agent_type_name(type));
+                        replay_save(recorder.get(), replay_out.string().c_str());
+                    }
+                }
+                if (match.done) {
+                    const int match_outcome = outcome(match.env, match.learner_seat);
+                    result.wins += match_outcome > 0;
+                    result.losses += match_outcome < 0;
+                    result.draws += match_outcome == 0;
+                    result.wins_by_seat[match.learner_seat] += match_outcome > 0;
+                    result.losses_by_seat[match.learner_seat] += match_outcome < 0;
+                    result.draws_by_seat[match.learner_seat] += match_outcome == 0;
+                    /* Classify HOW the match was decided, not just who won. cause_name feeds
+                       both the aggregate counters below and the per-match JSONL row - one
+                       classification, not duplicated logic that could silently drift apart. */
+                    const bool learner_alive = match.env.state.agents[match.learner_seat].alive != 0;
+                    const bool opp_alive = match.env.state.agents[opponent_seat].alive != 0;
+                    const char* cause_name;
+                    if (match_outcome > 0) {
+                        const int died_owner = match.env.state.death_owner[opponent_seat];
+                        if (died_owner == opponent_seat) { result.win_by_selfkill++; cause_name = "opponent_selfkill"; }
+                        else if (died_owner == match.learner_seat) { result.win_by_bomb++; cause_name = "bomb"; }
+                        else { result.win_by_crush++; cause_name = "arena_crush"; }
+                    } else if (match_outcome < 0) {
+                        const int died_owner = match.env.state.death_owner[match.learner_seat];
+                        if (died_owner == match.learner_seat) { result.loss_by_selfkill++; cause_name = "selfkill"; }
+                        else if (died_owner == opponent_seat) { result.loss_by_bomb++; cause_name = "bomb"; }
+                        else { result.loss_by_crush++; cause_name = "arena_crush"; }
+                    } else if (!learner_alive && !opp_alive) {
+                        result.draw_mutual_death++;
+                        cause_name = "mutual_death";
+                    } else {
+                        result.draw_timeout_alive++;
+                        cause_name = "timeout_both_alive";
+                    }
+                    if (per_match_log) {
+                        *per_match_log << "{\"seed\":" << match.seed
+                            << ",\"learner_seat\":" << match.learner_seat
+                            << ",\"outcome\":\""
+                            << (match_outcome > 0 ? "win" : match_outcome < 0 ? "loss" : "draw")
+                            << "\",\"cause\":\"" << cause_name << "\",\"steps\":"
+                            << match.env.state.step << ",\"learner_wait_steps\":"
+                            << match.wait_steps << ",\"learner_total_steps\":"
+                            << match.total_steps << ",\"learner_wait_fraction\":"
+                            << (match.total_steps > 0
+                                    ? static_cast<double>(match.wait_steps) / match.total_steps
+                                    : 0.0)
+                            << "}\n";
+                        per_match_log->flush();
+                    }
+                    total_steps += match.env.state.step;
+                    ++completed;
+                    progress.update(completed);
+                }
+            }
+        }
+        const int played = result.wins + result.draws + result.losses;
+        result.score = played ? (result.wins + 0.5 * result.draws) / played : 0.0;
+        result.lower_confidence_bound = wilson_lower_bound(
+            result.score, played, config.promotion_confidence_z);
+        result.mean_steps = played ? static_cast<double>(total_steps) / played : 0.0;
+        return result;
+    }
+
+    PolicyValueNet load_model_from_checkpoint(const std::filesystem::path& source) const {
+        PolicyValueNet loaded(BOMBER_TRAINING_CHANNELS, config.channels,
+                              config.residual_blocks, kActions,
+                              BOMBER_TRAINING_VIEW_SIZE);
+        loaded->to(device);
+        torch::serialize::InputArchive archive;
+        archive.load_from(source.string(), device);
+        loaded->load(archive);
+        loaded->eval();
+        return loaded;
+    }
+
+    Evaluation evaluate_incumbent(const PolicyValueNet& incumbent, int games_count,
+                                  int simulations, uint64_t seed_base,
+                                  const std::filesystem::path& replay_out = {},
+                                  const std::string& candidate_label = {},
+                                  const std::string& incumbent_label = {}) {
+        struct Match {
+            BomberEnv env{};
+            int candidate_seat{};
+            bool done{};
+        };
+        const BomberConfig base = game_config(config);
+        const int total_matches = games_count * 2;
+        std::vector<Match> matches(total_matches);
+        for (int index = 0; index < total_matches; ++index) {
+            Match& match = matches[index];
+            match.candidate_seat = index % 2;
+            env_init(&match.env, &base);
+            env_reset(&match.env, seed_base + static_cast<uint64_t>(index / 2));
+        }
+
+        /* Optional: record match 0 (candidate-vs-incumbent) into a v4 replay. */
+        std::unique_ptr<Replay> recorder;
+        if (!replay_out.empty()) {
+            recorder = std::make_unique<Replay>();
+            replay_init(recorder.get(), &base, seed_base);
+        }
+        Evaluation result;
+        BatchedMcts candidate_search(model, device, config, rng, iteration, false);
+        BatchedMcts incumbent_search(incumbent, device, config, rng, iteration, false);
+        PhaseProgress progress("evaluate-incumbent", total_matches, config.progress);
+        int completed = 0;
+        int64_t total_steps = 0;
+        while (completed < total_matches && !stop_requested.load()) {
+            std::vector<BomberEnv*> active;
+            std::vector<int> indices;
+            std::vector<SearchConstraint> constraints;
+            for (int index = 0; index < total_matches; ++index) {
+                if (!matches[index].done) {
+                    active.push_back(&matches[index].env);
+                    indices.push_back(index);
+                    constraints.emplace_back();
+                }
+            }
+            const auto candidate_results = candidate_search.search(
+                active, constraints, false, simulations);
+            const auto incumbent_results = incumbent_search.search(
+                active, constraints, false, simulations);
+            for (size_t active_index = 0; active_index < active.size(); ++active_index) {
+                Match& match = matches[indices[active_index]];
+                const int incumbent_seat = 1 - match.candidate_seat;
+                const int candidate_action = marginal_action(
+                    candidate_results[active_index].visits, match.candidate_seat);
+                Action actions[2];
+                actions[match.candidate_seat] = static_cast<Action>(candidate_action);
+                actions[incumbent_seat] = static_cast<Action>(marginal_action(
+                    incumbent_results[active_index].visits, incumbent_seat));
+                result.learner_total_steps++;
+                if (candidate_action == static_cast<int>(ACTION_WAIT)) result.learner_wait_steps++;
+                const StepResult step_result = env_step_joint(&match.env, actions, 2);
+                match.done = step_result.done != 0;
+                if (recorder && indices[active_index] == 0) {
+                    replay_record_env(recorder.get(), &match.env, step_result);
+                    if (match.done) {
+                        replay_set_policies(recorder.get(), candidate_label.c_str(),
+                                            incumbent_label.c_str());
+                        replay_save(recorder.get(), replay_out.string().c_str());
+                    }
+                }
+                if (match.done) {
+                    const int match_outcome = outcome(match.env, match.candidate_seat);
+                    result.wins += match_outcome > 0;
+                    result.losses += match_outcome < 0;
+                    result.draws += match_outcome == 0;
+                    result.wins_by_seat[match.candidate_seat] += match_outcome > 0;
+                    result.losses_by_seat[match.candidate_seat] += match_outcome < 0;
+                    result.draws_by_seat[match.candidate_seat] += match_outcome == 0;
+                    const bool candidate_alive = match.env.state.agents[match.candidate_seat].alive != 0;
+                    const bool incumbent_alive = match.env.state.agents[incumbent_seat].alive != 0;
+                    if (match_outcome > 0) {
+                        const int died_owner = match.env.state.death_owner[incumbent_seat];
+                        if (died_owner == incumbent_seat) result.win_by_selfkill++;
+                        else if (died_owner == match.candidate_seat) result.win_by_bomb++;
+                        else result.win_by_crush++;
+                    } else if (match_outcome < 0) {
+                        const int died_owner = match.env.state.death_owner[match.candidate_seat];
+                        if (died_owner == match.candidate_seat) result.loss_by_selfkill++;
+                        else if (died_owner == incumbent_seat) result.loss_by_bomb++;
+                        else result.loss_by_crush++;
+                    } else if (!candidate_alive && !incumbent_alive) {
+                        result.draw_mutual_death++;
+                    } else {
+                        result.draw_timeout_alive++;
+                    }
+                    total_steps += match.env.state.step;
+                    progress.update(++completed);
+                }
+            }
+        }
+        const int played = result.wins + result.draws + result.losses;
+        result.score = played ? (result.wins + 0.5 * result.draws) / played : 0.0;
+        result.lower_confidence_bound = wilson_lower_bound(
+            result.score, played, config.promotion_confidence_z);
+        result.mean_steps = played ? static_cast<double>(total_steps) / played : 0.0;
+        return result;
+    }
+
+    struct CheckpointLineage {
+        int iteration{-1};
+        int best_iteration{-1};
+    };
+
+    CheckpointLineage checkpoint_lineage(const std::filesystem::path& path) const {
+        torch::serialize::InputArchive archive;
+        archive.load_from(path.string(), torch::kCPU);
+        torch::Tensor meta;
+        archive.read("meta", meta);
+        meta = meta.to(torch::kCPU);
+        const auto meta_values = meta.accessor<int64_t, 1>();
+        CheckpointLineage result;
+        result.iteration = static_cast<int>(meta_values[1]);
+        result.best_iteration = result.iteration;
+        torch::Tensor selection_meta;
+        if (archive.try_read("selection_meta", selection_meta)) {
+            selection_meta = selection_meta.to(torch::kCPU);
+            result.best_iteration = static_cast<int>(
+                selection_meta.accessor<int64_t, 1>()[0]);
+        }
+        return result;
+    }
+
+    void copy_checkpoint_atomically(const std::filesystem::path& source,
+                                    const std::filesystem::path& destination) const {
+        const auto temporary = destination.string() + ".tmp";
+        std::filesystem::copy_file(source, temporary,
+                                   std::filesystem::copy_options::overwrite_existing);
+        atomic_replace(temporary, destination);
+    }
+
+    /* A checkpoint's selection metadata names the historical champion, but its model tensors
+       are the CURRENT iteration's tensors. Saving the just-loaded current model as best.pt
+       therefore corrupts lineage whenever iteration != best_iteration. Preserve the exact
+       parent champion artifact instead, or fail closed when it cannot be recovered. */
+    void inherit_champion_artifact(const std::filesystem::path& source_checkpoint) {
+        if (best_iteration < 0) return;
+        auto candidate = source_checkpoint.parent_path() / "best.pt";
+        if (!std::filesystem::exists(candidate)) {
+            const auto source_lineage = checkpoint_lineage(source_checkpoint);
+            if (source_lineage.iteration == best_iteration) {
+                candidate = source_checkpoint;
+            } else {
+                throw std::runtime_error(
+                    "fork checkpoint inherits champion iteration " +
+                    std::to_string(best_iteration) + " but the exact parent best.pt is missing; "
+                    "refusing to label current iteration " + std::to_string(source_lineage.iteration) +
+                    " weights as that historical champion");
+            }
+        }
+        const auto candidate_lineage = checkpoint_lineage(candidate);
+        if (candidate_lineage.iteration != best_iteration ||
+            candidate_lineage.best_iteration != best_iteration) {
+            throw std::runtime_error(
+                "parent champion artifact does not match inherited best_iteration=" +
+                std::to_string(best_iteration) + " (artifact iteration=" +
+                std::to_string(candidate_lineage.iteration) + ", lineage=" +
+                std::to_string(candidate_lineage.best_iteration) + ")");
+        }
+        copy_checkpoint_atomically(candidate, best_path);
+        inherited_champion_source = candidate;
+        reconcile_champion_state();
+        std::cout << "Inherited exact champion artifact " << candidate.string()
+                  << " (iteration " << best_iteration << ") into " << best_path.string()
+                  << '\n';
+    }
+
+    /* --fork-reset-champion: the child's champion history starts at its own fork point rather
+       than inheriting the parent's. best.pt is a FRESHLY-SAVED checkpoint of the just-loaded
+       fork-point weights with best_iteration set to the current iteration first - NOT a file
+       copy of the parent checkpoint, whose embedded selection_meta still carries the parent's
+       (possibly historically inconsistent) champion claims and would fail this lineage's own
+       later reconcile_or_restore_champion checks. Self-consistent by construction (artifact
+       iteration == best_iteration == the fork iteration), so this is the honest statement
+       "this lineage's champion so far is its starting point," not the relabel-current-weights-
+       as-an-older-champion bug the consistency checks exist to catch. */
+    void reset_champion_to_fork_point() {
+        best_iteration = iteration;
+        best_score = 0.0;
+        promotion_count = 0;
+        save_checkpoint(best_path);
+        inherited_champion_source.clear();
+        std::cout << "Champion lineage RESET at fork (--fork-reset-champion): best.pt = the "
+                     "fork-point weights at iteration " << iteration
+                  << ", best_score/promotion_count start at 0 - the parent's champion history "
+                     "was deliberately not inherited\n";
+    }
+
+    void reconcile_or_restore_champion(const std::filesystem::path& loaded_checkpoint) {
+        if (std::filesystem::exists(best_path)) {
+            const auto champion = checkpoint_lineage(best_path);
+            if (best_iteration < 0 || champion.iteration != best_iteration ||
+                champion.best_iteration != best_iteration) {
+                throw std::runtime_error(
+                    "existing best.pt champion artifact does not match loaded lineage "
+                    "best_iteration=" + std::to_string(best_iteration) +
+                    " (artifact iteration=" + std::to_string(champion.iteration) +
+                    ", lineage=" + std::to_string(champion.best_iteration) +
+                    "); refusing to use current/latest weights as a historical champion");
+            }
+            reconcile_champion_state();
+            return;
+        }
+        if (best_iteration < 0 || !std::filesystem::exists(loaded_checkpoint)) return;
+        const auto lineage = checkpoint_lineage(loaded_checkpoint);
+        if (lineage.iteration != best_iteration) {
+            throw std::runtime_error(
+                "checkpoint records champion iteration " + std::to_string(best_iteration) +
+                " but best.pt is missing and loaded checkpoint contains iteration " +
+                std::to_string(lineage.iteration) + " weights; refusing a fake incumbent");
+        }
+        copy_checkpoint_atomically(loaded_checkpoint, best_path);
+        inherited_champion_source = loaded_checkpoint;
+        reconcile_champion_state();
+    }
+
+    void reconcile_champion_state() {
+        if (!std::filesystem::exists(best_path)) return;
+        torch::serialize::InputArchive archive;
+        archive.load_from(best_path.string(), torch::kCPU);
+        torch::Tensor stored_best;
+        torch::Tensor meta;
+        archive.read("best_score", stored_best);
+        archive.read("meta", meta);
+        const double champion_score = stored_best.to(torch::kCPU).item<double>();
+        if (std::isfinite(champion_score)) best_score = std::max(best_score, champion_score);
+        meta = meta.to(torch::kCPU);
+        const auto meta_values = meta.accessor<int64_t, 1>();
+        int champion_iteration = static_cast<int>(meta_values[1]);
+        torch::Tensor selection_meta;
+        if (archive.try_read("selection_meta", selection_meta)) {
+            selection_meta = selection_meta.to(torch::kCPU);
+            const auto values = selection_meta.accessor<int64_t, 1>();
+            champion_iteration = static_cast<int>(values[0]);
+            promotion_count = std::max(promotion_count, values[1]);
+        }
+        best_iteration = std::max(best_iteration, champion_iteration);
+    }
+
+    void save_checkpoint(const std::filesystem::path& destination) {
+        const auto temporary = destination.string() + ".tmp";
+        torch::serialize::OutputArchive archive;
+        model->save(archive);
+        torch::serialize::OutputArchive optimizer_archive;
+        optimizer.save(optimizer_archive);
+        archive.write("optimizer", optimizer_archive);
+        torch::Tensor states, policies, values, tags;
+        {
+            ScopedTimer timer(last_phase_timings.replay_serialization_seconds);
+            std::tie(states, policies, values, tags) = replay.tensors();
+        }
+        archive.write("replay_states", states);
+        archive.write("replay_policies", policies);
+        archive.write("replay_values", values);
+        /* KL-105 Phase 3: new archive key, always written (even count=0 buffers serialize a
+           valid [0,2] tensor, never an undefined one) - old binaries that don't know this key
+           exists simply never call archive.read("replay_tags", ...), so its presence is inert
+           to them (the archive is a named key-value store, not a fixed positional format). */
+        archive.write("replay_tags", tags);
+        archive.write("meta", torch::tensor({static_cast<int64_t>(kFormatVersion),
+                                               static_cast<int64_t>(iteration), global_updates,
+                                               static_cast<int64_t>(replay.next())},
+                                              torch::kInt64));
+        archive.write("best_score", torch::tensor(best_score, torch::kFloat64));
+        archive.write("selection_meta", torch::tensor(
+            {static_cast<int64_t>(best_iteration), promotion_count}, torch::kInt64));
+        std::ostringstream gate_config;
+        gate_config << "evaluation_seed_base=" << config.evaluation_seed_base
+                    << ";promotion_seed_base=" << config.promotion_seed_base
+                    << ";mcts_evaluation_seed_base=" << config.mcts_evaluation_seed_base
+                    << ";promotion_games=" << config.promotion_games
+                    << ";promotion_simulations=" << config.promotion_simulations
+                    << ";promotion_margin=" << config.promotion_margin
+                    << ";promotion_confidence_z=" << config.promotion_confidence_z
+                    << ";random_score_floor=" << config.random_score_floor
+                    << ";heuristic_score_floor=" << config.heuristic_score_floor
+                    << ";heuristic_regression_margin="
+                    << config.heuristic_regression_margin
+                    << ";baseline_mcts_simulations="
+                    << config.baseline_mcts_simulations
+                    << ";baseline_mcts_depth=" << config.baseline_mcts_depth;
+        archive.write("selection_config", string_tensor(gate_config.str()));
+        std::ostringstream rng_state;
+        rng_state << rng;
+        archive.write("rng_state", string_tensor(rng_state.str()));
+        archive.write("config_signature", string_tensor(config_signature(config)));
+        archive.write("runtime_config", string_tensor(runtime_config_signature(config)));
+        archive.write("semantic_manifest", string_tensor(semantic_manifest_string(config)));
+        {
+            ScopedTimer timer(last_phase_timings.checkpoint_serialization_seconds);
+            archive.save_to(temporary);
+        }
+        {
+            ScopedTimer timer(last_phase_timings.durable_flush_seconds);
+            durable_flush(temporary);
+        }
+        atomic_replace(temporary, destination);
+    }
+
+    void load_checkpoint(const std::filesystem::path& source) {
+        torch::serialize::InputArchive archive;
+        archive.load_from(source.string(), device);
+        torch::Tensor stored_signature;
+        archive.read("config_signature", stored_signature);
+        if (tensor_string(stored_signature) != config_signature(config))
+            throw std::runtime_error("checkpoint configuration does not match this run");
+        torch::Tensor stored_runtime_config;
+        if (archive.try_read("runtime_config", stored_runtime_config) &&
+            tensor_string(stored_runtime_config) != runtime_config_signature(config))
+            std::cout << "Runtime configuration differs from the checkpoint "
+                         "(expected for evaluation overrides); training resumes "
+                         "record transitions in config-history.jsonl\n";
+        /* KL-101: load semantics (reward shaping, league, mechanics timing, resolved LR
+           schedule horizon, search settings) from the checkpoint's manifest by default,
+           rather than trusting whatever this process's CLI defaults happen to be. This is
+           what makes a checkpoint trained at arena-crush-win-value 0.1 impossible to
+           silently evaluate at the trainer's struct default of 0.3. */
+        torch::Tensor stored_manifest;
+        if (archive.try_read("semantic_manifest", stored_manifest)) {
+            const auto forks = apply_semantic_manifest(config, tensor_string(stored_manifest));
+            if (!forks.empty()) {
+                std::cout << "SEMANTIC FORK - explicit CLI overrides diverge from this "
+                             "checkpoint's trained semantics (all other unlisted fields "
+                             "were inherited from the checkpoint):\n";
+                for (const auto& fork : forks) std::cout << "  " << fork << '\n';
+                std::ofstream fork_log(config.run_dir / "semantic-fork-log.jsonl",
+                                       std::ios::app);
+                fork_log << "{\"checkpoint\":\"" << json_escape(source.string())
+                         << "\",\"forks\":[";
+                for (size_t index = 0; index < forks.size(); ++index)
+                    fork_log << (index ? "," : "") << '"' << json_escape(forks[index]) << '"';
+                fork_log << "]}\n";
+            }
+        } else if (config.legacy_accept_unverified_semantics) {
+            loaded_legacy_checkpoint = true;
+            std::cout << "UNVERIFIED SEMANTICS - " << source.string() << " predates the "
+                         "semantic manifest (KL-101). Its trained arena-crush-win-value, "
+                         "selfkill-win-value, league-heuristic-fraction, and other reward/"
+                         "mechanics fields cannot be verified from the checkpoint. Proceeding "
+                         "ONLY because --legacy-accept-unverified-semantics was passed; this "
+                         "process's CLI values/defaults are being used UNVERIFIED:\n  "
+                         << semantic_manifest_string(config) << '\n';
+        } else {
+            throw std::runtime_error(
+                source.string() + " predates the semantic manifest (KL-101) - its trained "
+                "reward/mechanics/schedule semantics cannot be verified from the checkpoint "
+                "file, so loading it would silently risk evaluating or resuming under the "
+                "wrong values (this is exactly the bug that produced an invalid crush01 "
+                "gate read). Pass --legacy-accept-unverified-semantics to proceed anyway "
+                "with this process's CLI values/defaults, understood as unverified.");
+        }
+        model->load(archive);
+        torch::serialize::InputArchive optimizer_archive;
+        archive.read("optimizer", optimizer_archive);
+        optimizer.load(optimizer_archive);
+        torch::Tensor states, policies, values, meta, stored_best, stored_rng, tags;
+        archive.read("replay_states", states);
+        archive.read("replay_policies", policies);
+        archive.read("replay_values", values);
+        /* KL-105 Phase 3: try_read, not read - every checkpoint saved before this change has
+           no "replay_tags" key at all. `tags` stays an undefined tensor in that case; see
+           ReplayBuffer::load()'s handling (defaults every sample's tags to 0/unknown, which is
+           semantically faithful for a checkpoint that trained entirely under cap=0). */
+        archive.try_read("replay_tags", tags);
+        archive.read("meta", meta);
+        archive.read("best_score", stored_best);
+        archive.read("rng_state", stored_rng);
+        meta = meta.to(torch::kCPU);
+        auto meta_values = meta.accessor<int64_t, 1>();
+        if (meta_values[0] != kFormatVersion)
+            throw std::runtime_error("unsupported native checkpoint format");
+        iteration = static_cast<int>(meta_values[1]);
+        global_updates = meta_values[2];
+        replay.load(states, policies, values, tags, static_cast<size_t>(meta_values[3]));
+        best_score = stored_best.to(torch::kCPU).item<double>();
+        torch::Tensor selection_meta;
+        if (archive.try_read("selection_meta", selection_meta)) {
+            selection_meta = selection_meta.to(torch::kCPU);
+            const auto selection_values = selection_meta.accessor<int64_t, 1>();
+            best_iteration = static_cast<int>(selection_values[0]);
+            promotion_count = selection_values[1];
+        }
+        std::istringstream rng_state(tensor_string(stored_rng));
+        rng_state >> rng;
+        if (!rng_state) throw std::runtime_error("checkpoint RNG state is corrupt");
+    }
+
+    void append_metrics(const OptimizationMetrics& optimization,
+                        const Evaluation* random, const Evaluation* heuristic,
+                        const Evaluation* incumbent, const Evaluation* mcts,
+                        const GateCanaryResult* canary,
+                        double elapsed, size_t new_samples, bool promoted,
+                        std::string_view promotion_reason) const {
+        std::ofstream output(metrics_path, std::ios::app);
+        /* KL-105 Phase 3: snapshotted AFTER this iteration's replay.add(collected) (run()'s
+           call order is add() -> optimize() -> append_metrics()), so this row's pools include
+           this iteration's own new samples - "what the buffer looked like going into this
+           iteration's training", the same buffer state optimize()'s batches were actually
+           drawn from. Persistence note for round-trip checks: a resumed run's FIRST row is
+           therefore >= the prior run's LAST row (loaded buffer plus one more iteration's
+           samples), never a reset to zero, as long as replay_capacity has not evicted anything
+           in between. */
+        const auto cause_pools = replay.cause_pool_snapshot();
+        output << std::setprecision(9)
+               << "{\"schema_version\":2,\"iteration\":" << iteration
+               << ",\"global_updates\":" << global_updates
+               << ",\"replay_size\":" << replay.size()
+               << ",\"new_samples\":" << new_samples
+               << ",\"replay_cause_pools\":{\"unknown\":"
+               << cause_pools.cause_counts[static_cast<uint8_t>(OutcomeCause::kUnknown)]
+               << ",\"bomb\":"
+               << cause_pools.cause_counts[static_cast<uint8_t>(OutcomeCause::kBomb)]
+               << ",\"selfkill\":"
+               << cause_pools.cause_counts[static_cast<uint8_t>(OutcomeCause::kSelfkill)]
+               << ",\"arena_crush\":"
+               << cause_pools.cause_counts[static_cast<uint8_t>(OutcomeCause::kArenaCrush)]
+               << ",\"mutual_death\":"
+               << cause_pools.cause_counts[static_cast<uint8_t>(OutcomeCause::kMutualDeath)]
+               << ",\"timeout_draw\":"
+               << cause_pools.cause_counts[static_cast<uint8_t>(OutcomeCause::kTimeoutDraw)]
+               << ",\"bomb_win_side_pool\":" << cause_pools.bomb_win_side_pool << '}'
+               << ",\"elapsed_seconds\":" << elapsed
+               << ",\"self_play\":{\"wins\":" << last_self_play.wins
+               << ",\"draws\":" << last_self_play.draws
+               << ",\"losses\":" << last_self_play.losses
+               << ",\"mean_steps\":" << last_self_play.mean_steps << '}'
+               /* v7 Stage 0 item 0.2 (docs/experiment-memory/14-v7-from-scratch-design.md):
+                  KataGo forced-playouts telemetry, combined across this iteration's mirror
+                  self-play AND league play (see ForcedPlayoutMetrics/last_forced_playouts
+                  above) - all-zero whenever config.forced_playouts_k<=0 (off, default).
+                  forced_floor_violations is expected to be exactly 0 whenever forcing is active
+                  (BatchedMcts::root_floor_violations() invariant); a nonzero count here is a
+                  real regression, not noise. */
+               << ",\"forced_playouts\":{\"mean_forced_per_move\":"
+               << (last_forced_playouts.moves > 0
+                       ? static_cast<double>(last_forced_playouts.forced_visits_sum) /
+                             static_cast<double>(last_forced_playouts.moves)
+                       : 0.0)
+               << ",\"mean_pruned_visit_fraction\":"
+               << (last_forced_playouts.moves > 0
+                       ? last_forced_playouts.pruned_fraction_sum /
+                             static_cast<double>(last_forced_playouts.moves)
+                       : 0.0)
+               << ",\"forced_floor_violations\":" << last_forced_playouts.floor_violations
+               << ",\"moves\":" << last_forced_playouts.moves << '}'
+               << ",\"optimization\":{\"loss\":" << optimization.loss
+               << ",\"policy_loss\":" << optimization.policy_loss
+               << ",\"value_loss\":" << optimization.value_loss
+               << ",\"entropy\":" << optimization.entropy
+               << ",\"learning_rate\":" << optimization.learning_rate
+               /* realized_pool_a_batch_fraction is retained as a deprecated alias of
+                  forced_pool_a_fraction (arms' metrics/analysis already key off this name) -
+                  forced_pool_a_fraction is the identical value under its honest name, and
+                  total_pool_a_fraction is the new KL-110 number (see OptimizationMetrics::
+                  total_pool_a_batch_fraction above). */
+               << ",\"realized_pool_a_batch_fraction\":"
+               << optimization.realized_pool_a_batch_fraction
+               << ",\"forced_pool_a_fraction\":" << optimization.realized_pool_a_batch_fraction
+               << ",\"total_pool_a_fraction\":" << optimization.total_pool_a_batch_fraction
+               /* v7 Stage-1 IL Bombing-Collapse guards: exactly what this iteration's loss graph
+                  contained (see OptimizationMetrics above). A reader sees the value-only warmup
+                  as policy_loss_applied_weight==0.0 (metrics rows are emitted after ++iteration,
+                  so those are rows iteration 1..K), and the entropy floor's beta as
+                  policy_entropy_bonus_applied. */
+               << ",\"policy_loss_applied_weight\":" << optimization.policy_loss_applied_weight
+               << ",\"policy_entropy_bonus_applied\":"
+               << optimization.policy_entropy_bonus_applied
+               << '}'
+               /* KL-101 Part E: this iteration's phase timings (all 7 phases KL-101/KL-102
+                  ask for) - the "same-machine/same-config baseline" KL-102's throughput work
+                  needs as its own first step, captured here instead of duplicated there. */
+               << ",\"phase_timings\":{\"mirror_collection_seconds\":"
+               << last_phase_timings.mirror_collection_seconds
+               << ",\"league_collection_seconds\":"
+               << last_phase_timings.league_collection_seconds
+               << ",\"optimization_seconds\":" << last_phase_timings.optimization_seconds
+               << ",\"evaluation_random_seconds\":"
+               << last_phase_timings.evaluation_random_seconds
+               << ",\"evaluation_heuristic_seconds\":"
+               << last_phase_timings.evaluation_heuristic_seconds
+               << ",\"evaluation_incumbent_seconds\":"
+               << last_phase_timings.evaluation_incumbent_seconds
+               << ",\"evaluation_mcts_seconds\":" << last_phase_timings.evaluation_mcts_seconds
+               << ",\"drift_canary_seconds\":" << last_phase_timings.drift_canary_seconds
+               << ",\"replay_serialization_seconds\":"
+               << last_phase_timings.replay_serialization_seconds
+               << ",\"checkpoint_serialization_seconds\":"
+               << last_phase_timings.checkpoint_serialization_seconds
+               << ",\"durable_flush_seconds\":" << last_phase_timings.durable_flush_seconds
+               << '}'
+               /* Cumulative across the whole run (not reset per iteration) - the network's
+                  own moves only, both seats during mirror self-play, learner seat only
+                  during league play. */
+               << ",\"action_histogram_cumulative\":{\"up\":" << action_histogram[ACTION_UP]
+               << ",\"down\":" << action_histogram[ACTION_DOWN]
+               << ",\"left\":" << action_histogram[ACTION_LEFT]
+               << ",\"right\":" << action_histogram[ACTION_RIGHT]
+               << ",\"place_bomb\":" << action_histogram[ACTION_PLACE_BOMB]
+               << ",\"wait\":" << action_histogram[ACTION_WAIT] << '}';
+        /* v7 Stage-1 IL: this iteration's teacher-action histogram (both seats), present ONLY on
+           iterations where collect_teacher() actually ran - the denominator for the Stage-1 exit
+           gate's "student bomb usage within 2x of teacher" (doc 14 Stage 1). append_metrics runs
+           AFTER run()'s ++iteration, so the collection-time iteration this row describes is
+           iteration-1; teacher ran that iteration iff it was below teacher_iterations and
+           teacher_games>0 - the exact condition run()'s call site used. bomb_fraction is BOMB /
+           total teacher actions (total is always >0 when teacher ran: every game contributes >=1
+           two-seat step). Keys follow the UP,DOWN,LEFT,RIGHT,BOMB,WAIT ordering.
+           v7 Stage-1 IL (D3): teacher_sample_digest is the FNV-1a determinism oracle for this
+           same collect_teacher() call (see last_teacher_sample_digest's own doc comment above,
+           and TrainConfig::teacher_threads in trainer.h) - a sibling of teacher_actions, present
+           under the exact same guard since both are set together at the end of collect_teacher(). */
+        if (config.teacher_games > 0 && (iteration - 1) < config.teacher_iterations) {
+            const int64_t teacher_total = std::accumulate(
+                last_teacher_actions.begin(), last_teacher_actions.end(), int64_t{0});
+            output << ",\"teacher_actions\":{\"UP\":" << last_teacher_actions[ACTION_UP]
+                   << ",\"DOWN\":" << last_teacher_actions[ACTION_DOWN]
+                   << ",\"LEFT\":" << last_teacher_actions[ACTION_LEFT]
+                   << ",\"RIGHT\":" << last_teacher_actions[ACTION_RIGHT]
+                   << ",\"BOMB\":" << last_teacher_actions[ACTION_PLACE_BOMB]
+                   << ",\"WAIT\":" << last_teacher_actions[ACTION_WAIT]
+                   << ",\"bomb_fraction\":"
+                   << (teacher_total > 0
+                           ? static_cast<double>(last_teacher_actions[ACTION_PLACE_BOMB]) /
+                                 static_cast<double>(teacher_total)
+                           : 0.0)
+                   << '}'
+                   << ",\"teacher_sample_digest\":\"" << last_teacher_sample_digest << "\"";
+        }
+        auto write_evaluation = [&output](const char* name, const Evaluation* value) {
+            if (!value) return;
+            output << ",\"" << name << "\":{\"wins\":" << value->wins
+                   << ",\"draws\":" << value->draws
+                   << ",\"losses\":" << value->losses
+                   << ",\"score\":" << value->score
+                   << ",\"lower_confidence_bound\":"
+                   << value->lower_confidence_bound
+                   << ",\"mean_steps\":" << value->mean_steps
+                   << ",\"by_seat\":[{\"seat\":0,\"wins\":"
+                   << value->wins_by_seat[0] << ",\"draws\":"
+                   << value->draws_by_seat[0] << ",\"losses\":"
+                   << value->losses_by_seat[0]
+                   << "},{\"seat\":1,\"wins\":" << value->wins_by_seat[1]
+                   << ",\"draws\":" << value->draws_by_seat[1]
+                   << ",\"losses\":" << value->losses_by_seat[1] << "}]}";
+        };
+        write_evaluation("random", random);
+        write_evaluation("heuristic", heuristic);
+        write_evaluation("incumbent", incumbent);
+        write_evaluation("mcts", mcts);
+        /* v7 Stage 0 item 0.5: present only on an evaluation_interval iteration (same
+           optionality convention as random/heuristic/incumbent/mcts above - canary is nullptr
+           on every other iteration, see the call site in run()). per_scenario preserves
+           build_gate_scenarios()'s own order rather than alphabetizing. */
+        if (canary) {
+            output << ",\"gates\":{\"passed_search\":" << canary->passed_search
+                   << ",\"trap_bomb_prior_step0\":" << canary->trap_bomb_prior_step0
+                   << ",\"per_scenario\":{";
+            for (size_t index = 0; index < canary->per_scenario.size(); ++index) {
+                const auto& [name, passed] = canary->per_scenario[index];
+                output << (index ? "," : "") << "\"" << json_escape(name) << "\":"
+                       << (passed ? "true" : "false");
+            }
+            output << "}}";
+        }
+        output << ",\"promoted\":" << (promoted ? "true" : "false")
+               << ",\"promotion_reason\":\"" << json_escape(promotion_reason) << "\""
+               << ",\"best_score\":";
+        if (std::isfinite(best_score)) output << best_score;
+        else output << "null";
+        output << ",\"best_iteration\":" << best_iteration
+               << ",\"promotion_count\":" << promotion_count
+               << ",\"selection\":{\"evaluation_seed_base\":"
+               << config.evaluation_seed_base
+               << ",\"promotion_seed_base\":" << config.promotion_seed_base
+               << ",\"mcts_evaluation_seed_base\":"
+               << config.mcts_evaluation_seed_base
+               << ",\"promotion_games\":" << config.promotion_games
+               << ",\"promotion_simulations\":" << config.promotion_simulations
+               << ",\"promotion_margin\":" << config.promotion_margin
+               << ",\"promotion_confidence_z\":" << config.promotion_confidence_z
+               << ",\"random_score_floor\":" << config.random_score_floor
+               << ",\"heuristic_score_floor\":" << config.heuristic_score_floor
+               << ",\"heuristic_regression_margin\":"
+               << config.heuristic_regression_margin
+               << ",\"baseline_mcts_simulations\":"
+               << config.baseline_mcts_simulations
+               << ",\"baseline_mcts_depth\":" << config.baseline_mcts_depth << '}';
+        output << "}\n";
+        output.flush();
+    }
+
+    void run() {
+        ConsoleTee console_tee(config.run_dir / "train-console.log");
+        stop_requested.store(false);
+        const auto previous = std::signal(SIGINT, signal_handler);
+        PhaseProgress iterations("iterations", std::max(config.iterations - iteration, 1),
+                                 config.progress);
+        int completed_this_run = 0;
+        while (iteration < config.iterations && !stop_requested.load()) {
+            const auto started = std::chrono::steady_clock::now();
+            last_phase_timings = {};
+            /* v7 Stage 0 item 0.2: reset ONCE per iteration, before either collection call -
+               last_forced_playouts spans BOTH collect_self_play() and collect_league_play()
+               below (unlike last_self_play/last_league_play, which each reset themselves inside
+               their own single call). */
+            last_forced_playouts = {};
+            std::vector<Sample> collected;
+            if (iteration < config.teacher_iterations && config.teacher_games > 0) {
+                auto teacher = collect_teacher(config.teacher_games);
+                collected.insert(collected.end(), std::make_move_iterator(teacher.begin()),
+                                 std::make_move_iterator(teacher.end()));
+            }
+            const int league_games = config.league_heuristic_fraction > 0.0
+                ? std::clamp(static_cast<int>(std::lround(
+                      config.self_play_games * config.league_heuristic_fraction)),
+                      0, config.self_play_games)
+                : 0;
+            const int mirror_games = config.self_play_games - league_games;
+            std::vector<Sample> self_play;
+            {
+                ScopedTimer timer(last_phase_timings.mirror_collection_seconds);
+                self_play = collect_self_play(mirror_games);
+            }
+            {
+                const int decisive = last_self_play.win_by_bomb + last_self_play.win_by_selfkill +
+                                     last_self_play.win_by_crush;
+                std::cout << "  self-play[" << iteration << "]: mean_steps="
+                          << last_self_play.mean_steps << ", decisive=" << decisive
+                          << " (bomb=" << last_self_play.win_by_bomb
+                          << " selfkill=" << last_self_play.win_by_selfkill
+                          << " crush=" << last_self_play.win_by_crush << ")"
+                          << ", draws=" << last_self_play.draws
+                          << " (mutual=" << last_self_play.draw_mutual_death
+                          << " timeout=" << last_self_play.draw_timeout_alive << ")"
+                          << ", wait=" << (last_self_play.total_steps > 0
+                              ? 100.0 * static_cast<double>(last_self_play.wait_steps) /
+                                    static_cast<double>(last_self_play.total_steps)
+                              : 0.0) << "%\n";
+            }
+            collected.insert(collected.end(), std::make_move_iterator(self_play.begin()),
+                             std::make_move_iterator(self_play.end()));
+            if (league_games > 0 && !stop_requested.load()) {
+                std::vector<Sample> league_play;
+                {
+                    ScopedTimer timer(last_phase_timings.league_collection_seconds);
+                    league_play = collect_league_play(league_games, AGENT_HEURISTIC);
+                }
+                std::cout << "  league-heuristic[" << iteration << "]: " << last_league_play.wins
+                          << "W " << last_league_play.draws << "D " << last_league_play.losses
+                          << "L mean_steps=" << last_league_play.mean_steps << '\n';
+                print_behavior_report("league-heuristic", last_league_play);
+                collected.insert(collected.end(), std::make_move_iterator(league_play.begin()),
+                                 std::make_move_iterator(league_play.end()));
+            }
+            if (stop_requested.load()) break;
+            const size_t new_samples = collected.size();
+            replay.add(collected);
+            OptimizationMetrics optimization;
+            {
+                ScopedTimer timer(last_phase_timings.optimization_seconds);
+                optimization = optimize();
+            }
+            ++iteration;
+
+            if (stop_requested.load()) {
+                const double elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - started).count();
+                save_checkpoint(latest_path);
+                append_metrics(optimization, nullptr, nullptr, nullptr, nullptr, nullptr,
+                               elapsed, new_samples, false, "interrupted");
+                break;
+            }
+
+            Evaluation random_result;
+            Evaluation heuristic_result;
+            Evaluation incumbent_result;
+            Evaluation mcts_result;
+            Evaluation* random_ptr = nullptr;
+            Evaluation* heuristic_ptr = nullptr;
+            Evaluation* incumbent_ptr = nullptr;
+            Evaluation* mcts_ptr = nullptr;
+            GateCanaryResult canary_result;
+            GateCanaryResult* canary_ptr = nullptr;
+            bool promoted = false;
+            std::string promotion_reason = "not_evaluated";
+            if (!stop_requested.load() && iteration % config.evaluation_interval == 0) {
+                {
+                    ScopedTimer timer(last_phase_timings.evaluation_random_seconds);
+                    random_result = evaluate_baseline(AGENT_RANDOM, config.evaluation_games,
+                                                      config.evaluation_simulations,
+                                                      config.evaluation_seed_base);
+                }
+                {
+                    ScopedTimer timer(last_phase_timings.evaluation_heuristic_seconds);
+                    heuristic_result = evaluate_baseline(AGENT_HEURISTIC, config.evaluation_games,
+                                                         config.evaluation_simulations,
+                                                         config.evaluation_seed_base);
+                }
+                random_ptr = &random_result;
+                heuristic_ptr = &heuristic_result;
+                {
+                    /* v7 Stage 0 item 0.5: kDriftCanarySeed is a fixed constant, NOT derived
+                       from `iteration` or `config.seed` - a fresh std::mt19937_64 is
+                       constructed from it right here, every eval interval, so the canary NEVER
+                       touches the shared collection `rng` member above (used by
+                       collect_self_play/collect_league_play/sample_joint_action) or the
+                       evaluate_baseline calls' own `rng` reference just above (inert today
+                       since both run with root_noise=false, but this stays correct even if
+                       that ever changes - see run_gate_canary()'s own doc comment). This is
+                       what makes "enabling the canary cannot perturb collection determinism"
+                       true by construction. */
+                    ScopedTimer timer(last_phase_timings.drift_canary_seconds);
+                    constexpr uint64_t kDriftCanarySeed = 7'700'001ULL;
+                    std::mt19937_64 canary_rng(kDriftCanarySeed);
+                    canary_result = run_gate_canary(canary_rng);
+                    canary_ptr = &canary_result;
+                }
+                const bool random_gate = random_result.score >= config.random_score_floor;
+                const bool has_incumbent = std::filesystem::exists(best_path);
+                if (!random_gate) {
+                    promotion_reason = "random_floor_failed";
+                } else if (!has_incumbent &&
+                           heuristic_result.score < config.heuristic_score_floor) {
+                    promotion_reason = "heuristic_initial_floor_failed";
+                } else if (!has_incumbent) {
+                    promoted = true;
+                    promotion_reason = "promoted_initial_quality_gate";
+                } else if (heuristic_result.score <
+                           best_score - config.heuristic_regression_margin) {
+                    promotion_reason = "heuristic_regression_gate_failed";
+                } else {
+                    const auto incumbent = load_model_from_checkpoint(best_path);
+                    {
+                        ScopedTimer timer(last_phase_timings.evaluation_incumbent_seconds);
+                        incumbent_result = evaluate_incumbent(
+                            incumbent, config.promotion_games,
+                            config.promotion_simulations, config.promotion_seed_base);
+                    }
+                    incumbent_ptr = &incumbent_result;
+                    if (incumbent_result.lower_confidence_bound >
+                        0.5 + config.promotion_margin) {
+                        promoted = true;
+                        promotion_reason = "promoted_incumbent_confidence_gate";
+                    } else {
+                        promotion_reason = "incumbent_confidence_gate_failed";
+                    }
+                }
+                if (promoted) {
+                    best_score = std::max(best_score, heuristic_result.score);
+                    best_iteration = iteration;
+                    ++promotion_count;
+                }
+            }
+            if (!stop_requested.load() && iteration % config.mcts_evaluation_interval == 0) {
+                ScopedTimer timer(last_phase_timings.evaluation_mcts_seconds);
+                mcts_result = evaluate_baseline(AGENT_MCTS, config.mcts_evaluation_games,
+                                                config.evaluation_simulations,
+                                                config.mcts_evaluation_seed_base);
+                mcts_ptr = &mcts_result;
+            }
+            const double elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - started).count();
+            save_checkpoint(latest_path);
+            if (iteration % config.snapshot_interval == 0) {
+                const auto snapshot = config.run_dir /
+                    ("iteration_" + [&] { std::ostringstream name; name << std::setw(6)
+                        << std::setfill('0') << iteration; return name.str(); }() + ".pt");
+                atomic_copy_file(latest_path, snapshot);
+            }
+            if (promoted)
+                atomic_copy_file(latest_path, best_path);
+            append_metrics(optimization, random_ptr, heuristic_ptr, incumbent_ptr,
+                           mcts_ptr, canary_ptr, elapsed, new_samples, promoted,
+                           promotion_reason);
+            std::cout << "iteration=" << iteration << " samples=" << new_samples
+                      << " replay=" << replay.size() << " loss=" << optimization.loss;
+            if (heuristic_ptr)
+                std::cout << " random=" << random_result.score
+                          << " heuristic=" << heuristic_result.score
+                          << " gate=" << promotion_reason;
+            if (incumbent_ptr)
+                std::cout << " incumbent=" << incumbent_result.score
+                          << " lcb=" << incumbent_result.lower_confidence_bound;
+            std::cout << " elapsed=" << format_duration(elapsed) << '\n';
+            iterations.update(++completed_this_run);
+        }
+        if (stop_requested.load()) {
+            const auto emergency = config.run_dir / "emergency.pt";
+            std::cout << "Interrupt requested; writing complete emergency checkpoint...\n";
+            save_checkpoint(emergency);
+            save_checkpoint(latest_path);
+            std::cout << "Recovery checkpoint: " << emergency.string() << '\n';
+        }
+        std::signal(SIGINT, previous);
+    }
+
+    /* Honest "is it playing or cheesing" report: how wins/losses were actually decided
+       (bomb kill vs self-kill vs sudden-death arena crush) and how much the learner idles.
+       Printed for every evaluate_only() baseline so a strong W-D-L score is never read
+       without also seeing whether it came from real tactical kills or from attrition. */
+    static void print_behavior_report(const char* label, const Evaluation& e) {
+        const int decided_wins = e.win_by_bomb + e.win_by_selfkill + e.win_by_crush;
+        const int decided_losses = e.loss_by_bomb + e.loss_by_selfkill + e.loss_by_crush;
+        const double wait_pct = e.learner_total_steps > 0
+            ? 100.0 * static_cast<double>(e.learner_wait_steps) / static_cast<double>(e.learner_total_steps)
+            : 0.0;
+        std::cout << "  " << label << " behavior: learner WAIT=" << std::fixed
+                  << std::setprecision(1) << wait_pct << "% of its own actions\n";
+        if (decided_wins > 0)
+            std::cout << "    wins  (" << decided_wins << "): bomb-kill=" << e.win_by_bomb
+                      << " (" << (100.0 * e.win_by_bomb / decided_wins) << "%)  opponent-selfkill="
+                      << e.win_by_selfkill << "  arena-crush=" << e.win_by_crush << " ("
+                      << (100.0 * e.win_by_crush / decided_wins) << "%)\n";
+        if (decided_losses > 0)
+            std::cout << "    losses(" << decided_losses << "): bomb-kill=" << e.loss_by_bomb
+                      << "  self-kill=" << e.loss_by_selfkill << "  arena-crush="
+                      << e.loss_by_crush << "\n";
+        if (e.draw_mutual_death || e.draw_timeout_alive)
+            std::cout << "    draws: mutual-death=" << e.draw_mutual_death
+                      << "  timeout-both-alive=" << e.draw_timeout_alive << "\n";
+        std::cout << std::defaultfloat;
+    }
+
+    void require_available_evidence_path(const std::filesystem::path& path,
+                                         std::string_view label) const {
+        if (path.empty() || config.overwrite_evidence || !std::filesystem::exists(path)) return;
+        throw std::runtime_error(
+            std::string(label) + " already exists: " + path.string() +
+            "; refusing to overwrite research evidence (choose a unique path or pass "
+            "--overwrite-evidence explicitly)");
+    }
+
+    void evaluate_only() {
+        if (!std::filesystem::exists(requested_checkpoint_path))
+            throw std::runtime_error("checkpoint not found: " + requested_checkpoint_path.string());
+        require_available_evidence_path(config.evaluation_output, "aggregate evaluation output");
+        require_available_evidence_path(config.per_match_output, "per-match evaluation output");
+        require_available_evidence_path(config.trace_output, "neural trace output");
+        /* KL-107 Phase 0d (F6): trace_output is only ever threaded into the MCTS-baseline
+           evaluate_baseline() call below - --trace-output without --eval-mcts silently produces
+           an empty (header-only) trace file, which previously failed silent rather than loud. */
+        if (!config.trace_output.empty() && !config.evaluate_mcts)
+            std::cerr << "warning: --trace-output was given without --eval-mcts; no rows will be "
+                         "written (trace capture only runs during the MCTS baseline match "
+                         "loop) - pass --eval-mcts too, or drop --trace-output\n";
+        /* KL-101: print the RESOLVED semantic config actually in effect for this evaluation
+           (after load_checkpoint()'s inheritance in the constructor above ran) - so a strong
+           W-D-L score is never read without also seeing whether the reward/mechanics
+           semantics used to compute it were the checkpoint's own trained values or a
+           deliberate, logged fork. */
+        std::cout << "resolved semantics: " << semantic_manifest_string(config) << '\n';
+        auto random = evaluate_baseline(AGENT_RANDOM, config.evaluation_games,
+                                        config.evaluation_simulations,
+                                        config.evaluation_seed_base);
+        auto heuristic = evaluate_baseline(AGENT_HEURISTIC, config.evaluation_games,
+                                           config.evaluation_simulations,
+                                           config.evaluation_seed_base);
+        std::cout << "random: " << random.wins << "W " << random.draws << "D "
+                  << random.losses << "L score=" << random.score << '\n'
+                  << "heuristic: " << heuristic.wins << "W " << heuristic.draws << "D "
+                  << heuristic.losses << "L score=" << heuristic.score << '\n';
+        print_behavior_report("heuristic", heuristic);
+        std::optional<Evaluation> mcts_result;
+        if (config.evaluate_mcts) {
+            mcts_result = evaluate_baseline(AGENT_MCTS, config.mcts_evaluation_games,
+                                            config.evaluation_simulations,
+                                            config.mcts_evaluation_seed_base,
+                                            {}, {}, config.per_match_output,
+                                            config.trace_output);
+            std::cout << "mcts: " << mcts_result->wins << "W " << mcts_result->draws << "D "
+                      << mcts_result->losses << "L score=" << mcts_result->score << '\n';
+            print_behavior_report("mcts", *mcts_result);
+        }
+        std::optional<Evaluation> mirror_result;
+        if (!config.replay_incumbent.empty()) {
+            /* checkpoint vs replay_incumbent (NN-vs-NN). games=1 (old default) just records
+               a replay; incumbent_eval_games > 0 additionally runs a full statistical
+               mirror-match with win-cause/WAIT instrumentation - the closest available
+               proxy for "what does self-play look like at this skill level." */
+            const std::string candidate = config.checkpoint.stem().string();
+            const auto incumbent = load_model_from_checkpoint(config.replay_incumbent);
+            const int mirror_games = std::max(1, config.incumbent_eval_games);
+            mirror_result = evaluate_incumbent(incumbent, mirror_games, config.evaluation_simulations,
+                                               config.evaluation_seed_base, config.replay_output,
+                                               candidate, config.replay_incumbent.stem().string());
+            if (mirror_games > 1) {
+                std::cout << "mirror(" << config.replay_incumbent.stem().string() << "): "
+                          << mirror_result->wins << "W " << mirror_result->draws << "D "
+                          << mirror_result->losses << "L score=" << mirror_result->score << '\n';
+                print_behavior_report(config.replay_incumbent.stem().string().c_str(), *mirror_result);
+            }
+            if (!config.replay_output.empty())
+                std::cout << "replay: wrote " << config.replay_output.string()
+                          << " (watch: bomber_viz --replay " << config.replay_output.string()
+                          << ")\n";
+        } else if (!config.replay_output.empty()) {
+            /* Emit one representative game of the loaded checkpoint for the polished viewer.
+               A single seed (both seats via games_count=1 -> 2 matches; match 0 recorded). */
+            const std::string candidate = config.checkpoint.stem().string();
+            const AgentType opponent = config.evaluate_mcts ? AGENT_MCTS : AGENT_HEURISTIC;
+            (void)evaluate_baseline(opponent, 1, config.evaluation_simulations,
+                                    config.evaluation_seed_base, config.replay_output,
+                                    candidate);
+            std::cout << "replay: wrote " << config.replay_output.string()
+                      << " (watch: bomber_viz --replay " << config.replay_output.string()
+                      << ")\n";
+        }
+        if (!config.evaluation_output.empty()) {
+            const auto temporary = config.evaluation_output.string() + ".tmp";
+            if (!config.evaluation_output.parent_path().empty())
+                std::filesystem::create_directories(config.evaluation_output.parent_path());
+            std::ofstream output(temporary, std::ios::trunc);
+            if (!output)
+                throw std::runtime_error("could not open aggregate evaluation output: " +
+                                         temporary);
+            auto write_result = [&output](const char* name, const Evaluation& value) {
+                output << "  \"" << name << "\": {\"wins\": " << value.wins
+                       << ", \"draws\": " << value.draws
+                       << ", \"losses\": " << value.losses
+                       << ", \"score\": " << value.score
+                       << ", \"lower_confidence_bound\": "
+                       << value.lower_confidence_bound
+                       << ", \"mean_steps\": " << value.mean_steps
+                       << ", \"by_seat\": [{\"seat\": 0, \"wins\": "
+                       << value.wins_by_seat[0] << ", \"draws\": "
+                       << value.draws_by_seat[0] << ", \"losses\": "
+                       << value.losses_by_seat[0]
+                       << "}, {\"seat\": 1, \"wins\": "
+                       << value.wins_by_seat[1] << ", \"draws\": "
+                       << value.draws_by_seat[1] << ", \"losses\": "
+                       << value.losses_by_seat[1] << "}]"
+                       << ", \"behavior\": {\"learner_wait_fraction\": "
+                       << (value.learner_total_steps > 0
+                               ? static_cast<double>(value.learner_wait_steps) /
+                                     static_cast<double>(value.learner_total_steps)
+                               : 0.0)
+                       << ", \"win_by_bomb\": " << value.win_by_bomb
+                       << ", \"win_by_selfkill\": " << value.win_by_selfkill
+                       << ", \"win_by_arena_crush\": " << value.win_by_crush
+                       << ", \"loss_by_bomb\": " << value.loss_by_bomb
+                       << ", \"loss_by_selfkill\": " << value.loss_by_selfkill
+                       << ", \"loss_by_arena_crush\": " << value.loss_by_crush
+                       << ", \"draw_mutual_death\": " << value.draw_mutual_death
+                       << ", \"draw_timeout_alive\": " << value.draw_timeout_alive
+                       << "}}";
+            };
+            output << "{\n"
+                   << "  \"schema_version\": 2,\n"
+                   << "  \"generated_at_utc\": \"" << utc_timestamp() << "\",\n"
+                   << "  \"invocation_argv\": [";
+            for (size_t index = 0; index < config.invocation_argv.size(); ++index) {
+                if (index) output << ',';
+                output << '"' << json_escape(config.invocation_argv[index]) << '"';
+            }
+            output << "],\n"
+                   << "  \"working_directory\": \""
+                   << json_escape(std::filesystem::current_path().string()) << "\",\n"
+                   << "  \"checkpoint\": \"" << json_escape(config.checkpoint.string()) << "\",\n"
+                   << "  \"checkpoint_path\": \""
+                   << json_escape(std::filesystem::absolute(requested_checkpoint_path)
+                                      .lexically_normal().string()) << "\",\n"
+                   << "  \"checkpoint_sha256\": \""
+                   << sha256_file(requested_checkpoint_path) << "\",\n"
+                   << "  \"executable_path\": \""
+                   << json_escape(current_executable_path().string()) << "\",\n"
+                   << "  \"executable_sha256\": \""
+                   << sha256_file(current_executable_path()) << "\",\n"
+                   << "  \"git_commit\": \"" << AI_BOMBER_GIT_SHA << "\",\n"
+                   << "  \"runtime_config_signature\": \""
+                   << json_escape(runtime_config_signature(config)) << "\",\n"
+                   << "  \"checkpoint_semantics_verified\": "
+                   << (loaded_legacy_checkpoint ? "false" : "true") << ",\n"
+                   << "  \"checkpoint_semantics_source\": \""
+                   << (loaded_legacy_checkpoint ? "legacy_cli_unverified" : "checkpoint_manifest")
+                   << "\",\n"
+                   << "  \"checkpoint_iteration\": " << iteration << ",\n"
+                   << "  \"seed_base\": " << config.evaluation_seed_base << ",\n"
+                   << "  \"seeds_per_opponent\": " << config.evaluation_games << ",\n"
+                   << "  \"search_simulations\": " << config.evaluation_simulations << ",\n"
+                   /* KL-101: the resolved semantics actually used for this evaluation's
+                      search backup (post checkpoint-inheritance) - the regression-tested
+                      field that proves a 0.1-trained checkpoint cannot silently evaluate at
+                      the trainer's struct default of 0.3. */
+                   << "  \"resolved_semantics\": {\"flame_duration\": " << config.flame_duration
+                   << ", \"sudden_death_start\": " << config.sudden_death_start
+                   << ", \"shrink_interval\": " << config.shrink_interval
+                   << ", \"timeout_draw_value\": " << config.timeout_draw_value
+                   << ", \"mutual_death_value\": " << config.mutual_death_value
+                   << ", \"arena_crush_win_value\": " << config.arena_crush_win_value
+                   << ", \"selfkill_win_value\": " << config.selfkill_win_value
+                   << ", \"league_heuristic_fraction\": " << config.league_heuristic_fraction
+                   << ", \"replay_cause_balance_cap\": " << config.replay_cause_balance_cap
+                   << ", \"c_puct\": " << config.c_puct
+                   << ", \"learning_rate_schedule_updates\": ";
+            if (loaded_legacy_checkpoint && config.learning_rate_schedule_updates <= 0)
+                output << "null";
+            else
+                output << config.learning_rate_schedule_updates;
+            output << "},\n";
+            if (config.evaluate_mcts)
+                output << "  \"baseline_mcts_simulations\": "
+                       << config.baseline_mcts_simulations << ",\n"
+                       << "  \"baseline_mcts_depth\": "
+                       << config.baseline_mcts_depth << ",\n"
+                       << "  \"mcts_seed_base\": "
+                       << config.mcts_evaluation_seed_base << ",\n"
+                       << "  \"mcts_seeds_per_opponent\": "
+                       << config.mcts_evaluation_games << ",\n";
+            write_result("random", random);
+            output << ",\n";
+            write_result("heuristic", heuristic);
+            if (mcts_result) {
+                output << ",\n";
+                write_result("mcts", *mcts_result);
+            }
+            output << "\n}\n";
+            output.close();
+            atomic_replace(temporary, config.evaluation_output);
+        }
+    }
+
+    /* KL-105 Phase 2b: step one already-constructed gate scenario env for up to k_steps ticks.
+       Learner (seat 0) decision procedure is selected by learner_mode: kSearch runs the exact
+       deployed decision procedure (BatchedMcts, root noise off, greedy marginal_action -
+       identical machinery to evaluate_baseline's own search loop, same simulations budget as
+       --eval-simulations, opponent model per config.gates_opponent_model - see
+       gate_search_constraint()); kRaw takes the unmasked policy-head argmax with NO search at
+       all (diagnostic only - recorded but never gates pass/fail, per doc 13 section 2); kAgent
+       substitutes a scripted Agent for the network entirely (the --gates-agent achievability
+       reference). Opponent (seat 1) is one of: kNone (ACTION_WAIT every step), kConstant
+       (opponent_constant_action every step regardless of outcome - this is what produces the
+       "mutual rejection" stall pattern when contested), kAgent (a real scripted Agent via
+       env_observe/env_get_debug_snapshot/agent_act, the same pattern evaluate_baseline uses
+       for its opponents). Stops at the first step whose POST-step state satisfies
+       pass_predicate, at the first env_step_joint terminal, or after k_steps ticks - whichever
+       comes first. Takes env BY VALUE deliberately: the caller passes the constructed scenario
+       directly and this parameter's own copy is what gets mutated, so calling this two or
+       three times (search/raw/agent) against the same constructed env never shares or mutates
+       state across those runs.
+       scenario_rng/gates_opponent_model are explicit parameters, not a read of the `rng`
+       member / config.gates_opponent_model directly, so that run_gate_canary() (the v7 Stage 0
+       item 0.5 in-training probe below) can supply its OWN dedicated RNG and a hardcoded "self"
+       model - see that function's own doc comment for why. The `gates()` subcommand's call
+       sites pass the member `rng` and config.gates_opponent_model explicitly, so its behavior
+       (including determinism across repeated `gates` invocations) is completely unchanged.
+       gates_search_contempt (v7 Stage 0 item 0.4) is threaded through the SAME way and for the
+       SAME reason: run_gate_canary() hardcodes false (contempt off) rather than reading
+       config.gates_search_contempt, so the in-training drift canary's own behavior never
+       depends on a --gates-* flag that has nothing to do with training - only the `gates()`
+       subcommand ever passes config.gates_search_contempt through. */
+    GateResult run_gate_scenario(BomberEnv env, int k_steps, GateOpponentMode opponent_mode,
+                                 Action opponent_constant_action, AgentType opponent_agent_type,
+                                 uint64_t seed,
+                                 const std::function<bool(const BomberEnv&)>& pass_predicate,
+                                 GateLearnerMode learner_mode,
+                                 std::mt19937_64& scenario_rng,
+                                 const std::string& gates_opponent_model,
+                                 AgentType learner_agent_type = AGENT_RANDOM,
+                                 bool gates_search_contempt = false) {
+        GateResult result;
+        /* KL-110 Phase B: accumulates across every kSearch step of this whole scenario (one
+           BatchedMcts::search call per step) via count_fixed_opponent_violations() - see the
+           per-step search call below and the doc comment on BatchedMcts::search itself. Stays 0
+           for kRaw/kAgent (never passed to a search call) and for "self" mode (constraint's
+           fixed_opponent_action is always -1 there, so the traversal never fires). */
+        int fixed_opponent_violations = 0;
+        Agent opponent_scripted;
+        if (opponent_mode == GateOpponentMode::kAgent) {
+            agent_init(&opponent_scripted, opponent_agent_type);
+            agent_reset(&opponent_scripted, seed * 2 + 1);
+            if (opponent_agent_type == AGENT_MCTS &&
+                !mcts_agent_configure(&opponent_scripted, config.baseline_mcts_simulations,
+                                      config.baseline_mcts_depth))
+                throw std::runtime_error("invalid native MCTS baseline configuration "
+                                         "(gates opponent)");
+        }
+        Agent learner_scripted;
+        if (learner_mode == GateLearnerMode::kAgent) {
+            agent_init(&learner_scripted, learner_agent_type);
+            agent_reset(&learner_scripted, seed * 2);
+            if (learner_agent_type == AGENT_MCTS &&
+                !mcts_agent_configure(&learner_scripted, config.baseline_mcts_simulations,
+                                      config.baseline_mcts_depth))
+                throw std::runtime_error("invalid native MCTS baseline configuration "
+                                         "(gates learner)");
+        }
+        std::unique_ptr<BatchedMcts> search;
+        if (learner_mode == GateLearnerMode::kSearch)
+            search = std::make_unique<BatchedMcts>(model, device, config, scenario_rng,
+                                                    iteration, false);
+
+        const int initial_x = env.state.agents[0].x;
+        const int initial_y = env.state.agents[0].y;
+        /* doc 13 section 2's stall-break fail note: "track whether the learner ever changed
+           position or destroyed a crate or placed a bomb." crates_destroyed can only increase
+           via the learner's OWN bomb exploding on a crate, which necessarily means
+           bombs_active was >0 for that bomb first - so "placed a bomb" (bombs_active>0 at any
+           point) already subsumes "destroyed a crate" as a signal; checking both anyway costs
+           nothing and keeps this obviously traceable to the doc's three conditions. */
+        bool learner_ever_acted = false;
+
+        for (int step = 0; step < k_steps; ++step) {
+            int learner_action;
+            std::optional<GateStepRecord> step_record;
+            if (learner_mode == GateLearnerMode::kSearch) {
+                std::vector<BomberEnv*> active{&env};
+                /* config.gates_opponent_model selects what search's OWN internal lookahead
+                   assumes for the opposing seat this step. "self" (default, and the sole
+                   behavior before KL-110 Phase B) always models both seats with the network,
+                   uniformly across all six scenarios, regardless of what the outer loop's
+                   actual opponent_mode is (evaluate_baseline instead fixes fixed_opponent_seat
+                   to the real baseline type for non-MCTS opponents - see its `modeled_seat` -
+                   but gates historically did not: kNone/kConstant opponents have no AgentType
+                   to model in the first place, and uniformity meant all six gates exercised the
+                   exact same search configuration. This IS the "opponent_modeled_as" mismatch
+                   KL-107's trace already tracks - "self" mode keeps it constant rather than
+                   scenario-dependent). "aligned" instead fixes seat 1 (the opponent; the gates
+                   learner is always seat 0) to match the scenario's actual opponent this step -
+                   see gate_search_constraint(). Purpose: a raw-pass/search-fail inversion under
+                   "self" that disappears under "aligned" implicates opponent-model mismatch
+                   specifically, not generic value suppression - the two are otherwise
+                   confounded because "self" always searches against a full-strength mirror even
+                   when the real opponent that step is a WAIT-only or CONSTANT-action stub. */
+                const SearchConstraint constraint = gate_search_constraint(
+                    gates_opponent_model, opponent_mode, opponent_constant_action,
+                    opponent_agent_type, seed, gates_search_contempt);
+                std::vector<SearchConstraint> constraints{constraint};
+                const auto results = search->search(active, constraints, false,
+                                                     config.evaluation_simulations,
+                                                     &fixed_opponent_violations);
+                learner_action = marginal_action(results[0].visits, 0);
+
+                /* KL-110 Phase B per-step telemetry (search modes only). Learner-seat (0)
+                   marginals reuse marginal_distribution() exactly like the KL-107 evaluate
+                   trace above; opp_visit_marginal is the opponent seat's (1) visit marginal -
+                   in aligned mode with a fixed action this must come out one-hot (CI-checked).
+                   root_q mirrors the existing search_root_q_values derivation: value_sum0 is
+                   the correct per-seat accumulator here because the gates learner is always
+                   seat 0 (unlike evaluate_baseline, whose learner_seat varies, this needs no
+                   seat-conditional value_sum selection). opponent_executed_action is filled in
+                   below, once the outer loop actually computes what seat 1 was fed this step. */
+                GateStepRecord record;
+                record.step = step;
+                record.chosen = learner_action;
+                record.prior_after_safety_mask_marginal =
+                    marginal_distribution(results[0].priors, 0);
+                record.visit_marginal = marginal_distribution(results[0].visits, 0);
+                record.opp_visit_marginal = marginal_distribution(results[0].visits, 1);
+                const auto q_visits = record.visit_marginal;
+                const auto q_value_sums = marginal_distribution(results[0].value_sum0, 0);
+                for (int action = 0; action < kActions; ++action)
+                    record.root_q[action] = q_visits[action] > 0.0
+                        ? q_value_sums[action] / q_visits[action] : 0.0;
+                step_record = std::move(record);
+            } else if (learner_mode == GateLearnerMode::kRaw) {
+                /* Diagnostic-only decision procedure: unmasked policy-head argmax, no search -
+                   mirrors the v3 raw-recomputation single-position forward pass used for
+                   KL-107 trace capture above. Deliberately NOT run through
+                   safe_action_mask_for; that omission is the entire point of recording this
+                   mode separately from search mode. */
+                std::array<float, kObservationSize> encoded{};
+                if (bomber_training_encode_env(&env, 0, encoded.data(), kObservationSize) !=
+                    kObservationSize)
+                    throw std::runtime_error(
+                        "C observation encoder failed during gates raw-mode step");
+                auto input = torch::from_blob(encoded.data(),
+                    {1, BOMBER_TRAINING_CHANNELS, BOMBER_TRAINING_VIEW_SIZE,
+                     BOMBER_TRAINING_VIEW_SIZE}, torch::kFloat32).to(device);
+                torch::Tensor logits, value_tensor;
+                model->eval();
+                {
+                    torch::InferenceMode inference;
+                    AutocastGuard autocast;
+                    std::tie(logits, value_tensor) = model->forward(input);
+                }
+                const auto policy =
+                    torch::softmax(logits.to(torch::kFloat32), 1).to(torch::kCPU);
+                const auto accessor = policy.accessor<float, 2>();
+                int best_action = 0;
+                float best_probability = accessor[0][0];
+                for (int action = 1; action < kActions; ++action) {
+                    if (accessor[0][action] > best_probability) {
+                        best_probability = accessor[0][action];
+                        best_action = action;
+                    }
+                }
+                learner_action = best_action;
+            } else {
+                Observation obs;
+                DebugSnapshot snap;
+                env_observe(&env, 0, &obs);
+                env_get_debug_snapshot(&env, &snap);
+                learner_action = static_cast<int>(agent_act(&learner_scripted, &obs, &snap));
+            }
+
+            int opponent_action = static_cast<int>(ACTION_WAIT);
+            if (opponent_mode == GateOpponentMode::kConstant) {
+                opponent_action = static_cast<int>(opponent_constant_action);
+            } else if (opponent_mode == GateOpponentMode::kAgent) {
+                Observation obs;
+                DebugSnapshot snap;
+                env_observe(&env, 1, &obs);
+                env_get_debug_snapshot(&env, &snap);
+                opponent_action = static_cast<int>(agent_act(&opponent_scripted, &obs, &snap));
+            }
+            if (step_record) {
+                /* What the outer loop actually fed seat 1 this step - computed just above,
+                   after the search call that produced everything else in step_record. */
+                step_record->opponent_executed_action = opponent_action;
+                result.steps.push_back(*step_record);
+            }
+
+            if (learner_action == static_cast<int>(ACTION_PLACE_BOMB)) learner_ever_acted = true;
+            const Action actions[2] = {static_cast<Action>(learner_action),
+                                       static_cast<Action>(opponent_action)};
+            const StepResult step_result = env_step_joint(&env, actions, 2);
+            if (env.state.agents[0].x != initial_x || env.state.agents[0].y != initial_y ||
+                env.state.agents[0].bombs_active > 0)
+                learner_ever_acted = true;
+
+            result.steps_used = step + 1;
+            if (pass_predicate(env)) {
+                result.passed = true;
+                result.terminal = "pass";
+                break;
+            }
+            if (step_result.done) {
+                result.terminal = gate_terminal_label(step_result.terminal_reason);
+                break;
+            }
+        }
+        if (result.terminal.empty()) result.terminal = "step_budget_exhausted";
+        result.note = learner_ever_acted ? "" :
+            "learner never changed position, destroyed a crate, or placed a bomb "
+            "(combined-idle every step)";
+        result.fixed_opponent_internal_violations = fixed_opponent_violations;
+        return result;
+    }
+
+    /* v7 Stage 0 item 0.5 (docs/experiment-memory/14-v7-from-scratch-design.md): runs the same
+       six tactical gates build_gate_scenarios() defines, IN-PROCESS against the LIVE model,
+       search mode only, hardcoded "self" opponent model - never config.gates_opponent_model,
+       which is a `gates` SUBCOMMAND-only CLI flag unrelated to this training-loop probe (a
+       training run that happens to also carry --gates-opponent-model aligned on its command
+       line must not silently change what the canary measures - it must stay a stable,
+       comparable-over-time signal). GateLearnerMode::kSearch always builds its BatchedMcts
+       with root_noise=false (see run_gate_scenario above), so this reuses config.
+       evaluation_simulations as its budget - the same authoritative decision procedure and
+       budget the `gates` subcommand itself scores pass/fail on. Called from run() at every
+       evaluation_interval - "drift must never be invisible again" is this item's own name for
+       the finding that motivated it (doc 14 section 1 item 3 / section 3 item 0.5).
+
+       Diagnostic only: deliberately NOT in semantic_field_flags()/runtime_config_signature()/
+       the manifest - this changes what a live probe MEASURES about the current weights, never
+       what those weights were themselves trained under (same category as --gates-agent/
+       --gates-opponent-model - see trainer.h's own doc comment on gates_opponent_model).
+
+       scenario_rng MUST be a dedicated RNG the caller constructs fresh from a constant seed,
+       never the shared collection `rng` member - see the call site in run() for the full
+       argument. (root_noise is false for every call this makes, so scenario_rng is never
+       actually drawn from today - add_root_noise(), the sole rng_ consumer inside
+       BatchedMcts::search, is skipped whenever root_noise is false. The dedicated instance is
+       still required: it is what makes "the canary cannot perturb collection determinism" true
+       by construction, not true by an accident of today's noise-off default that a future
+       search() change could silently invalidate.) */
+    GateCanaryResult run_gate_canary(std::mt19937_64& scenario_rng) {
+        GateCanaryResult canary;
+        BomberConfig base = game_config(config);
+        base.crate_density = 0;
+        /* Mirrors gates()'s own --max-steps floor below (see its comment there): the tiny CI
+           fixture trains at --max-steps 8, which would otherwise cap every scenario's real
+           step budget to 8 regardless of its own k_steps, making passed_search meaningless at
+           fixture scale. */
+        base.max_steps = std::max(base.max_steps, 64);
+        /* Disjoint from gates()'s own kGateSeedBase (5'000'001) and every evaluation/
+           promotion/mcts-eval seed block below - purely env_reset() reproducibility
+           bookkeeping, not security; the canary's actual search RANDOMNESS is scenario_rng,
+           entirely separate from this env-construction seed. */
+        constexpr uint64_t kCanaryGateSeedBase = 9'900'001ULL;
+        const auto specs = build_gate_scenarios();
+        bool trap_recorded = false;
+        for (size_t index = 0; index < specs.size(); ++index) {
+            const auto& spec = specs[index];
+            const uint64_t seed = kCanaryGateSeedBase + static_cast<uint64_t>(index);
+            BomberEnv constructed{};
+            env_init(&constructed, &base);
+            env_reset(&constructed, seed);
+            spec.build(constructed);
+            /* Same staleness fix as gates() below - the scenario builder just overwrote
+               env.state directly; recompute danger before the search reads it (channel 8,
+               current_blast, is read directly rather than recomputed - see gates()'s own
+               comment on this exact call pair for the full explanation). */
+            danger_compute(&constructed.danger, &constructed.state);
+            danger_compute_escape(&constructed.danger, &constructed.state, 0);
+            validate_gate_scenario_construction(constructed, spec.name);
+
+            const GateResult result = run_gate_scenario(
+                constructed, spec.k_steps, spec.opponent_mode, spec.opponent_constant_action,
+                spec.opponent_agent_type, seed, spec.pass_predicate, GateLearnerMode::kSearch,
+                scenario_rng, "self");
+            canary.passed_search += result.passed ? 1 : 0;
+            canary.per_scenario.emplace_back(spec.name, result.passed);
+            if (spec.name == "trap") {
+                /* run_gate_scenario always pushes a step_record BEFORE checking pass_predicate/
+                   terminal (see its loop), so steps[0] exists for any k_steps>=1 regardless of
+                   whether the scenario passed on the very first tick - trap's k_steps is 20. */
+                if (result.steps.empty())
+                    throw std::runtime_error(
+                        "drift canary: trap scenario produced no step-0 search telemetry");
+                canary.trap_bomb_prior_step0 = result.steps.front()
+                    .prior_after_safety_mask_marginal[static_cast<int>(ACTION_PLACE_BOMB)];
+                trap_recorded = true;
+            }
+        }
+        if (!trap_recorded)
+            throw std::runtime_error(
+                "drift canary: build_gate_scenarios() no longer contains a 'trap' scenario "
+                "(trap_bomb_prior_step0 is undefined without one)");
+        return canary;
+    }
+
+    /* KL-105 Phase 2b: the `gates` subcommand entry point. Read-only, like evaluate_only() -
+       loads the checkpoint exactly the same way (manifest semantics inheritance happens in the
+       constructor above; --legacy-accept-unverified-semantics supported the same way), reuses
+       --output/--overwrite-evidence for a write-once JSON evidence file, and reuses
+       --eval-simulations for the search budget. Runs each of the six scenarios twice (search
+       mode + raw mode) against the loaded network, or once against a scripted Agent if
+       --gates-agent was given. */
+    void gates() {
+        if (!std::filesystem::exists(requested_checkpoint_path))
+            throw std::runtime_error("checkpoint not found: " +
+                                     requested_checkpoint_path.string());
+        require_available_evidence_path(config.evaluation_output, "gates evidence output");
+        std::cout << "resolved semantics: " << semantic_manifest_string(config) << '\n';
+
+        const bool agent_mode = !config.gates_agent.empty();
+        const AgentType gates_agent_type =
+            agent_mode ? parse_gate_agent_name(config.gates_agent) : AGENT_RANDOM;
+
+        BomberConfig base = game_config(config);
+        base.crate_density = 0;
+        /* --max-steps is part of the checkpoint ABI (config_signature(), checked once at
+           load_checkpoint() time using the CLI's original --max-steps) but is NOT a semantic
+           field (not in semantic_field_flags()/the manifest) and this `base` is a fresh local
+           BomberConfig, not a reference back into `config` - overriding it here cannot affect
+           or re-trigger that already-completed ABI check. It matters because CI's tiny fixture
+           checkpoints are trained at --max-steps 8 for speed (see tests/CMakeLists.txt's
+           native-alphazero-semantic-smoke fixture), and gates must be run against that exact
+           checkpoint (matching --max-steps 8 to load it at all) - without this override every
+           scenario's env would hit TERMINAL_TIMEOUT at state.step==8 regardless of its own
+           k_steps budget (empirically confirmed: every scenario reported "8 steps, timeout"
+           before this fix), silently capping every scenario's real step budget to 8 and making
+           the --gates-agent achievability check meaningless. The largest k_steps below is 30
+           (corridor-clear/chase); 64 leaves generous headroom for all of them regardless of
+           what --max-steps the loaded checkpoint's own training run used. */
+        base.max_steps = std::max(base.max_steps, 64);
+        /* KL-105: seed block dedicated to gates, disjoint from evaluation (900001+), promotion
+           (1100001+), and MCTS-eval (1300001+) seed blocks validate_config guards against
+           overlapping - gates never shares a process invocation with those, so no explicit
+           overlap check is needed here, but the block is kept disjoint anyway on principle.
+           env_reset's seed barely matters at crate_density=0 (map_generate's wall/pillar
+           layout is a pure function of width/height only, no RNG involved; only crate
+           placement -disabled here via crate_density=0- and later in-scenario gameplay RNG,
+           e.g. powerup drops from a destroyed crate, consume it, and none of the pass
+           predicates below depend on powerup RNG) - fixed purely for reproducibility. */
+        constexpr uint64_t kGateSeedBase = 5'000'001ULL;
+        const auto specs = build_gate_scenarios();
+
+        struct ScenarioRecord {
+            std::string name;
+            GateResult search;
+            GateResult raw;
+            GateResult agent;
+        };
+        std::vector<ScenarioRecord> records;
+        records.reserve(specs.size());
+
+        for (size_t index = 0; index < specs.size(); ++index) {
+            const auto& spec = specs[index];
+            const uint64_t seed = kGateSeedBase + static_cast<uint64_t>(index);
+            BomberEnv constructed{};
+            env_init(&constructed, &base);
+            env_reset(&constructed, seed);
+            spec.build(constructed);
+            /* The scenario builder just overwrote env.state directly; env.danger was computed
+               for the PRE-overwrite (freshly-generated, un-modified) layout by env_reset above
+               and is now stale relative to the hand-placed tiles/bombs. env_step_joint
+               recomputes danger_compute/danger_compute_escape internally after every step
+               (verified: src/env/bomber_env.c, both calls unconditionally run right before
+               state->step++), so staleness only matters for the very first decision - but it
+               matters: bomber_training_encode_env's channel 8 (current_blast) reads
+               env->danger.current_blast directly rather than recomputing it fresh
+               (src/training/encoding.c), so a stale danger map would show the network a false
+               "no danger" read on step 0 of e.g. flame-timing/stall-break, where real danger is
+               present from construction. Recompute before anything touches this env, mirroring
+               exactly what env_reset itself does for a freshly generated map. */
+            danger_compute(&constructed.danger, &constructed.state);
+            danger_compute_escape(&constructed.danger, &constructed.state, 0);
+            validate_gate_scenario_construction(constructed, spec.name);
+
+            ScenarioRecord record;
+            record.name = spec.name;
+            if (agent_mode) {
+                /* run_gate_scenario takes its env BY VALUE - passing `constructed` directly
+                   lets that parameter copy do the "give each run its own independent env"
+                   work; `constructed` itself is untouched and reusable for the next mode. */
+                record.agent = run_gate_scenario(constructed, spec.k_steps, spec.opponent_mode,
+                                                 spec.opponent_constant_action,
+                                                 spec.opponent_agent_type, seed,
+                                                 spec.pass_predicate, GateLearnerMode::kAgent,
+                                                 rng, config.gates_opponent_model,
+                                                 gates_agent_type);
+            } else {
+                record.search = run_gate_scenario(constructed, spec.k_steps, spec.opponent_mode,
+                                                  spec.opponent_constant_action,
+                                                  spec.opponent_agent_type, seed,
+                                                  spec.pass_predicate, GateLearnerMode::kSearch,
+                                                  rng, config.gates_opponent_model, AGENT_RANDOM,
+                                                  config.gates_search_contempt);
+                record.raw = run_gate_scenario(constructed, spec.k_steps, spec.opponent_mode,
+                                               spec.opponent_constant_action,
+                                               spec.opponent_agent_type, seed,
+                                               spec.pass_predicate, GateLearnerMode::kRaw,
+                                               rng, config.gates_opponent_model);
+            }
+            records.push_back(std::move(record));
+        }
+
+        std::cout << "\nTactical gates (" << (agent_mode ? config.gates_agent + " agent"
+                                                          : std::string("network"))
+                  << ", " << config.evaluation_simulations << " simulations"
+                  << (agent_mode ? std::string() : ", " + config.gates_opponent_model +
+                                                   "-opponent search")
+                  << "):\n";
+        if (agent_mode) {
+            std::cout << std::left << std::setw(20) << "scenario" << std::setw(10) << "result"
+                      << std::setw(8) << "steps" << "terminal\n";
+            for (const auto& record : records)
+                std::cout << std::left << std::setw(20) << record.name
+                          << std::setw(10) << (record.agent.passed ? "PASS" : "FAIL")
+                          << std::setw(8) << record.agent.steps_used
+                          << record.agent.terminal << '\n';
+        } else {
+            std::cout << std::left << std::setw(20) << "scenario"
+                      << std::setw(45) << "search (authoritative)" << "raw (diagnostic)\n";
+            for (const auto& record : records) {
+                std::ostringstream search_cell;
+                std::ostringstream raw_cell;
+                search_cell << (record.search.passed ? "PASS" : "FAIL") << " ("
+                           << record.search.steps_used << " steps, " << record.search.terminal
+                           << ")";
+                raw_cell << (record.raw.passed ? "PASS" : "FAIL") << " ("
+                        << record.raw.steps_used << " steps, " << record.raw.terminal << ")";
+                std::cout << std::left << std::setw(20) << record.name
+                          << std::setw(45) << search_cell.str() << raw_cell.str() << '\n';
+            }
+        }
+
+        if (!config.evaluation_output.empty()) {
+            const auto temporary = config.evaluation_output.string() + ".tmp";
+            if (!config.evaluation_output.parent_path().empty())
+                std::filesystem::create_directories(config.evaluation_output.parent_path());
+            std::ofstream output(temporary, std::ios::trunc);
+            if (!output)
+                throw std::runtime_error("could not open gates evidence output: " + temporary);
+            auto write_result = [&output](const GateResult& value) {
+                output << "{\"passed\": " << (value.passed ? "true" : "false")
+                       << ", \"steps_used\": " << value.steps_used
+                       << ", \"terminal\": \"" << json_escape(value.terminal) << "\""
+                       << ", \"note\": \"" << json_escape(value.note) << "\"}";
+            };
+            /* KL-110 Phase B: search-mode-only extension of write_result - per-step search
+               telemetry (steps[]) and the internal-node enforcement count. A SEPARATE lambda
+               rather than adding these fields unconditionally to write_result, so raw/agent-mode
+               evidence objects (which never populate GateResult::steps or
+               fixed_opponent_internal_violations - see run_gate_scenario) never carry a
+               misleadingly-present-but-empty "steps": [] implying a search that never ran.
+               std::setprecision(9), set once below on `output` (KL-101 fork-manifest
+               precedent), governs every double this lambda writes too. */
+            auto write_search_result = [&output](const GateResult& value) {
+                output << "{\"passed\": " << (value.passed ? "true" : "false")
+                       << ", \"steps_used\": " << value.steps_used
+                       << ", \"terminal\": \"" << json_escape(value.terminal) << "\""
+                       << ", \"note\": \"" << json_escape(value.note) << "\""
+                       << ", \"fixed_opponent_internal_violations\": "
+                       << value.fixed_opponent_internal_violations
+                       << ", \"steps\": [";
+                for (size_t index = 0; index < value.steps.size(); ++index) {
+                    const auto& step = value.steps[index];
+                    output << (index ? "," : "") << "{\"step\": " << step.step
+                           << ", \"chosen\": " << step.chosen
+                           << ", \"opponent_executed_action\": " << step.opponent_executed_action
+                           << ", \"prior_after_safety_mask_marginal\": [";
+                    for (int action = 0; action < kActions; ++action)
+                        output << (action ? "," : "")
+                               << step.prior_after_safety_mask_marginal[action];
+                    output << "], \"visit_marginal\": [";
+                    for (int action = 0; action < kActions; ++action)
+                        output << (action ? "," : "") << step.visit_marginal[action];
+                    output << "], \"root_q\": [";
+                    for (int action = 0; action < kActions; ++action)
+                        output << (action ? "," : "") << step.root_q[action];
+                    output << "], \"opp_visit_marginal\": [";
+                    for (int action = 0; action < kActions; ++action)
+                        output << (action ? "," : "") << step.opp_visit_marginal[action];
+                    output << "]}";
+                }
+                output << "]}";
+            };
+            output << std::setprecision(9) << "{\n"
+                   << "  \"gates_format_version\": 2,\n"
+                   << "  \"generated_at_utc\": \"" << utc_timestamp() << "\",\n"
+                   << "  \"invocation_argv\": [";
+            for (size_t index = 0; index < config.invocation_argv.size(); ++index) {
+                if (index) output << ',';
+                output << '"' << json_escape(config.invocation_argv[index]) << '"';
+            }
+            output << "],\n"
+                   << "  \"working_directory\": \""
+                   << json_escape(std::filesystem::current_path().string()) << "\",\n"
+                   << "  \"checkpoint\": \"" << json_escape(config.checkpoint.string())
+                   << "\",\n"
+                   << "  \"checkpoint_path\": \""
+                   << json_escape(std::filesystem::absolute(requested_checkpoint_path)
+                                      .lexically_normal().string()) << "\",\n"
+                   << "  \"checkpoint_sha256\": \"" << sha256_file(requested_checkpoint_path)
+                   << "\",\n"
+                   << "  \"executable_path\": \""
+                   << json_escape(current_executable_path().string()) << "\",\n"
+                   << "  \"executable_sha256\": \"" << sha256_file(current_executable_path())
+                   << "\",\n"
+                   << "  \"git_commit\": \"" << AI_BOMBER_GIT_SHA << "\",\n"
+                   << "  \"runtime_config_signature\": \""
+                   << json_escape(runtime_config_signature(config)) << "\",\n"
+                   << "  \"checkpoint_semantics_verified\": "
+                   << (loaded_legacy_checkpoint ? "false" : "true") << ",\n"
+                   << "  \"checkpoint_semantics_source\": \""
+                   << (loaded_legacy_checkpoint ? "legacy_cli_unverified" : "checkpoint_manifest")
+                   << "\",\n"
+                   << "  \"checkpoint_iteration\": " << iteration << ",\n"
+                   << "  \"resolved_semantics\": \""
+                   << json_escape(semantic_manifest_string(config)) << "\",\n"
+                   << "  \"mode\": \""
+                   << json_escape(agent_mode ? config.gates_agent : std::string("network"))
+                   << "\",\n"
+                   << "  \"simulations\": " << config.evaluation_simulations << ",\n"
+                   << "  \"search_opponent_model\": \""
+                   << json_escape(config.gates_opponent_model) << "\",\n";
+            /* v7 Stage 0 item 0.4 (SEARCH-CONTEMPT PROTOTYPE): conditionally present - only when
+               --gates-search-contempt was passed this invocation. config.search_contempt_nscl is
+               parsed unconditionally like any other CLI value, but is only actually LIVE when a
+               constraint's contempt_seat>=0 too (see gate_search_constraint()) - printing it
+               unconditionally would misleadingly suggest every gates run "used" whatever value
+               this process's --search-contempt-nscl happened to resolve to, even a run that
+               never passed --gates-search-contempt at all. Per-scenario evidence needs no
+               companion field: contempt does not change GateResult's shape, only which action(s)
+               a search-mode scenario's own steps[] record. */
+            if (config.gates_search_contempt)
+                output << "  \"search_contempt_nscl\": " << config.search_contempt_nscl << ",\n";
+            output << "  \"scenarios\": [\n";
+            for (size_t index = 0; index < records.size(); ++index) {
+                const auto& record = records[index];
+                output << "    {\"name\": \"" << json_escape(record.name) << "\", ";
+                if (agent_mode) {
+                    output << "\"result\": ";
+                    write_result(record.agent);
+                } else {
+                    /* opponent_model_alignment is scenario-level metadata about what search's
+                       opponent modeling would be for THIS scenario under the current
+                       --gates-opponent-model - see gate_opponent_alignment_kind(). Only
+                       meaningful in network mode (agent_mode substitutes a scripted Agent for
+                       the whole learner decision procedure - no BatchedMcts search runs at all,
+                       so there is nothing to label as aligned/self here), matching how
+                       "search"/"raw" are themselves absent from agent-mode scenario records. */
+                    output << "\"opponent_model_alignment\": \""
+                           << gate_opponent_alignment_kind(config.gates_opponent_model,
+                                                            specs[index].opponent_mode)
+                           << "\", \"search\": ";
+                    write_search_result(record.search);
+                    output << ", \"raw\": ";
+                    write_result(record.raw);
+                }
+                output << "}" << (index + 1 < records.size() ? "," : "") << "\n";
+            }
+            output << "  ]\n"
+                   << "}\n";
+            output.close();
+            atomic_replace(temporary, config.evaluation_output);
+            std::cout << "\nwrote " << config.evaluation_output.string() << '\n';
+        }
+    }
+};
+
+TrainConfig parse_train_config(int argc, char** argv, int first) {
+    validate_train_cli_options(argc, argv, first);
+    TrainConfig config;
+    config.invocation_argv = invocation_arguments(argc, argv);
+    config.run_dir = parse_string(argc, argv, first, "--run-dir", config.run_dir.string());
+    config.checkpoint = parse_string(argc, argv, first, "--checkpoint", config.checkpoint.string());
+    config.evaluation_output = parse_string(argc, argv, first, "--output", "");
+    config.per_match_output = parse_string(argc, argv, first, "--per-match-output", "");
+    config.trace_output = parse_string(argc, argv, first, "--trace-output", "");
+    config.replay_output = parse_string(argc, argv, first, "--replay-out", "");
+    config.replay_incumbent = parse_string(argc, argv, first, "--replay-incumbent", "");
+    config.incumbent_eval_games = parse_number(argc, argv, first, "--incumbent-eval-games",
+                                               config.incumbent_eval_games);
+    config.width = parse_number(argc, argv, first, "--width", config.width);
+    config.height = parse_number(argc, argv, first, "--height", config.height);
+    config.max_steps = parse_number(argc, argv, first, "--max-steps", config.max_steps);
+    config.crate_density = parse_number(argc, argv, first, "--crate-density", config.crate_density);
+    config.flame_duration = parse_number(argc, argv, first, "--flame-duration", config.flame_duration);
+    config.sudden_death_start = parse_number(argc, argv, first, "--sudden-death-start", config.sudden_death_start);
+    config.shrink_interval = parse_number(argc, argv, first, "--shrink-interval", config.shrink_interval);
+    config.iterations = parse_number(argc, argv, first, "--iterations", config.iterations);
+    config.self_play_games = parse_number(argc, argv, first, "--games", config.self_play_games);
+    config.simulations = parse_number(argc, argv, first, "--simulations", config.simulations);
+    config.train_steps = parse_number(argc, argv, first, "--train-steps", config.train_steps);
+    config.batch_size = parse_number(argc, argv, first, "--batch-size", config.batch_size);
+    config.replay_capacity = parse_number(argc, argv, first, "--replay-capacity", config.replay_capacity);
+    config.channels = parse_number(argc, argv, first, "--channels", config.channels);
+    config.residual_blocks = parse_number(argc, argv, first, "--blocks", config.residual_blocks);
+    config.teacher_games = parse_number(argc, argv, first, "--teacher-games", config.teacher_games);
+    config.teacher_iterations = parse_number(argc, argv, first, "--teacher-iterations", config.teacher_iterations);
+    config.teacher_agents = parse_string(argc, argv, first, "--teacher-agents", config.teacher_agents);
+    config.teacher_threads = parse_number(argc, argv, first, "--teacher-threads", config.teacher_threads);
+    config.evaluation_interval = parse_number(argc, argv, first, "--eval-interval", config.evaluation_interval);
+    config.evaluation_games = parse_number(argc, argv, first, "--eval-games", config.evaluation_games);
+    config.evaluation_simulations = parse_number(argc, argv, first, "--eval-simulations", config.evaluation_simulations);
+    config.promotion_games = parse_number(argc, argv, first, "--promotion-games", config.promotion_games);
+    config.promotion_simulations = parse_number(argc, argv, first, "--promotion-simulations", config.promotion_simulations);
+    config.mcts_evaluation_interval = parse_number(argc, argv, first, "--mcts-eval-interval", config.mcts_evaluation_interval);
+    config.mcts_evaluation_games = parse_number(argc, argv, first, "--mcts-eval-games", config.mcts_evaluation_games);
+    config.baseline_mcts_simulations = parse_number(argc, argv, first, "--baseline-mcts-simulations", config.baseline_mcts_simulations);
+    config.baseline_mcts_depth = parse_number(argc, argv, first, "--baseline-mcts-depth", config.baseline_mcts_depth);
+    config.evaluation_seed_base = parse_number(argc, argv, first, "--eval-seed-base", config.evaluation_seed_base);
+    config.promotion_seed_base = parse_number(argc, argv, first, "--promotion-seed-base", config.promotion_seed_base);
+    config.mcts_evaluation_seed_base = parse_number(argc, argv, first, "--mcts-eval-seed-base", config.mcts_evaluation_seed_base);
+    config.snapshot_interval = parse_number(argc, argv, first, "--snapshot-interval", config.snapshot_interval);
+    config.temperature_steps = parse_number(argc, argv, first, "--temperature-steps", config.temperature_steps);
+    config.seed = parse_number(argc, argv, first, "--seed", config.seed);
+    config.learning_rate = parse_number(argc, argv, first, "--learning-rate", config.learning_rate);
+    config.min_learning_rate = parse_number(argc, argv, first, "--min-learning-rate", config.min_learning_rate);
+    config.learning_rate_schedule_start_update = parse_number(
+        argc, argv, first, "--lr-schedule-start-update",
+        config.learning_rate_schedule_start_update);
+    config.learning_rate_schedule_updates = parse_number(
+        argc, argv, first, "--lr-schedule-updates",
+        config.learning_rate_schedule_updates);
+    config.weight_decay = parse_number(argc, argv, first, "--weight-decay", config.weight_decay);
+    config.c_puct = parse_number(argc, argv, first, "--c-puct", config.c_puct);
+    config.dirichlet_alpha = parse_number(argc, argv, first, "--dirichlet-alpha", config.dirichlet_alpha);
+    config.dirichlet_fraction = parse_number(argc, argv, first, "--dirichlet-fraction", config.dirichlet_fraction);
+    config.forced_playouts_k = parse_number(argc, argv, first, "--forced-playouts-k",
+                                            config.forced_playouts_k);
+    config.search_contempt_nscl = parse_number(argc, argv, first, "--search-contempt-nscl",
+                                               config.search_contempt_nscl);
+    config.temperature = parse_number(argc, argv, first, "--temperature", config.temperature);
+    config.temperature_final = parse_number(argc, argv, first, "--temperature-final",
+                                            config.temperature_final);
+    config.bootstrap_value_weight = parse_number(argc, argv, first, "--bootstrap-weight", config.bootstrap_value_weight);
+    config.bootstrap_value_iterations = parse_number(argc, argv, first, "--bootstrap-iterations", config.bootstrap_value_iterations);
+    /* Convenience: --draw-value X sets BOTH per-seat draw values (timeout stall and mutual
+       death) to X, the single "how much worse than a win is a draw" aggression dial from
+       docs/REWARD_AND_MODEL_DESIGN.md. It is a base; a following --timeout-draw-value /
+       --mutual-death-value still overrides its seat. validate_config enforces X in [-1,0]. */
+    constexpr double kDrawValueUnset = 1e9;
+    const double draw_value = parse_number(argc, argv, first, "--draw-value", kDrawValueUnset);
+    if (draw_value != kDrawValueUnset) {
+        config.timeout_draw_value = draw_value;
+        config.mutual_death_value = draw_value;
+    }
+    config.timeout_draw_value = parse_number(argc, argv, first, "--timeout-draw-value", config.timeout_draw_value);
+    config.mutual_death_value = parse_number(argc, argv, first, "--mutual-death-value", config.mutual_death_value);
+    config.arena_crush_win_value = parse_number(argc, argv, first, "--arena-crush-win-value", config.arena_crush_win_value);
+    config.selfkill_win_value = parse_number(argc, argv, first, "--selfkill-win-value", config.selfkill_win_value);
+    config.league_heuristic_fraction = parse_number(argc, argv, first, "--league-heuristic-fraction",
+                                                     config.league_heuristic_fraction);
+    config.replay_cause_balance_cap = parse_number(argc, argv, first, "--replay-cause-balance-cap",
+                                                    config.replay_cause_balance_cap);
+    config.policy_entropy_bonus = parse_number(argc, argv, first, "--policy-entropy-bonus",
+                                               config.policy_entropy_bonus);
+    config.value_only_iterations = parse_number(argc, argv, first, "--value-only-iterations",
+                                                 config.value_only_iterations);
+    config.promotion_margin = parse_number(argc, argv, first, "--promotion-margin", config.promotion_margin);
+    config.promotion_confidence_z = parse_number(argc, argv, first, "--promotion-confidence-z", config.promotion_confidence_z);
+    config.random_score_floor = parse_number(argc, argv, first, "--random-score-floor", config.random_score_floor);
+    config.heuristic_score_floor = parse_number(argc, argv, first, "--heuristic-score-floor", config.heuristic_score_floor);
+    config.heuristic_regression_margin = parse_number(argc, argv, first, "--heuristic-regression-margin", config.heuristic_regression_margin);
+    config.gates_agent = parse_string(argc, argv, first, "--gates-agent", config.gates_agent);
+    config.gates_opponent_model = parse_string(argc, argv, first, "--gates-opponent-model",
+                                               config.gates_opponent_model);
+    config.gates_search_contempt = has_flag(argc, argv, first, "--gates-search-contempt");
+    config.fork_from = parse_string(argc, argv, first, "--fork-from", config.fork_from.string());
+    config.dirty_diff_digest = parse_string(argc, argv, first, "--dirty-diff-digest",
+                                            config.dirty_diff_digest);
+    config.fresh = has_flag(argc, argv, first, "--fresh");
+    config.temperature_anneal = has_flag(argc, argv, first, "--temperature-anneal");
+    config.fork_reset_champion = has_flag(argc, argv, first, "--fork-reset-champion");
+    config.progress = !has_flag(argc, argv, first, "--no-progress");
+    config.evaluate_mcts = has_flag(argc, argv, first, "--eval-mcts");
+    config.overwrite_evidence = has_flag(argc, argv, first, "--overwrite-evidence");
+    config.legacy_accept_unverified_semantics =
+        has_flag(argc, argv, first, "--legacy-accept-unverified-semantics");
+    for (const auto& [key, flag] : semantic_field_flags())
+        if (has_flag(argc, argv, first, flag)) config.explicit_semantic_flags.insert(key);
+    if (has_flag(argc, argv, first, "--draw-value")) {
+        config.explicit_semantic_flags.insert("timeout_draw_value");
+        config.explicit_semantic_flags.insert("mutual_death_value");
+    }
+    validate_config(config);
+    return config;
+}
+
+Trainer::Trainer(TrainConfig config) : impl_(std::make_unique<Impl>(std::move(config))) {}
+Trainer::~Trainer() = default;
+void Trainer::run() { impl_->run(); }
+void Trainer::evaluate_only() { impl_->evaluate_only(); }
+void Trainer::gates() { impl_->gates(); }
+
+void print_native_help() {
+    std::cout <<
+        "Native C++/LibTorch AlphaZero trainer\n\n"
+        "Usage:\n"
+        "  bomber_alphazero_native train [options]\n"
+        "  bomber_alphazero_native evaluate [options]\n"
+        "  bomber_alphazero_native gates [options]\n"
+        "  bomber_alphazero_native benchmark [options]\n\n"
+        "Key training options:\n"
+        "  --run-dir PATH            Checkpoint/result directory\n"
+        "  --checkpoint FILE         Checkpoint to load (default latest.pt)\n"
+        "  --output PATH             Write evaluation results as JSON (gates: write the\n"
+        "                            tactical-gates evidence file - see below)\n"
+        "  --per-match-output PATH   (evaluate --eval-mcts) Write one JSON line per\n"
+        "                            completed MCTS-baseline match: seed, seat, outcome, cause,\n"
+        "                            steps, WAIT - rows for paired/seat-delta descriptive\n"
+        "                            comparison; causal use also requires matched training\n"
+        "                            lineage, schedule, binary, and non-treatment semantics\n"
+        "  --trace-output PATH       (evaluate --eval-mcts) Write one JSON line per LEARNER\n"
+        "                            STEP: safety-masked policy prior + entropy, MCTS-refined\n"
+        "                            policy, search backup value, root visits, chosen action,\n"
+        "                            plus a genuinely raw pre-mask policy/value recomputation,\n"
+        "                            the safe-action mask, a wait_forced flag, root Q per\n"
+        "                            action, the search's own opponent-model assumption\n"
+        "                            (opponent_modeled_as), and whether the learner actually\n"
+        "                            moved this step (learner_moved, false = blocked/rejected\n"
+        "                            move - effective idle beyond explicit WAIT) (trace_format\n"
+        "                            _version 4)\n"
+        "  --overwrite-evidence      Explicitly allow existing output/per-match/trace paths\n"
+        "                            to be replaced (default is fail closed)\n"
+        "  --draw-value X            Set both per-seat draw values (timeout+mutual death) to X\n"
+        "                            in [-1,0]; the aggression dial (default -0.5/-0.2)\n"
+        "  --arena-crush-win-value X Value of a win by sudden-death arena crush (default 0.3)\n"
+        "  --selfkill-win-value X    Value of a win where the loser blew itself up (default 0.3)\n"
+        "                            Both in (0,1]; only a demonstrated kill (you killed them\n"
+        "                            with your bomb) still values at 1.0 - loss values untouched\n"
+        "  --league-heuristic-fraction X  Fraction of self-play games (in [0,1], default 0)\n"
+        "                            played vs the heuristic agent instead of a network mirror;\n"
+        "                            mirrors structurally suppress clean kills (both seats share\n"
+        "                            dodge skill) - a non-mirror opponent creates reachable ones\n"
+        "  --replay-cause-balance-cap X  Bias training batches toward bomb-kill winning-side\n"
+        "                            replay samples (in [0,0.9], default 0 = off = current\n"
+        "                            uniform sampling, bit-for-bit); tagging always runs, only\n"
+        "                            the sampler bias is gated by this cap - see docs/\n"
+        "                            experiment-memory/13-kl105-experiment-design.md section 3\n"
+        "  --forced-playouts-k X     KataGo forced playouts + policy-target pruning (in [0,10],\n"
+        "                            default 0 = off, bit-for-bit). >0: during COLLECTION\n"
+        "                            searches only (root_noise on - mirror/league; eval/gates/\n"
+        "                            promotion never force), a root action is selected\n"
+        "                            regardless of PUCT score whenever its marginal visits fall\n"
+        "                            below sqrt(X * post-noise prior * total visits); the POLICY\n"
+        "                            TARGET (not action selection) is then pruned of forced-only\n"
+        "                            visits at collection time - counters measured prior\n"
+        "                            starvation under Dirichlet noise - see docs/experiment-\n"
+        "                            memory/14-v7-from-scratch-design.md item 0.2\n"
+        "  --search-contempt-nscl N  SEARCH-CONTEMPT PROTOTYPE (in [0,10000], default 0 = off).\n"
+        "                            Gates-only for now: requires a constraint with\n"
+        "                            contempt_seat>=0 (see --gates-search-contempt) AND\n"
+        "                            root_noise=false (throws otherwise - never coexists with\n"
+        "                            collection). >0: at any node (root or interior) where that\n"
+        "                            seat is modeled, once the node's total visits first exceed\n"
+        "                            N, the seat's marginal action freezes to a snapshot of its\n"
+        "                            visit distribution at that moment and is sampled from it\n"
+        "                            thereafter, instead of continuing PUCT - caps how perfectly\n"
+        "                            the modeled opponent can punish a commitment move (e.g.\n"
+        "                            BOMB) within one search budget. Joshi 2025 arXiv:2504.07757,\n"
+        "                            adapted to decoupled simultaneous PUCT - see docs/\n"
+        "                            experiment-memory/14-v7-from-scratch-design.md item 0.4\n"
+        "  --temperature-anneal      Linearly anneal the sample temperature from --temperature\n"
+        "                            (step 0) down to --temperature-final (step\n"
+        "                            --temperature-steps), then argmax after - default off,\n"
+        "                            which keeps the original step-function temperature (flat\n"
+        "                            --temperature for step<temperature-steps, argmax after),\n"
+        "                            bit-for-bit\n"
+        "  --temperature-final X     Anneal endpoint temperature (in [0,--temperature], default\n"
+        "                            0); only meaningful with --temperature-anneal\n"
+        "  --teacher-agents LIST     v7 Stage-1 IL teacher roster, comma-separated (semantic\n"
+        "                            field; default \"heuristic\"). collect_teacher() draws BOTH\n"
+        "                            seats from this roster - a single entry is expert-vs-itself,\n"
+        "                            multiple entries rotate matchups per game (v7 uses\n"
+        "                            \"mcts,heuristic\"). Names: random, scripted, heuristic,\n"
+        "                            greedy, enemy-bot, external, alpha-beta, mcts, evasive - a\n"
+        "                            typo or empty roster fails closed at startup. Only harvested\n"
+        "                            while iteration < --teacher-iterations and --teacher-games>0\n"
+        "  --teacher-threads N       (D3) OpenMP thread count for collect_teacher()'s game loop,\n"
+        "                            in [0,256] - NOT a semantic field (a pure performance knob;\n"
+        "                            output is bit-identical for any thread count, proven by\n"
+        "                            tests/test_native_alphazero_teacher_threads_check.py). 0\n"
+        "                            (default) = auto (omp_get_max_threads()), 1 = serial, N =\n"
+        "                            exactly N threads. Without OpenMP compiled in, every value\n"
+        "                            behaves as 1\n"
+        "  --policy-entropy-bonus X  v7 Stage-1 IL Bombing-Collapse guard (semantic field, in\n"
+        "                            [0,0.5], default 0 = off, bit-for-bit). >0: the policy loss\n"
+        "                            becomes policy_ce - X*H(pi), an entropy floor keeping the\n"
+        "                            softmax policy from collapsing (Meisheri et al. 2019; v7 IL\n"
+        "                            uses 0.01) - see docs/experiment-memory/14 Stage 1\n"
+        "  --value-only-iterations N v7 Stage-1 IL Bombing-Collapse guard (semantic field, in\n"
+        "                            [0,10000], default 0 = off, bit-for-bit). Staged value\n"
+        "                            warmup: the first N iterations (iteration < N, same 0-based\n"
+        "                            window as --teacher-iterations) train VALUE ONLY (policy-loss\n"
+        "                            weight 0); v7 IL uses 4 - see docs/experiment-memory/14\n"
+        "                            Stage 1\n"
+        "  --legacy-accept-unverified-semantics\n"
+        "                            Required to resume/evaluate a checkpoint saved before the\n"
+        "                            semantic manifest (KL-101) - its trained reward/mechanics/\n"
+        "                            schedule values cannot be verified from the checkpoint, so\n"
+        "                            this loudly opts in to using this process's CLI values as\n"
+        "                            unverified rather than failing closed\n"
+        "  --fork-from PATH          (train --fresh) Seed this run's weights/optimizer/replay/\n"
+        "                            RNG/semantics/champion-lineage from an external checkpoint\n"
+        "                            and record full provenance to fork-manifest.json - the\n"
+        "                            explicit, verified alternative to copying a .pt file into\n"
+        "                            a new run-dir by hand\n"
+        "  --fork-reset-champion     (train --fresh --fork-from) Start the child's champion\n"
+        "                            history at its own fork point instead of inheriting the\n"
+        "                            parent's - for forking a parent whose champion state is\n"
+        "                            historically inconsistent (fails closed otherwise);\n"
+        "                            recorded as champion_reset in fork-manifest.json\n"
+        "  --dirty-diff-digest STR   Opaque working-tree diff digest (e.g. `git diff | sha256`,\n"
+        "                            computed by the calling script) recorded verbatim in\n"
+        "                            fork-manifest.json alongside the compiled-in git commit\n"
+        "  --replay-out FILE         (evaluate) Write a v4 replay of one checkpoint game for\n"
+        "                            bomber_viz --replay (vs heuristic, or MCTS with --eval-mcts)\n"
+        "  --replay-incumbent FILE   (evaluate) Record/evaluate checkpoint-vs-checkpoint; with\n"
+        "                            --incumbent-eval-games N>1, run a full N-game mirror-match\n"
+        "                            with win-cause/WAIT behavior stats instead of just 1 replay\n"
+        "  gates: runs 6 pre-registered, deterministic tactical scenarios (bomb-and-escape,\n"
+        "         corridor-clear, trap, chase, flame-timing, stall-break) against the loaded\n"
+        "         checkpoint, twice each - search mode (BatchedMcts, noise off, greedy,\n"
+        "         --eval-simulations budget - the deployed decision procedure and the only\n"
+        "         mode pass/fail is scored on) and raw mode (unmasked policy-head argmax, no\n"
+        "         search - diagnostic only). Writes write-once JSON evidence via --output,\n"
+        "         same --overwrite-evidence/--legacy-accept-unverified-semantics rules as\n"
+        "         evaluate. Read-only: acquires the system lock, not a run-dir lock.\n"
+        "  --gates-agent NAME        (gates) Substitute a scripted Agent for the network\n"
+        "                            entirely - random, scripted, heuristic, greedy, enemy-bot,\n"
+        "                            external, alpha-beta, mcts, evasive - the achievability\n"
+        "                            reference proving a gate is solvable by something, not\n"
+        "                            just an aspirational target no policy could ever pass\n"
+        "  --gates-opponent-model NAME  (gates, search mode) self (default) or aligned. self:\n"
+        "                            search always models both seats with the network, uniform\n"
+        "                            across all six scenarios. aligned: search's internal\n"
+        "                            opponent model instead matches the scenario's real\n"
+        "                            opponent (NONE->fixed WAIT, CONSTANT->the scenario's fixed\n"
+        "                            action, AGENT(type)->that type) - isolates opponent-model\n"
+        "                            mismatch from value suppression when a raw-pass/search-\n"
+        "                            fail inversion is observed. Evidence gains per-step search\n"
+        "                            telemetry (chosen/opponent_executed_action/prior_after_\n"
+        "                            safety_mask_marginal/visit_marginal/root_q/\n"
+        "                            opp_visit_marginal), an opponent_model_alignment label per\n"
+        "                            scenario (action_exact/type_aligned/self), and a\n"
+        "                            fixed_opponent_internal_violations structural check\n"
+        "                            (gates_format_version 2)\n"
+        "  --gates-search-contempt   (gates, search mode) Set contempt_seat=1 (the scenario\n"
+        "                            opponent seat) on every constraint gate_search_constraint()\n"
+        "                            builds - composes with --gates-opponent-model: a documented\n"
+        "                            no-op under aligned (already one-hot), the interesting case\n"
+        "                            under self (default off). Needs --search-contempt-nscl N>0\n"
+        "                            to actually do anything; evidence gains a top-level\n"
+        "                            search_contempt_nscl field when this flag is set\n"
+        "  --iterations N            Total iteration target (resume-safe)\n"
+        "  --games N                 Concurrent self-play games\n"
+        "  --simulations N           PUCT simulations per move\n"
+        "  --channels N --blocks N   Residual tower size\n"
+        "  --train-steps N           Optimizer updates per iteration\n"
+        "  --batch-size N            Replay minibatch size\n"
+        "  --lr-schedule-start-update N  Cosine schedule restart update\n"
+        "  --lr-schedule-updates N   Cosine decay span (0 derives from target)\n"
+        "  --promotion-games N       Seeds for two-seat champion arena\n"
+        "  --promotion-simulations N Search simulations in champion arena\n"
+        "  --promotion-margin X      Required confidence-bound margin over 0.5\n"
+        "  --promotion-seed-base N   Disjoint champion-selection seed block\n"
+        "  --baseline-mcts-simulations N  Native MCTS opponent budget\n"
+        "  --baseline-mcts-depth N   Native MCTS opponent rollout depth (max 24)\n"
+        "  --fresh                    Remove known artifacts and restart\n"
+        "  --no-progress              Disable progress bars and ETA\n";
+}
+
+void benchmark_model(int argc, char** argv, int first) {
+    const int channels = parse_number(argc, argv, first, "--channels", 128);
+    const int blocks = parse_number(argc, argv, first, "--blocks", 10);
+    const int batch = parse_number(argc, argv, first, "--batch-size", 512);
+    const int warmup = parse_number(argc, argv, first, "--warmup", 10);
+    const int repeats = parse_number(argc, argv, first, "--repeats", 50);
+    torch::manual_seed(1);
+    const auto device = torch::Device(torch::kCUDA, 0);
+    PolicyValueNet model(BOMBER_TRAINING_CHANNELS, channels, blocks, kActions,
+                         BOMBER_TRAINING_VIEW_SIZE);
+    model->to(device);
+    model->eval();
+    auto input = torch::randn({batch, BOMBER_TRAINING_CHANNELS,
+                               BOMBER_TRAINING_VIEW_SIZE, BOMBER_TRAINING_VIEW_SIZE},
+                              torch::TensorOptions().device(device));
+    torch::InferenceMode inference;
+    for (int index = 0; index < warmup; ++index) {
+        AutocastGuard autocast;
+        (void)model->forward(input);
+    }
+    torch::cuda::synchronize();
+    const auto started = std::chrono::steady_clock::now();
+    for (int index = 0; index < repeats; ++index) {
+        AutocastGuard autocast;
+        (void)model->forward(input);
+    }
+    torch::cuda::synchronize();
+    const double seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    std::cout << "native_libtorch_cuda=true\n"
+              << "precision=bf16_autocast\n"
+              << "channels=" << channels << "\nblocks=" << blocks
+              << "\nparameters=" << model->parameter_count()
+              << "\nbatch_size=" << batch << std::fixed << std::setprecision(3)
+              << "\nmilliseconds_per_batch=" << seconds * 1000.0 / repeats
+              << "\npositions_per_second=" << static_cast<double>(batch) * repeats / seconds
+              << '\n';
+}
+
+}  // namespace bomber::az

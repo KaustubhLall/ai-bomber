@@ -44,14 +44,17 @@ int rules_pickup_powerup(BomberState* state, int agent_id) {
     switch (tile) {
         case TILE_POWERUP_BOMB:
             agent->bomb_ammo++;
+            agent->powerups_collected++;
             state->tiles[agent->y][agent->x] = TILE_FLOOR;
             return 1;
         case TILE_POWERUP_RANGE:
             agent->blast_range++;
+            agent->powerups_collected++;
             state->tiles[agent->y][agent->x] = TILE_FLOOR;
             return 1;
         case TILE_POWERUP_SPEED:
             agent->speed++;
+            agent->powerups_collected++;
             state->tiles[agent->y][agent->x] = TILE_FLOOR;
             return 1;
         default:
@@ -60,18 +63,20 @@ int rules_pickup_powerup(BomberState* state, int agent_id) {
 }
 
 TerminalReason rules_check_terminal(const BomberState* state, int agent_id, int max_steps) {
-    if (state->step >= max_steps) return TERMINAL_TIMEOUT;
-
-    if (!state->agents[agent_id].alive) return TERMINAL_AGENT_DEAD;
-
     /* Check for win/loss in multi-agent */
     if (state->agent_count > 1) {
         int alive_enemies = 0;
         for (int a = 0; a < state->agent_count; a++) {
             if (a != agent_id && state->agents[a].alive) alive_enemies++;
         }
+        if (!state->agents[agent_id].alive && alive_enemies == 0) return TERMINAL_DRAW;
+        if (!state->agents[agent_id].alive) return TERMINAL_AGENT_DEAD;
         if (alive_enemies == 0) return TERMINAL_WIN;
     }
+
+    if (!state->agents[agent_id].alive) return TERMINAL_AGENT_DEAD;
+
+    if (state->step >= max_steps) return TERMINAL_TIMEOUT;
 
     return TERMINAL_NONE;
 }

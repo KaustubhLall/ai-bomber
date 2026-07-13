@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "env/types.h"
+struct BomberState;
 
 typedef struct {
     int episodes;
@@ -16,6 +17,11 @@ typedef struct {
     int crates_destroyed;
     int powerups_collected;
     int invalid_actions;
+    int enemies_killed;
+    int self_kills;
+    int opponent_self_kills;
+    int opponent_kills;
+    int bombs_placed;
 
     /* Action distribution */
     int action_counts[6]; /* ACTION_COUNT = 6 */
@@ -29,5 +35,6 @@ void metrics_update(Metrics* m, Action action, StepResult result,
                     int crates_destroyed, int powerups_collected);
 void metrics_print(const Metrics* m);
 void metrics_print_compact(const Metrics* m);
+void metrics_record_elimination_causes(Metrics* m, const struct BomberState* state);
 
 #endif /* BOMBER_METRICS_H */

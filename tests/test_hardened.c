@@ -198,6 +198,12 @@ static void test_opponent_policy(void) {
     env_set_opponent(env, &enemy);
     assert(env->opponent == &enemy);
 
+    /* Policy wiring is configuration: init and reset must not silently clear it. */
+    env_init(env, &cfg);
+    assert(env->opponent == &enemy);
+    env_reset(env, 8);
+    assert(env->opponent == &enemy);
+
     /* Run a few steps to verify it doesn't crash */
     Observation obs;
     DebugSnapshot snap;
@@ -221,6 +227,58 @@ static void test_opponent_policy(void) {
 
     printf("  test_opponent_policy: PASS\n");
     free(env);
+}
+
+static Action always_wait(Agent* agent, const Observation* obs, const DebugSnapshot* debug) {
+    (void)agent; (void)obs; (void)debug;
+    return ACTION_WAIT;
+}
+
+/* Behavior proof: an explicit opponent changes enemy movement from fallback AI. */
+static void test_opponent_changes_behavior(void) {
+    BomberConfig cfg;
+    config_battle(&cfg);
+    cfg.seed = 19;
+    cfg.crate_density = 0;
+
+    BomberEnv fallback = {0};
+    BomberEnv explicit_policy = {0};
+    Agent wait_policy = {0};
+    wait_policy.act = always_wait;
+    strcpy(wait_policy.name, "test-wait");
+
+    env_set_opponent(&explicit_policy, &wait_policy);
+    env_init(&fallback, &cfg);
+    env_init(&explicit_policy, &cfg);
+
+    int ex = explicit_policy.state.agents[1].x;
+    int ey = explicit_policy.state.agents[1].y;
+    env_step(&fallback, ACTION_WAIT);
+    env_step(&explicit_policy, ACTION_WAIT);
+
+    assert(explicit_policy.state.agents[1].x == ex);
+    assert(explicit_policy.state.agents[1].y == ey);
+    assert(fallback.state.agents[1].x != ex || fallback.state.agents[1].y != ey);
+
+    /* A real CLI-selectable policy also diverges from the fallback trajectory. */
+    BomberEnv fallback_real = {0};
+    BomberEnv scripted_env = {0};
+    Agent scripted;
+    agent_init(&scripted, AGENT_SCRIPTED);
+    env_set_opponent(&scripted_env, &scripted);
+    env_init(&fallback_real, &cfg);
+    env_init(&scripted_env, &cfg);
+    agent_reset(&scripted, 19);
+    int diverged = 0;
+    for (int step = 0; step < 8 && !diverged; step++) {
+        env_step(&fallback_real, ACTION_WAIT);
+        env_step(&scripted_env, ACTION_WAIT);
+        diverged = fallback_real.state.agents[1].x != scripted_env.state.agents[1].x ||
+                   fallback_real.state.agents[1].y != scripted_env.state.agents[1].y ||
+                   fallback_real.state.agents[1].bombs_active != scripted_env.state.agents[1].bombs_active;
+    }
+    assert(diverged);
+    printf("  test_opponent_changes_behavior: PASS\n");
 }
 
 /* Test: observation bounds with max agents */
@@ -469,6 +527,7 @@ int main(void) {
     test_danger_arrival_safety();
     test_action_safe_timing();
     test_opponent_policy();
+    test_opponent_changes_behavior();
     test_observation_bounds();
     test_reward_breakdown_sum();
     test_determinism_with_opponent();

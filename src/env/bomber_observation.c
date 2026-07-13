@@ -11,6 +11,7 @@ void obs_compute(const BomberState* state, const DangerMap* dm, int agent_id,
     if (agent_id < 0 || agent_id >= state->agent_count) return;
 
     const BomberAgentState* agent = &state->agents[agent_id];
+    obs->agent_id = agent_id;
     obs->agent_x = agent->x;
     obs->agent_y = agent->y;
     obs->agent_alive = agent->alive;

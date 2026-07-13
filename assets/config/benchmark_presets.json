@@ -1,0 +1,1 @@
+{"survival":{"mode":"survival","crate_density":45},"duel":{"mode":"battle","agents":2,"crate_density":45},"crate-heavy":{"mode":"battle","agents":2,"crate_density":75},"bomb-heavy":{"mode":"battle","agents":2,"bomb_timer":3,"blast_range":4},"sparse":{"mode":"battle","agents":2,"crate_density":15},"dense":{"mode":"battle","agents":4,"crate_density":65}}

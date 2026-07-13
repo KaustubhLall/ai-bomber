@@ -7,7 +7,7 @@
 #define MAX_HEIGHT 31
 #define MAX_AGENTS 8
 #define MAX_BOMBS 64
-#define MAX_REPLAY_STEPS 20000
+#define MAX_REPLAY_STEPS 2000
 #define LOCAL_OBS_SIZE 11
 #define MAX_BLAST_TILES 128
 
@@ -23,6 +23,9 @@ typedef struct {
     int agent_count;
     int bomb_timer;
     int blast_range;
+    int flame_duration; /* ticks a blast tile stays lethal after detonation (canonical ~2) */
+    int sudden_death_start; /* step at which the arena starts closing inward; 0 disables */
+    int shrink_interval;    /* steps between successive inward wall rings during sudden death */
     int max_steps;
     float powerup_rate;
     int crate_density;

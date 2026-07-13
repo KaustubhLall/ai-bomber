@@ -1,0 +1,4 @@
+"""Render dependency-free SVG learning curves from learning.py JSON output."""
+import argparse,json
+from pathlib import Path
+p=argparse.ArgumentParser();p.add_argument('input');p.add_argument('output');a=p.parse_args();d=json.loads(Path(a.input).read_text());rows=d['learning_curve'];key=next(k for k in ('return','policy_loss','value_loss') if k in rows[0]);v=[float(x[key]) for x in rows];lo=min(v);hi=max(v);span=hi-lo or 1;pts=' '.join(f'{30+i*540/max(len(v)-1,1):.1f},{180-(x-lo)*150/span:.1f}' for i,x in enumerate(v));svg=f'<svg xmlns="http://www.w3.org/2000/svg" width="600" height="220"><rect width="100%" height="100%" fill="#0b1220"/><text x="20" y="20" fill="white">{key}</text><polyline points="{pts}" fill="none" stroke="#5eead4" stroke-width="3"/></svg>';Path(a.output).write_text(svg)

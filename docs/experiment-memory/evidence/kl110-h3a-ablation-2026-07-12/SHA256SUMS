@@ -1,0 +1,11 @@
+# SHA-256 manifest, repo-root-relative. All 8 ablation evidence files + the machine-
+# readable verdict are committed (small JSONs); nothing local-only for this experiment.
+d31b7920fafd9ac0eafcfd836420b65429326c2a80f345fb8459658b578a123b *docs/experiment-memory/evidence/kl110-h3a-ablation-2026-07-12/control-154-aligned-gates.json
+853f6ad86dfac5cb1bf4f4726420cdf45a7a444e767d7afc8a406e05bd4fd3af *docs/experiment-memory/evidence/kl110-h3a-ablation-2026-07-12/control-154-self-gates.json
+b008803a1bfc36f26b30b0f52b9b4e0bf218f7962df2eba81ec4674db7de229f *docs/experiment-memory/evidence/kl110-h3a-ablation-2026-07-12/control03-130-aligned-gates.json
+56b9d9e69b4ed19bf9743c15d4c070d458b3360536af59b9288d2fc1e98ea3f3 *docs/experiment-memory/evidence/kl110-h3a-ablation-2026-07-12/control03-130-self-gates.json
+5227ee1c82c442fbe6a5dc8d0381a39026d701ba9311012a1addcf7a9206e7fd *docs/experiment-memory/evidence/kl110-h3a-ablation-2026-07-12/h3a-verdict.json
+79a9a476b3576bc9d47ed820e967429877b1560cae0b4dae871f60bd8573d20c *docs/experiment-memory/evidence/kl110-h3a-ablation-2026-07-12/lever2-160-aligned-gates.json
+bb7c5bf17883afa5feae35a05ecc3fc5f01b3a737669ba299c14fb0db1e2d302 *docs/experiment-memory/evidence/kl110-h3a-ablation-2026-07-12/lever2-160-self-gates.json
+4121d2448fe6e7965eddfeb0f52881a4f0f155e5451fe75e35ea12d99c65a2b7 *docs/experiment-memory/evidence/kl110-h3a-ablation-2026-07-12/treatment-154-aligned-gates.json
+e15dccef1c49dc00485ef39f7b8bcfae80448f9c5ec3849cfd34e879a4c986e2 *docs/experiment-memory/evidence/kl110-h3a-ablation-2026-07-12/treatment-154-self-gates.json

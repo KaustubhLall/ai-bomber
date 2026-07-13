@@ -6,7 +6,7 @@
 #include <string.h>
 
 float reward_compute(RewardBreakdown* rb, BomberEnv* env, Action action,
-                     int agent_id, int prev_crates, int powerups_collected,
+                     int agent_id, int prev_owned_crates, int powerups_collected,
                      int prev_enemies_alive, int was_in_danger) {
     memset(rb, 0, sizeof(RewardBreakdown));
     const BomberConfig* cfg = &env->config;
@@ -17,8 +17,7 @@ float reward_compute(RewardBreakdown* rb, BomberEnv* env, Action action,
         rb->survival = cfg->survival_reward;
     }
 
-    int cur_crates = map_count_crates(state);
-    int crates_destroyed = prev_crates - cur_crates;
+    int crates_destroyed = agent->crates_destroyed - prev_owned_crates;
     if (crates_destroyed > 0) {
         rb->crate_destroyed = cfg->crate_destroy_reward * (float)crates_destroyed;
     }
@@ -32,8 +31,15 @@ float reward_compute(RewardBreakdown* rb, BomberEnv* env, Action action,
         if (a != agent_id && state->agents[a].alive) cur_enemies_alive++;
     }
     int enemies_killed = prev_enemies_alive - cur_enemies_alive;
+    int owned_eliminations = 0;
     if (enemies_killed > 0) {
-        rb->enemy_elimination = cfg->enemy_elimination_reward * (float)enemies_killed;
+        for (int a = 0; a < state->agent_count; a++) {
+            if (a != agent_id && !state->agents[a].alive && state->death_owner[a] == agent_id)
+                owned_eliminations++;
+        }
+    }
+    if (owned_eliminations > 0) {
+        rb->enemy_elimination = cfg->enemy_elimination_reward * (float)owned_eliminations;
     }
 
     if (!agent->alive) {

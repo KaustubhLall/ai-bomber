@@ -12,13 +12,13 @@ The reward system uses configurable components that are tracked separately and s
 | `crate_destroy_reward` | +0.20 | Per crate destroyed by agent's bombs |
 | `powerup_reward` | +0.30 | Per powerup collected |
 | `enemy_damage_reward` | +0.50 | Per enemy damaged |
-| `enemy_elimination_reward` | +1.00 | Per enemy eliminated |
+| `enemy_elimination_reward` | +1.00 | Per enemy eliminated by this agent's bomb |
 | `win_reward` | +2.00 | For winning a match |
 | `death_penalty` | -1.00 | For agent dying |
-| `timeout_penalty` | -0.10 | For episode timeout |
+| `timeout_penalty` | -0.10 | For episode timeout (-1.00 in battle mode) |
 | `invalid_action_penalty` | -0.05 | For invalid actions (blocked moves, no ammo) |
 | `suicidal_bomb_penalty` | -0.30 | For placing a bomb that traps the agent |
-| `stall_penalty` | -0.01 | For prolonged inactivity |
+| `stall_penalty` | -0.01 | For prolonged inactivity (-0.03 in battle mode) |
 | `escape_danger_reward` | +0.15 | For moving from danger to safety |
 | `trap_opportunity_reward` | +0.25 | For creating a trap opportunity |
 
@@ -47,10 +47,10 @@ typedef struct {
 
 The reward system is designed to prevent common reward hacking strategies:
 
-- **Hiding forever**: `stall_penalty` activates after 10 steps of no movement; `timeout_penalty` applies at max steps.
+- **Hiding forever**: battle mode pays no survival reward, applies `stall_penalty` after 10 steps without movement, ends after 200 steps, and applies a -1 timeout penalty.
 - **Bomb spamming**: Limited by bomb ammo; `suicidal_bomb_penalty` discourages reckless placement.
 - **Suicide bombing**: `death_penalty` (-1.0) outweighs `crate_destroy_reward` (+0.2), making suicide unprofitable.
-- **Passive play**: `survival_reward` is small (+0.01) so active crate destruction and powerup collection are encouraged.
+- **False combat credit**: opponent self-eliminations can still win the match, but do not receive `enemy_elimination_reward` or count as an owned elimination.
 
 ## Configuration
 

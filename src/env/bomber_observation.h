@@ -16,6 +16,7 @@
 
 typedef struct {
     /* Agent info */
+    int agent_id;
     int agent_x;
     int agent_y;
     int agent_alive;

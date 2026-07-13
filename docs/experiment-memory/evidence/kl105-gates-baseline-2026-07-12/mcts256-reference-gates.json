@@ -1,0 +1,27 @@
+{
+  "gates_format_version": 1,
+  "generated_at_utc": "2026-07-12T09:58:13Z",
+  "invocation_argv": ["C:\\Users\\kaust\\IdeaProjects\\ai-bomber\\build-native-gpu\\src\\Release\\bomber_alphazero_native.exe","gates","--run-dir","build-native-gpu/native-alphazero-semantic-smoke","--checkpoint","latest.pt","--channels","16","--blocks","1","--max-steps","8","--replay-capacity","128","--eval-simulations","8","--gates-agent","mcts","--baseline-mcts-simulations","256","--baseline-mcts-depth","16","--no-progress","--output","results/kl105-gates-baseline-2026-07-12/mcts256-reference-gates.json"],
+  "working_directory": "C:\\Users\\kaust\\IdeaProjects\\ai-bomber",
+  "checkpoint": "latest.pt",
+  "checkpoint_path": "C:\\Users\\kaust\\IdeaProjects\\ai-bomber\\build-native-gpu\\native-alphazero-semantic-smoke\\latest.pt",
+  "checkpoint_sha256": "cbdd5786e589589b884e02c7075a3fbcf7fc6d225dfe35c0e2e27a8a81bd127d",
+  "executable_path": "C:\\Users\\kaust\\IdeaProjects\\ai-bomber\\build-native-gpu\\src\\Release\\bomber_alphazero_native.exe",
+  "executable_sha256": "f74cde02f58c37adba10d74400c45b1253b5c2e55f3cc2bb1ce868e648fa2ada",
+  "git_commit": "58f688bd4f9b",
+  "runtime_config_signature": "games=128;simulations=96;train_steps=128;batch_size=1024;learning_rate=0.0002;min_learning_rate=2e-05;lr_schedule_start=0;lr_schedule_updates=1;weight_decay=0.0001;c_puct=1.5;dirichlet_alpha=0.3;dirichlet_fraction=0.25;temperature=1;temperature_steps=30;teacher_games=32;teacher_iterations=20;bootstrap_weight=0.75;bootstrap_iterations=30;evaluation_games=32;evaluation_simulations=8;promotion_games=128;promotion_simulations=96;baseline_mcts_simulations=256;baseline_mcts_depth=16;seed=1",
+  "checkpoint_semantics_verified": true,
+  "checkpoint_semantics_source": "checkpoint_manifest",
+  "checkpoint_iteration": 1,
+  "resolved_semantics": "flame_duration=2;sudden_death_start=120;shrink_interval=4;timeout_draw_value=-0.5;mutual_death_value=-0.2;arena_crush_win_value=0.15;selfkill_win_value=0.3;league_heuristic_fraction=0;c_puct=1.5;dirichlet_alpha=0.3;dirichlet_fraction=0.25;temperature=1;temperature_steps=30;learning_rate=0.0002;min_learning_rate=2e-05;learning_rate_schedule_start_update=0;learning_rate_schedule_updates=1;seed=1",
+  "mode": "mcts",
+  "simulations": 8,
+  "scenarios": [
+    {"name": "bomb-and-escape", "result": {"passed": true, "steps_used": 4, "terminal": "pass", "note": ""}},
+    {"name": "corridor-clear", "result": {"passed": true, "steps_used": 10, "terminal": "pass", "note": ""}},
+    {"name": "trap", "result": {"passed": true, "steps_used": 6, "terminal": "pass", "note": ""}},
+    {"name": "chase", "result": {"passed": false, "steps_used": 30, "terminal": "step_budget_exhausted", "note": ""}},
+    {"name": "flame-timing", "result": {"passed": false, "steps_used": 15, "terminal": "step_budget_exhausted", "note": ""}},
+    {"name": "stall-break", "result": {"passed": true, "steps_used": 4, "terminal": "pass", "note": ""}}
+  ]
+}

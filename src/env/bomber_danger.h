@@ -7,6 +7,7 @@
 
 typedef struct {
     int current_blast[MAX_HEIGHT][MAX_WIDTH];
+    int bomb_occupied[MAX_HEIGHT][MAX_WIDTH];
     int time_to_blast[MAX_HEIGHT][MAX_WIDTH]; /* -1 = no danger, 0 = exploding now */
     int safe_now[MAX_HEIGHT][MAX_WIDTH];
     int reachable_safe[MAX_HEIGHT][MAX_WIDTH];

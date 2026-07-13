@@ -44,13 +44,17 @@ typedef struct {
 ```c
 void env_init(BomberEnv* env, const BomberConfig* config);
 ```
-Initializes the environment with the given configuration. Calls `env_reset` internally.
+Initializes the environment with the given configuration. Calls `env_reset`
+internally. `BomberEnv` must be zero-initialized before its first API call. An
+opponent installed with `env_set_opponent` on a zero-initialized environment is
+preserved by `env_init`.
 
 ### `env_reset`
 ```c
 void env_reset(BomberEnv* env, uint64_t seed);
 ```
-Resets the environment with a deterministic seed. Regenerates the map, resets agents, clears bombs.
+Resets the environment with a deterministic seed. Regenerates the map, resets
+agents, and clears bombs. Policy wiring is preserved.
 
 ### `env_step`
 ```c
@@ -71,7 +75,10 @@ Returns the step reward, done flag, and terminal reason.
 ```c
 void env_set_opponent(BomberEnv* env, Agent* opponent);
 ```
-Sets an explicit opponent agent for enemy agents in battle mode. Pass `NULL` to revert to built-in AI. The opponent agent is queried each step for each enemy agent's action.
+Sets one explicit opponent policy shared by enemy agents 1..N. Pass `NULL` to
+revert to the built-in random fallback. The opponent is queried once per living
+enemy each step. The environment does not call this self-play unless both agent 0
+and the opponent are explicitly configured with policies.
 
 ### `env_observe`
 ```c

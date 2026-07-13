@@ -26,6 +26,10 @@ typedef struct BomberEnv {
     int prev_agent_y;
     int steps_since_progress;
     struct Agent* opponent; /* Optional opponent policy; NULL = built-in AI */
+    uint32_t opponent_wiring_magic;
+    Action last_joint_actions[MAX_AGENTS];
+    int last_joint_action_count;
+    RNG last_rng_before_joint;
 } BomberEnv;
 
 void env_init(BomberEnv* env, const BomberConfig* config);
@@ -33,10 +37,16 @@ void env_reset(BomberEnv* env, uint64_t seed);
 StepResult env_step(BomberEnv* env, Action action);
 void env_observe(const BomberEnv* env, int agent_id, Observation* obs);
 void env_set_opponent(BomberEnv* env, struct Agent* opponent);
+void env_copy(BomberEnv* dst, const BomberEnv* src);
+void env_legal_actions(const BomberEnv* env, int agent_id, Action* out, int* count);
+StepResult env_step_joint(BomberEnv* env, const Action* actions, int action_count);
+uint64_t env_state_hash(const BomberEnv* env);
 
 /* Debug snapshot for visualizer */
 typedef struct {
     BomberState state;
+    BomberConfig config;
+    RNG rng;
     DangerMap danger;
     RewardBreakdown last_reward;
     Action last_action;
