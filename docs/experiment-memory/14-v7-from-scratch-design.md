@@ -1,6 +1,6 @@
 # v7 from-scratch design: ladder-bootstrapped AlphaZero with a repaired improvement operator
 
-**Status: PROPOSAL — no training authorized. Written 2026-07-13 from (a) the complete v6
+**Status: APPROVED 2026-07-13 (user: "execute") — Stage 0 in implementation; training launches remain individually gated per the standing advisor/orchestrator protocol. Originally: Written 2026-07-13 from (a) the complete v6
 diagnostic corpus (docs 10-13, KL-96..KL-110 evidence), (b) two commissioned literature
 surveys (Pommerman/curriculum practice; AlphaZero-family algorithmics), (c) the user's
 direction: fresh look, open to starting from scratch, algorithmic-opponent ladder instinct,
