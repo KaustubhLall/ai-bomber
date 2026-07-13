@@ -115,6 +115,27 @@ struct TrainConfig {
     double dirichlet_alpha{0.3};
     double dirichlet_fraction{0.25};
     double temperature{1.0};
+    /* v7 Stage 0 item 0.1+0.3 (docs/experiment-memory/14-v7-from-scratch-design.md): the sample
+       temperature used for step < temperature_steps of self-play/league collection (argmax
+       after) has two selectable shapes, both riding the FULL semantic manifest machinery
+       exactly like replay_cause_balance_cap - persisted/inherited/explicit-override-logged,
+       part of runtime_config_signature, config.json, and semantic_field_flags():
+         - temperature_anneal=false (default): EXACTLY today's step-function behavior, bit for
+           bit - temperature for step < temperature_steps, 0 (argmax) after. Every checkpoint
+           trained before this field existed, and every run that never passes
+           --temperature-anneal, is unaffected. See resolve_temperature() in trainer.cpp.
+         - temperature_anneal=true: linear anneal from `temperature` at step 0 down to
+           `temperature_final` at step temperature_steps, then argmax after (v7 passes
+           1.0 -> 0.25 over 60 steps - data-diversity collapse after step 30 was measured in
+           idle-streak structure under the old step function). validate_config requires
+           temperature_steps > 0 whenever anneal is requested (the linear fraction's
+           denominator) and temperature_final in [0, temperature].
+       CLI --temperature-final X, --temperature-anneal (flag). Dirichlet alpha (item 0.1) needs
+       no struct change - dirichlet_alpha is already a semantic field below; v7 sets it
+       explicitly (1.5) in its launcher rather than changing this compiled default, per this
+       project's explicit-over-default discipline. */
+    double temperature_final{0.0};
+    bool temperature_anneal{false};
     double bootstrap_value_weight{0.75};
     int bootstrap_value_iterations{30};
     /* Draw-averse value targets: a both-alive timeout stall is valued at

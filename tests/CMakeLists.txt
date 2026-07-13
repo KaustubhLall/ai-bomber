@@ -617,6 +617,84 @@ if(TARGET bomber_alphazero_native)
       DEPENDS test_native_alphazero_cause_balance_true_legacy_fork TIMEOUT 20)
   endif()
 
+  # v7 Stage 0 item 0.1+0.3 (docs/experiment-memory/14-v7-from-scratch-design.md): temperature_
+  # final/temperature_anneal semantic-field machinery. Same fresh -> resume(inherit) ->
+  # resume(explicit override) shape as the cause-balance chain above, in one dedicated run-dir:
+  # fresh sets --temperature-anneal --temperature-final 0.25 --temperature-steps 4; the resume
+  # passes NO temperature flags at all (must inherit silently); the third invocation passes only
+  # --temperature-final 0.1 (must log a SEMANTIC FORK line, while temperature_anneal/
+  # temperature_steps keep inheriting). --eval-interval 1 on all three doubles this fixture as
+  # the drift-canary (item 0.5) fixture below - every metrics.jsonl row gets a "gates" object.
+  add_test(NAME test_native_alphazero_temperature_anneal_fresh
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-temperature-anneal-smoke
+      --fresh --iterations 1 --games 2 --simulations 2
+      --train-steps 1 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 1 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress
+      --temperature-anneal --temperature-final 0.25 --temperature-steps 4)
+  set_tests_properties(test_native_alphazero_temperature_anneal_fresh PROPERTIES TIMEOUT 60)
+  # No temperature flags at all - both fields must inherit silently from the fresh run's manifest.
+  add_test(NAME test_native_alphazero_temperature_anneal_resume
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-temperature-anneal-smoke
+      --iterations 2 --games 2 --simulations 2
+      --train-steps 1 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 1 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress)
+  set_tests_properties(test_native_alphazero_temperature_anneal_resume PROPERTIES
+    DEPENDS test_native_alphazero_temperature_anneal_fresh TIMEOUT 60)
+  # Only --temperature-final diverges from the inherited manifest value (0.25 -> 0.1) - must log
+  # a SEMANTIC FORK line for temperature_final specifically, not temperature_anneal/steps.
+  add_test(NAME test_native_alphazero_temperature_anneal_override
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-temperature-anneal-smoke
+      --iterations 3 --games 2 --simulations 2
+      --train-steps 1 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 1 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress
+      --temperature-final 0.1)
+  set_tests_properties(test_native_alphazero_temperature_anneal_override PROPERTIES
+    DEPENDS test_native_alphazero_temperature_anneal_resume TIMEOUT 60)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME test_native_alphazero_temperature_anneal_check
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_alphazero_temperature_anneal_check.py
+        ${CMAKE_BINARY_DIR}/native-alphazero-temperature-anneal-smoke)
+    set_tests_properties(test_native_alphazero_temperature_anneal_check PROPERTIES
+      DEPENDS test_native_alphazero_temperature_anneal_override TIMEOUT 20)
+
+    # v7 Stage 0 item 0.5: the in-training drift canary (six tactical gates, search mode, run
+    # in-process every eval interval - see run_gate_canary()/append_metrics() in trainer.cpp).
+    # Reuses the temperature-anneal fixture above rather than a dedicated one - all three of its
+    # train invocations pass --eval-interval 1, so every resulting metrics.jsonl row already
+    # carries a "gates" object.
+    add_test(NAME test_native_alphazero_drift_canary_check
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_alphazero_drift_canary_check.py
+        ${CMAKE_BINARY_DIR}/native-alphazero-temperature-anneal-smoke)
+    set_tests_properties(test_native_alphazero_drift_canary_check PROPERTIES
+      DEPENDS test_native_alphazero_temperature_anneal_override TIMEOUT 20)
+  endif()
+
   # KL-101 Part D regression: a second `train` process must be refused while a first is still
   # running, even on a different run-dir - the actual failure mode that crashed training twice
   # earlier in this project's history. Self-contained (manages its own background process),

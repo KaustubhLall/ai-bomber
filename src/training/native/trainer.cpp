@@ -246,6 +246,12 @@ struct PhaseTimings {
     double evaluation_heuristic_seconds{};
     double evaluation_incumbent_seconds{};
     double evaluation_mcts_seconds{};
+    /* v7 Stage 0 item 0.5 (docs/experiment-memory/14-v7-from-scratch-design.md): cost of the
+       in-training drift canary (six tactical gates, search mode, run_gate_canary() in this
+       file) - 0 on any iteration the canary did not run (same convention as the other
+       evaluation_*_seconds fields, which are also only nonzero on an evaluation_interval
+       iteration). */
+    double drift_canary_seconds{};
     double replay_serialization_seconds{};
     double checkpoint_serialization_seconds{};
     double durable_flush_seconds{};
@@ -1012,6 +1018,27 @@ private:
     bool bootstrap_enabled_;
 };
 
+/* v7 Stage 0 item 0.1+0.3 (docs/experiment-memory/14-v7-from-scratch-design.md): resolves the
+   sampling temperature for self-play/league collection at a given step - the single place both
+   collect_self_play() and collect_league_play() must call, so the two call sites can never
+   drift apart on this logic. temperature_anneal=false (default) reproduces EXACTLY the
+   pre-existing step-function behavior bit for bit - unconditional early-return before anneal is
+   even consulted, so a legacy checkpoint (or any run that never passes --temperature-anneal)
+   sees zero behavioral change. temperature_anneal=true linearly interpolates from
+   config.temperature at step 0 toward config.temperature_final at step config.temperature_steps
+   (validate_config guarantees temperature_steps > 0 whenever anneal is requested, so this
+   division is always safe), then argmax from temperature_steps on - identical cutover point to
+   the step function, just a sloped ramp instead of a flat one beforehand. */
+float resolve_temperature(int step, const TrainConfig& config) {
+    if (step >= config.temperature_steps) return 0.0f;
+    if (!config.temperature_anneal) return static_cast<float>(config.temperature);
+    const double fraction = static_cast<double>(step) /
+        static_cast<double>(config.temperature_steps);
+    const double value = config.temperature +
+        (config.temperature_final - config.temperature) * fraction;
+    return static_cast<float>(value);
+}
+
 int sample_joint_action(const std::array<int, kJointActions>& visits, float temperature,
                         std::mt19937_64& rng) {
     if (temperature <= 1e-6f) {
@@ -1243,6 +1270,8 @@ std::string runtime_config_signature(const TrainConfig& config) {
            << ";dirichlet_fraction=" << config.dirichlet_fraction
            << ";temperature=" << config.temperature
            << ";temperature_steps=" << config.temperature_steps
+           << ";temperature_final=" << config.temperature_final
+           << ";temperature_anneal=" << (config.temperature_anneal ? "true" : "false")
            << ";teacher_games=" << config.teacher_games
            << ";teacher_iterations=" << config.teacher_iterations
            << ";bootstrap_weight=" << config.bootstrap_value_weight
@@ -1281,6 +1310,8 @@ const std::vector<std::pair<std::string, std::string>>& semantic_field_flags() {
         {"dirichlet_fraction", "--dirichlet-fraction"},
         {"temperature", "--temperature"},
         {"temperature_steps", "--temperature-steps"},
+        {"temperature_final", "--temperature-final"},
+        {"temperature_anneal", "--temperature-anneal"},
         {"learning_rate", "--learning-rate"},
         {"min_learning_rate", "--min-learning-rate"},
         {"learning_rate_schedule_start_update", "--lr-schedule-start-update"},
@@ -1306,6 +1337,8 @@ std::string semantic_manifest_string(const TrainConfig& config) {
            << ";dirichlet_fraction=" << config.dirichlet_fraction
            << ";temperature=" << config.temperature
            << ";temperature_steps=" << config.temperature_steps
+           << ";temperature_final=" << config.temperature_final
+           << ";temperature_anneal=" << (config.temperature_anneal ? "true" : "false")
            << ";learning_rate=" << config.learning_rate
            << ";min_learning_rate=" << config.min_learning_rate
            << ";learning_rate_schedule_start_update="
@@ -1384,6 +1417,25 @@ std::vector<std::string> apply_semantic_manifest(TrainConfig& config,
             config.*field = stored_value;
         }
     };
+    /* v7 Stage 0 item 0.1+0.3: same shape as the numeric reconcilers above, serialized as the
+       literal tokens "true"/"false" (matching every bool this file already writes into JSON -
+       write_result/write_config/etc.) rather than "0"/"1", so a hand-read manifest string is
+       unambiguous. temperature_anneal is currently the only bool semantic field. */
+    auto reconcile_bool = [&](const char* key, bool TrainConfig::* field) {
+        const auto it = stored.find(key);
+        if (it == stored.end()) return;
+        const bool stored_value = it->second == "true";
+        if (config.explicit_semantic_flags.count(key)) {
+            if (config.*field != stored_value) {
+                std::ostringstream fork;
+                fork << key << ": checkpoint=" << (stored_value ? "true" : "false")
+                     << " -> explicit CLI=" << (config.*field ? "true" : "false");
+                forks.push_back(fork.str());
+            }
+        } else {
+            config.*field = stored_value;
+        }
+    };
     reconcile_int("flame_duration", &TrainConfig::flame_duration);
     reconcile_int("sudden_death_start", &TrainConfig::sudden_death_start);
     reconcile_int("shrink_interval", &TrainConfig::shrink_interval);
@@ -1397,6 +1449,23 @@ std::vector<std::string> apply_semantic_manifest(TrainConfig& config,
     reconcile_double("dirichlet_fraction", &TrainConfig::dirichlet_fraction);
     reconcile_double("temperature", &TrainConfig::temperature);
     reconcile_int("temperature_steps", &TrainConfig::temperature_steps);
+    /* v7 Stage 0 item 0.1+0.3: temperature_final/temperature_anneal did not exist before this
+       manifest schema addition, so - exactly like replay_cause_balance_cap's own addition
+       above - a checkpoint saved earlier has a fully valid, modern manifest that simply lacks
+       these two keys. The generic absent-key handling in reconcile_double/reconcile_bool
+       already does the right thing behaviorally (config is left at whatever CLI parsing
+       resolved - temperature_final=0.0, temperature_anneal=false unless explicitly overridden)
+       but stays silent; one combined NOTE covers both keys since they were added together in
+       the same schema change. Inheriting anneal=false is faithful, not a substitution: it
+       reproduces the OLD step-function temperature() behavior bit for bit, the only behavior
+       such a checkpoint was ever trained under. */
+    if (!stored.count("temperature_anneal"))
+        std::cerr << "NOTE - checkpoint manifest predates temperature_final/temperature_anneal "
+                     "(v7 Stage 0 item 0.1+0.3); inheriting the compiled defaults "
+                     "(temperature_final=0.0, temperature_anneal=false), which reproduce the "
+                     "step-function temperature behavior this checkpoint was trained under.\n";
+    reconcile_double("temperature_final", &TrainConfig::temperature_final);
+    reconcile_bool("temperature_anneal", &TrainConfig::temperature_anneal);
     reconcile_double("learning_rate", &TrainConfig::learning_rate);
     reconcile_double("min_learning_rate", &TrainConfig::min_learning_rate);
     reconcile_int64("learning_rate_schedule_start_update",
@@ -1509,10 +1578,12 @@ void validate_train_cli_options(int argc, char** argv, int first) {
         "--promotion-confidence-z", "--random-score-floor", "--heuristic-score-floor",
         "--heuristic-regression-margin", "--fork-from", "--dirty-diff-digest",
         "--gates-agent", "--gates-opponent-model", "--replay-cause-balance-cap",
+        "--temperature-final",
     };
     static const std::set<std::string_view> flag_options = {
         "--fresh", "--no-progress", "--eval-mcts", "--overwrite-evidence",
         "--legacy-accept-unverified-semantics", "--fork-reset-champion",
+        "--temperature-anneal",
     };
     for (int index = first; index < argc; ++index) {
         const std::string_view option(argv[index]);
@@ -1553,6 +1624,16 @@ void validate_config(const TrainConfig& config) {
         throw std::invalid_argument("league heuristic fraction must lie in [0, 1]");
     if (config.replay_cause_balance_cap < 0.0 || config.replay_cause_balance_cap > 0.9)
         throw std::invalid_argument("replay cause-balance cap must lie in [0, 0.9]");
+    /* v7 Stage 0 item 0.1+0.3: temperature_final must be a valid endpoint for the linear anneal
+       to land on - below 0 is not a probability-like temperature, above `temperature` would be
+       annealing UP, not down. temperature_anneal's linear fraction (resolve_temperature() in
+       this file) divides by temperature_steps, so annealing requires a positive span; a
+       zero-length anneal (temperature_steps<=0) has no defined meaning and is rejected instead
+       of silently degenerating. */
+    if (config.temperature_final < 0.0 || config.temperature_final > config.temperature)
+        throw std::invalid_argument("temperature-final must lie in [0, temperature]");
+    if (config.temperature_anneal && config.temperature_steps <= 0)
+        throw std::invalid_argument("temperature-anneal requires temperature-steps > 0");
     if (config.gates_opponent_model != "self" && config.gates_opponent_model != "aligned")
         throw std::invalid_argument(
             "--gates-opponent-model must be 'self' or 'aligned', got '" +
@@ -1652,6 +1733,23 @@ struct GateResult {
        kRaw and kAgent, neither of which ever calls BatchedMcts::search. */
     std::vector<GateStepRecord> steps{};
     int fixed_opponent_internal_violations{};
+};
+
+/* v7 Stage 0 item 0.5 (docs/experiment-memory/14-v7-from-scratch-design.md): "the drift
+   canary" - aggregates one run_gate_canary() pass (all six scenarios, search mode only)
+   into exactly what metrics.jsonl records: how many of the six passed, the trap scenario's
+   step-0 BOMB prior (the H3a starvation signal - see doc 14 section 1 item 3, "truthful
+   opponent model instantly restores the trap kill wherever BOMB prior >= ~0.10, starved
+   below ~0.08"), and a per-scenario pass/fail breakdown. Declared here (anonymous namespace,
+   alongside its sibling GateResult) rather than nested in Trainer::Impl because
+   append_metrics() - which needs this type complete - is declared far EARLIER in the Impl
+   class body than run_gate_canary() itself; every type used across Impl member function
+   signatures in this file follows the same "declare in the anonymous namespace before Impl
+   begins" convention for exactly this reason. */
+struct GateCanaryResult {
+    int passed_search{};
+    double trap_bomb_prior_step0{};
+    std::vector<std::pair<std::string, bool>> per_scenario;
 };
 
 /* Human-readable label for env_step_joint's own terminal classification. rules_check_terminal
@@ -2370,6 +2468,9 @@ struct Trainer::Impl {
                << "  \"dirichlet_fraction\": " << config.dirichlet_fraction << ",\n"
                << "  \"temperature\": " << config.temperature << ",\n"
                << "  \"temperature_steps\": " << config.temperature_steps << ",\n"
+               << "  \"temperature_final\": " << config.temperature_final << ",\n"
+               << "  \"temperature_anneal\": "
+               << (config.temperature_anneal ? "true" : "false") << ",\n"
                << "  \"teacher_games\": " << config.teacher_games << ",\n"
                << "  \"teacher_iterations\": " << config.teacher_iterations << ",\n"
                << "  \"bootstrap_value_weight\": " << config.bootstrap_value_weight << ",\n"
@@ -2516,8 +2617,7 @@ struct Trainer::Impl {
                 }
                 game.trajectory.push_back(std::move(zero));
                 game.trajectory.push_back(std::move(one));
-                const float temperature = game.env.state.step < config.temperature_steps ?
-                    static_cast<float>(config.temperature) : 0.0f;
+                const float temperature = resolve_temperature(game.env.state.step, config);
                 const int joint = sample_joint_action(visits, temperature, rng);
                 const Action actions[2] = {static_cast<Action>(joint / kActions),
                                            static_cast<Action>(joint % kActions)};
@@ -2669,8 +2769,7 @@ struct Trainer::Impl {
                 }
                 game.trajectory.push_back(std::move(sample));
 
-                const float temperature = game.env.state.step < config.temperature_steps ?
-                    static_cast<float>(config.temperature) : 0.0f;
+                const float temperature = resolve_temperature(game.env.state.step, config);
                 const int joint = sample_joint_action(visits, temperature, rng);
                 const int learner_action = learner_seat == 0 ? joint / kActions : joint % kActions;
 
@@ -3595,6 +3694,7 @@ struct Trainer::Impl {
     void append_metrics(const OptimizationMetrics& optimization,
                         const Evaluation* random, const Evaluation* heuristic,
                         const Evaluation* incumbent, const Evaluation* mcts,
+                        const GateCanaryResult* canary,
                         double elapsed, size_t new_samples, bool promoted,
                         std::string_view promotion_reason) const {
         std::ofstream output(metrics_path, std::ios::app);
@@ -3660,6 +3760,7 @@ struct Trainer::Impl {
                << ",\"evaluation_incumbent_seconds\":"
                << last_phase_timings.evaluation_incumbent_seconds
                << ",\"evaluation_mcts_seconds\":" << last_phase_timings.evaluation_mcts_seconds
+               << ",\"drift_canary_seconds\":" << last_phase_timings.drift_canary_seconds
                << ",\"replay_serialization_seconds\":"
                << last_phase_timings.replay_serialization_seconds
                << ",\"checkpoint_serialization_seconds\":"
@@ -3696,6 +3797,21 @@ struct Trainer::Impl {
         write_evaluation("heuristic", heuristic);
         write_evaluation("incumbent", incumbent);
         write_evaluation("mcts", mcts);
+        /* v7 Stage 0 item 0.5: present only on an evaluation_interval iteration (same
+           optionality convention as random/heuristic/incumbent/mcts above - canary is nullptr
+           on every other iteration, see the call site in run()). per_scenario preserves
+           build_gate_scenarios()'s own order rather than alphabetizing. */
+        if (canary) {
+            output << ",\"gates\":{\"passed_search\":" << canary->passed_search
+                   << ",\"trap_bomb_prior_step0\":" << canary->trap_bomb_prior_step0
+                   << ",\"per_scenario\":{";
+            for (size_t index = 0; index < canary->per_scenario.size(); ++index) {
+                const auto& [name, passed] = canary->per_scenario[index];
+                output << (index ? "," : "") << "\"" << json_escape(name) << "\":"
+                       << (passed ? "true" : "false");
+            }
+            output << "}}";
+        }
         output << ",\"promoted\":" << (promoted ? "true" : "false")
                << ",\"promotion_reason\":\"" << json_escape(promotion_reason) << "\""
                << ",\"best_score\":";
@@ -3795,7 +3911,7 @@ struct Trainer::Impl {
                 const double elapsed = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - started).count();
                 save_checkpoint(latest_path);
-                append_metrics(optimization, nullptr, nullptr, nullptr, nullptr,
+                append_metrics(optimization, nullptr, nullptr, nullptr, nullptr, nullptr,
                                elapsed, new_samples, false, "interrupted");
                 break;
             }
@@ -3808,6 +3924,8 @@ struct Trainer::Impl {
             Evaluation* heuristic_ptr = nullptr;
             Evaluation* incumbent_ptr = nullptr;
             Evaluation* mcts_ptr = nullptr;
+            GateCanaryResult canary_result;
+            GateCanaryResult* canary_ptr = nullptr;
             bool promoted = false;
             std::string promotion_reason = "not_evaluated";
             if (!stop_requested.load() && iteration % config.evaluation_interval == 0) {
@@ -3825,6 +3943,23 @@ struct Trainer::Impl {
                 }
                 random_ptr = &random_result;
                 heuristic_ptr = &heuristic_result;
+                {
+                    /* v7 Stage 0 item 0.5: kDriftCanarySeed is a fixed constant, NOT derived
+                       from `iteration` or `config.seed` - a fresh std::mt19937_64 is
+                       constructed from it right here, every eval interval, so the canary NEVER
+                       touches the shared collection `rng` member above (used by
+                       collect_self_play/collect_league_play/sample_joint_action) or the
+                       evaluate_baseline calls' own `rng` reference just above (inert today
+                       since both run with root_noise=false, but this stays correct even if
+                       that ever changes - see run_gate_canary()'s own doc comment). This is
+                       what makes "enabling the canary cannot perturb collection determinism"
+                       true by construction. */
+                    ScopedTimer timer(last_phase_timings.drift_canary_seconds);
+                    constexpr uint64_t kDriftCanarySeed = 7'700'001ULL;
+                    std::mt19937_64 canary_rng(kDriftCanarySeed);
+                    canary_result = run_gate_canary(canary_rng);
+                    canary_ptr = &canary_result;
+                }
                 const bool random_gate = random_result.score >= config.random_score_floor;
                 const bool has_incumbent = std::filesystem::exists(best_path);
                 if (!random_gate) {
@@ -3880,7 +4015,8 @@ struct Trainer::Impl {
             if (promoted)
                 atomic_copy_file(latest_path, best_path);
             append_metrics(optimization, random_ptr, heuristic_ptr, incumbent_ptr,
-                           mcts_ptr, elapsed, new_samples, promoted, promotion_reason);
+                           mcts_ptr, canary_ptr, elapsed, new_samples, promoted,
+                           promotion_reason);
             std::cout << "iteration=" << iteration << " samples=" << new_samples
                       << " replay=" << replay.size() << " loss=" << optimization.loss;
             if (heuristic_ptr)
@@ -4145,12 +4281,20 @@ struct Trainer::Impl {
        comes first. Takes env BY VALUE deliberately: the caller passes the constructed scenario
        directly and this parameter's own copy is what gets mutated, so calling this two or
        three times (search/raw/agent) against the same constructed env never shares or mutates
-       state across those runs. */
+       state across those runs.
+       scenario_rng/gates_opponent_model are explicit parameters, not a read of the `rng`
+       member / config.gates_opponent_model directly, so that run_gate_canary() (the v7 Stage 0
+       item 0.5 in-training probe below) can supply its OWN dedicated RNG and a hardcoded "self"
+       model - see that function's own doc comment for why. The `gates()` subcommand's call
+       sites pass the member `rng` and config.gates_opponent_model explicitly, so its behavior
+       (including determinism across repeated `gates` invocations) is completely unchanged. */
     GateResult run_gate_scenario(BomberEnv env, int k_steps, GateOpponentMode opponent_mode,
                                  Action opponent_constant_action, AgentType opponent_agent_type,
                                  uint64_t seed,
                                  const std::function<bool(const BomberEnv&)>& pass_predicate,
                                  GateLearnerMode learner_mode,
+                                 std::mt19937_64& scenario_rng,
+                                 const std::string& gates_opponent_model,
                                  AgentType learner_agent_type = AGENT_RANDOM) {
         GateResult result;
         /* KL-110 Phase B: accumulates across every kSearch step of this whole scenario (one
@@ -4181,7 +4325,8 @@ struct Trainer::Impl {
         }
         std::unique_ptr<BatchedMcts> search;
         if (learner_mode == GateLearnerMode::kSearch)
-            search = std::make_unique<BatchedMcts>(model, device, config, rng, iteration, false);
+            search = std::make_unique<BatchedMcts>(model, device, config, scenario_rng,
+                                                    iteration, false);
 
         const int initial_x = env.state.agents[0].x;
         const int initial_y = env.state.agents[0].y;
@@ -4216,7 +4361,7 @@ struct Trainer::Impl {
                    confounded because "self" always searches against a full-strength mirror even
                    when the real opponent that step is a WAIT-only or CONSTANT-action stub. */
                 const SearchConstraint constraint = gate_search_constraint(
-                    config.gates_opponent_model, opponent_mode, opponent_constant_action,
+                    gates_opponent_model, opponent_mode, opponent_constant_action,
                     opponent_agent_type, seed);
                 std::vector<SearchConstraint> constraints{constraint};
                 const auto results = search->search(active, constraints, false,
@@ -4331,6 +4476,88 @@ struct Trainer::Impl {
         return result;
     }
 
+    /* v7 Stage 0 item 0.5 (docs/experiment-memory/14-v7-from-scratch-design.md): runs the same
+       six tactical gates build_gate_scenarios() defines, IN-PROCESS against the LIVE model,
+       search mode only, hardcoded "self" opponent model - never config.gates_opponent_model,
+       which is a `gates` SUBCOMMAND-only CLI flag unrelated to this training-loop probe (a
+       training run that happens to also carry --gates-opponent-model aligned on its command
+       line must not silently change what the canary measures - it must stay a stable,
+       comparable-over-time signal). GateLearnerMode::kSearch always builds its BatchedMcts
+       with root_noise=false (see run_gate_scenario above), so this reuses config.
+       evaluation_simulations as its budget - the same authoritative decision procedure and
+       budget the `gates` subcommand itself scores pass/fail on. Called from run() at every
+       evaluation_interval - "drift must never be invisible again" is this item's own name for
+       the finding that motivated it (doc 14 section 1 item 3 / section 3 item 0.5).
+
+       Diagnostic only: deliberately NOT in semantic_field_flags()/runtime_config_signature()/
+       the manifest - this changes what a live probe MEASURES about the current weights, never
+       what those weights were themselves trained under (same category as --gates-agent/
+       --gates-opponent-model - see trainer.h's own doc comment on gates_opponent_model).
+
+       scenario_rng MUST be a dedicated RNG the caller constructs fresh from a constant seed,
+       never the shared collection `rng` member - see the call site in run() for the full
+       argument. (root_noise is false for every call this makes, so scenario_rng is never
+       actually drawn from today - add_root_noise(), the sole rng_ consumer inside
+       BatchedMcts::search, is skipped whenever root_noise is false. The dedicated instance is
+       still required: it is what makes "the canary cannot perturb collection determinism" true
+       by construction, not true by an accident of today's noise-off default that a future
+       search() change could silently invalidate.) */
+    GateCanaryResult run_gate_canary(std::mt19937_64& scenario_rng) {
+        GateCanaryResult canary;
+        BomberConfig base = game_config(config);
+        base.crate_density = 0;
+        /* Mirrors gates()'s own --max-steps floor below (see its comment there): the tiny CI
+           fixture trains at --max-steps 8, which would otherwise cap every scenario's real
+           step budget to 8 regardless of its own k_steps, making passed_search meaningless at
+           fixture scale. */
+        base.max_steps = std::max(base.max_steps, 64);
+        /* Disjoint from gates()'s own kGateSeedBase (5'000'001) and every evaluation/
+           promotion/mcts-eval seed block below - purely env_reset() reproducibility
+           bookkeeping, not security; the canary's actual search RANDOMNESS is scenario_rng,
+           entirely separate from this env-construction seed. */
+        constexpr uint64_t kCanaryGateSeedBase = 9'900'001ULL;
+        const auto specs = build_gate_scenarios();
+        bool trap_recorded = false;
+        for (size_t index = 0; index < specs.size(); ++index) {
+            const auto& spec = specs[index];
+            const uint64_t seed = kCanaryGateSeedBase + static_cast<uint64_t>(index);
+            BomberEnv constructed{};
+            env_init(&constructed, &base);
+            env_reset(&constructed, seed);
+            spec.build(constructed);
+            /* Same staleness fix as gates() below - the scenario builder just overwrote
+               env.state directly; recompute danger before the search reads it (channel 8,
+               current_blast, is read directly rather than recomputed - see gates()'s own
+               comment on this exact call pair for the full explanation). */
+            danger_compute(&constructed.danger, &constructed.state);
+            danger_compute_escape(&constructed.danger, &constructed.state, 0);
+            validate_gate_scenario_construction(constructed, spec.name);
+
+            const GateResult result = run_gate_scenario(
+                constructed, spec.k_steps, spec.opponent_mode, spec.opponent_constant_action,
+                spec.opponent_agent_type, seed, spec.pass_predicate, GateLearnerMode::kSearch,
+                scenario_rng, "self");
+            canary.passed_search += result.passed ? 1 : 0;
+            canary.per_scenario.emplace_back(spec.name, result.passed);
+            if (spec.name == "trap") {
+                /* run_gate_scenario always pushes a step_record BEFORE checking pass_predicate/
+                   terminal (see its loop), so steps[0] exists for any k_steps>=1 regardless of
+                   whether the scenario passed on the very first tick - trap's k_steps is 20. */
+                if (result.steps.empty())
+                    throw std::runtime_error(
+                        "drift canary: trap scenario produced no step-0 search telemetry");
+                canary.trap_bomb_prior_step0 = result.steps.front()
+                    .prior_after_safety_mask_marginal[static_cast<int>(ACTION_PLACE_BOMB)];
+                trap_recorded = true;
+            }
+        }
+        if (!trap_recorded)
+            throw std::runtime_error(
+                "drift canary: build_gate_scenarios() no longer contains a 'trap' scenario "
+                "(trap_bomb_prior_step0 is undefined without one)");
+        return canary;
+    }
+
     /* KL-105 Phase 2b: the `gates` subcommand entry point. Read-only, like evaluate_only() -
        loads the checkpoint exactly the same way (manifest semantics inheritance happens in the
        constructor above; --legacy-accept-unverified-semantics supported the same way), reuses
@@ -4420,16 +4647,19 @@ struct Trainer::Impl {
                                                  spec.opponent_constant_action,
                                                  spec.opponent_agent_type, seed,
                                                  spec.pass_predicate, GateLearnerMode::kAgent,
+                                                 rng, config.gates_opponent_model,
                                                  gates_agent_type);
             } else {
                 record.search = run_gate_scenario(constructed, spec.k_steps, spec.opponent_mode,
                                                   spec.opponent_constant_action,
                                                   spec.opponent_agent_type, seed,
-                                                  spec.pass_predicate, GateLearnerMode::kSearch);
+                                                  spec.pass_predicate, GateLearnerMode::kSearch,
+                                                  rng, config.gates_opponent_model);
                 record.raw = run_gate_scenario(constructed, spec.k_steps, spec.opponent_mode,
                                                spec.opponent_constant_action,
                                                spec.opponent_agent_type, seed,
-                                               spec.pass_predicate, GateLearnerMode::kRaw);
+                                               spec.pass_predicate, GateLearnerMode::kRaw,
+                                               rng, config.gates_opponent_model);
             }
             records.push_back(std::move(record));
         }
@@ -4646,6 +4876,8 @@ TrainConfig parse_train_config(int argc, char** argv, int first) {
     config.dirichlet_alpha = parse_number(argc, argv, first, "--dirichlet-alpha", config.dirichlet_alpha);
     config.dirichlet_fraction = parse_number(argc, argv, first, "--dirichlet-fraction", config.dirichlet_fraction);
     config.temperature = parse_number(argc, argv, first, "--temperature", config.temperature);
+    config.temperature_final = parse_number(argc, argv, first, "--temperature-final",
+                                            config.temperature_final);
     config.bootstrap_value_weight = parse_number(argc, argv, first, "--bootstrap-weight", config.bootstrap_value_weight);
     config.bootstrap_value_iterations = parse_number(argc, argv, first, "--bootstrap-iterations", config.bootstrap_value_iterations);
     /* Convenience: --draw-value X sets BOTH per-seat draw values (timeout stall and mutual
@@ -4678,6 +4910,7 @@ TrainConfig parse_train_config(int argc, char** argv, int first) {
     config.dirty_diff_digest = parse_string(argc, argv, first, "--dirty-diff-digest",
                                             config.dirty_diff_digest);
     config.fresh = has_flag(argc, argv, first, "--fresh");
+    config.temperature_anneal = has_flag(argc, argv, first, "--temperature-anneal");
     config.fork_reset_champion = has_flag(argc, argv, first, "--fork-reset-champion");
     config.progress = !has_flag(argc, argv, first, "--no-progress");
     config.evaluate_mcts = has_flag(argc, argv, first, "--eval-mcts");
@@ -4745,6 +4978,14 @@ void print_native_help() {
         "                            uniform sampling, bit-for-bit); tagging always runs, only\n"
         "                            the sampler bias is gated by this cap - see docs/\n"
         "                            experiment-memory/13-kl105-experiment-design.md section 3\n"
+        "  --temperature-anneal      Linearly anneal the sample temperature from --temperature\n"
+        "                            (step 0) down to --temperature-final (step\n"
+        "                            --temperature-steps), then argmax after - default off,\n"
+        "                            which keeps the original step-function temperature (flat\n"
+        "                            --temperature for step<temperature-steps, argmax after),\n"
+        "                            bit-for-bit\n"
+        "  --temperature-final X     Anneal endpoint temperature (in [0,--temperature], default\n"
+        "                            0); only meaningful with --temperature-anneal\n"
         "  --legacy-accept-unverified-semantics\n"
         "                            Required to resume/evaluate a checkpoint saved before the\n"
         "                            semantic manifest (KL-101) - its trained reward/mechanics/\n"
