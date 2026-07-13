@@ -833,3 +833,24 @@ Executor note for the record: Unit B caught a miscount in the KL-110 issue text 
 NONE/CONSTANT scenarios; the table has five — 4 NONE + 1 CONSTANT), implemented the rule
 rather than the count, and flagged it. Internal-node enforcement was mutation-tested (inverted
 comparison fires on all five action_exact scenarios; reverted; CI pins zero violations).
+
+## v7 Stage 0 complete (KL-111) — commits `ea41f2b`, `986c061`, + Unit C
+
+All five Stage-0 items from doc 14 are landed, each Sonnet-executed and planner-reviewed:
+temperature-anneal semantics (0.1/0.3; anneal=false reproduces the old step function exactly;
+alpha stays default-0.3 with 1.5 explicit in the v7 launcher per explicit-over-default),
+KataGo forced playouts + policy-target pruning (0.2; root-only, collection-only, off-path
+identical by construction; always-on floor-violation telemetry measured 0; the executor caught
+a contradiction in the planner's own pruning brief and resolved it to the KataGo-consistent
+form), the search-contempt prototype (0.4; gates-only, default off, live path proven 6/6
+scenarios differing at nscl=1, training paths unreachable), and the drift canary (0.5; all six
+gates + trap step-0 BOMB prior in metrics.jsonl every eval interval on a dedicated
+constant-seeded rng — the +8.6pp drift class can never again be invisible). The gated
+v7-stage1-bootstrap.ps1 carries every v7.0 semantic explicitly and throws without
+-IAcknowledgeLaunchGate. Suite grew 61 -> 79 native tests across the three units; every
+existing byte-identical/exact-value test stayed green throughout, which is the standing proof
+that no v6-era behavior changed.
+
+**Next gate: Stage-1 IL design** (MCTS-256 teacher collection mode, IL loss path, staged value
+warmup, entropy floor — the "Bombing Collapse" guards) as its own design pass; its teacher-
+collection GPU run gets a documented launch-gate sign-off before anything executes.
