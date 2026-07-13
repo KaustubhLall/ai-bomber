@@ -632,4 +632,16 @@ if(TARGET bomber_alphazero_native)
         ${CMAKE_BINARY_DIR}/native-alphazero-lock-b)
     set_tests_properties(test_native_alphazero_lock_check PROPERTIES TIMEOUT 60)
   endif()
+
+  # KL-110 hygiene: select_replay_indices() (src/training/native/replay_sampling.h) is the
+  # pure, Torch-free extraction of ReplayBuffer::batch()'s index-selection logic - deliberately
+  # kept out of ReplayBuffer itself so this test can exercise the actual sampling algorithm (RNG
+  # draws + pool-A boosting math) without linking LibTorch/CUDA. Plain assert()-based
+  # executable, same convention as the dependency-free C tests above (this whole file keeps
+  # NDEBUG off directory-wide). Wired here rather than the dependency-free "build" tree purely
+  # for build-graph convenience alongside the rest of the native-alphazero test surface - the
+  # header itself has no native-alphazero/LibTorch dependency, only this include path.
+  add_executable(test_replay_sampling test_replay_sampling.cpp)
+  target_include_directories(test_replay_sampling PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  add_test(NAME test_replay_sampling COMMAND test_replay_sampling)
 endif()

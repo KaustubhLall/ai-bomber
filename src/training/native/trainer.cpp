@@ -1,4 +1,5 @@
 #include "training/native/trainer.h"
+#include "training/native/replay_sampling.h"
 
 extern "C" {
 #include "training/encoding.h"
@@ -364,35 +365,44 @@ public:
         samples.clear();
     }
 
-    /* cause_balance_cap<=0 (default) takes the FIRST branch below with pool_a left empty, which
-       is byte-for-byte the pre-KL-105 code: same std::uniform_int_distribution constructed the
-       same way, same choose(rng) call per row, nothing else touches rng - this is the "cap=0 is
-       exactly current behavior" contract the whole feature is gated on. Returns the realized
-       pool-A fraction of this batch (0.0 whenever the uniform path was taken) so callers can
-       report what the sampler actually did, not just what it was asked to do. */
-    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, double> batch(
+    /* cause_balance_cap<=0 (default), or pool_a empty, takes select_replay_indices()'s uniform
+       fallback (src/training/native/replay_sampling.h) - byte-for-byte the pre-KL-105 code:
+       same std::uniform_int_distribution constructed the same way, same choose(rng) call per
+       row, nothing else touches rng - this is the "cap=0 is exactly current behavior" contract
+       the whole feature is gated on. select_replay_indices() is the actual index-selection
+       algorithm (kept Torch-free so it can be unit-tested without linking LibTorch); this
+       method only builds pool_a, calls it, and fills tensor rows from the indices it returns.
+       Returns BOTH pool-A fractions of this batch: forced (what the sampler was compelled to
+       draw from pool A - the pre-KL-110 "realized" number, 0.0 whenever the uniform path was
+       taken) and total (every SELECTED row, forced or drawn from the uniform remainder, that
+       actually landed in pool A - uniform draws over the whole buffer can land in pool A too,
+       so forced alone understates true pool-A representation in the batch). */
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, double, double> batch(
             int requested, std::mt19937_64& rng, double cause_balance_cap = 0.0) const {
         const int count = std::min<int>(requested, static_cast<int>(samples_.size()));
         std::vector<float> states(static_cast<size_t>(count) * kObservationSize);
         std::vector<float> policies(static_cast<size_t>(count) * kActions);
         std::vector<float> values(count);
-        double realized_pool_a_fraction = 0.0;
         /* One linear pass over uint8 tags per batch (~200k samples) is sub-millisecond; the
            optimization phase this feeds is ~7.6s/iteration total (KL-105 design doc section 3),
-           so this scan is noise relative to a forward/backward pass - measured, not assumed. */
+           so this scan is noise relative to a forward/backward pass - measured, not assumed.
+           in_pool_a is built in the same pass as pool_a (KL-110 hygiene) so counting how many
+           SELECTED rows land in pool A costs nothing beyond this existing scan. */
         std::vector<size_t> pool_a;
+        std::vector<bool> in_pool_a;
         if (cause_balance_cap > 0.0) {
             pool_a.reserve(samples_.size());
+            in_pool_a.assign(samples_.size(), false);
             for (size_t index = 0; index < samples_.size(); ++index)
-                if (samples_[index].bomb_win_side) pool_a.push_back(index);
+                if (samples_[index].bomb_win_side) {
+                    pool_a.push_back(index);
+                    in_pool_a[index] = true;
+                }
         }
-        int pool_a_draws = 0;
-        if (!pool_a.empty()) {
-            const double n_a = static_cast<double>(pool_a.size());
-            const double n = static_cast<double>(samples_.size());
-            const double fraction = std::min(cause_balance_cap, kBoostMax * n_a / n);
-            pool_a_draws = std::clamp(static_cast<int>(std::lround(fraction * count)), 0, count);
-        }
+        int forced_pool_a_draws = 0;
+        const std::vector<size_t> indices = select_replay_indices(
+            samples_.size(), pool_a, cause_balance_cap, kBoostMax, count, rng,
+            &forced_pool_a_draws);
         auto fill_row = [&](int row, const Sample& sample) {
             for (int cell = 0; cell < kObservationSize; ++cell)
                 states[static_cast<size_t>(row) * kObservationSize + cell] =
@@ -401,27 +411,24 @@ public:
                       policies.begin() + static_cast<size_t>(row) * kActions);
             values[row] = sample.value;
         };
-        if (pool_a_draws > 0) {
-            std::uniform_int_distribution<size_t> choose_pool_a(0, pool_a.size() - 1);
-            std::uniform_int_distribution<size_t> choose_any(0, samples_.size() - 1);
-            for (int row = 0; row < count; ++row) {
-                const size_t index = row < pool_a_draws ? pool_a[choose_pool_a(rng)]
-                                                         : choose_any(rng);
-                fill_row(row, samples_[index]);
-            }
-            realized_pool_a_fraction = static_cast<double>(pool_a_draws) /
-                                       static_cast<double>(count);
-        } else {
-            std::uniform_int_distribution<size_t> choose(0, samples_.size() - 1);
-            for (int row = 0; row < count; ++row) fill_row(row, samples_[choose(rng)]);
+        int total_pool_a_selected = 0;
+        for (int row = 0; row < count; ++row) {
+            const size_t index = indices[static_cast<size_t>(row)];
+            fill_row(row, samples_[index]);
+            if (!in_pool_a.empty() && in_pool_a[index]) ++total_pool_a_selected;
         }
+        const double forced_pool_a_fraction = count > 0 ?
+            static_cast<double>(forced_pool_a_draws) / static_cast<double>(count) : 0.0;
+        const double total_pool_a_fraction = count > 0 ?
+            static_cast<double>(total_pool_a_selected) / static_cast<double>(count) : 0.0;
         auto state_tensor = torch::from_blob(states.data(),
             {count, BOMBER_TRAINING_CHANNELS, BOMBER_TRAINING_VIEW_SIZE,
              BOMBER_TRAINING_VIEW_SIZE}, torch::kFloat32).clone();
         auto policy_tensor = torch::from_blob(policies.data(), {count, kActions},
                                                torch::kFloat32).clone();
         auto value_tensor = torch::from_blob(values.data(), {count}, torch::kFloat32).clone();
-        return {state_tensor, policy_tensor, value_tensor, realized_pool_a_fraction};
+        return {state_tensor, policy_tensor, value_tensor, forced_pool_a_fraction,
+                total_pool_a_fraction};
     }
 
     /* Per-cause sample counts (index = OutcomeCause value) plus the pool-A (bomb_win_side==1)
@@ -2200,12 +2207,22 @@ struct Trainer::Impl {
         double value_loss{};
         double entropy{};
         double learning_rate{};
-        /* KL-105 Phase 3: mean, over this iteration's train_steps batches, of the actual
-           pool-A (bomb_win_side==1) fraction ReplayBuffer::batch() drew - what the sampler
-           DID, not just what --replay-cause-balance-cap asked for. 0 whenever the cap is 0 or
-           pool A was empty for the whole iteration (the batch() cap<=0/empty-pool path always
-           reports 0.0). */
+        /* KL-105 Phase 3: mean, over this iteration's train_steps batches, of the FORCED
+           pool-A (bomb_win_side==1) fraction ReplayBuffer::batch() drew - what the sampler was
+           compelled to draw from pool A, not just what --replay-cause-balance-cap asked for. 0
+           whenever the cap is 0 or pool A was empty for the whole iteration (the batch()
+           cap<=0/empty-pool path always reports 0.0). KL-110 hygiene: this field's name is a
+           pre-existing misnomer ("realized" reads as "how much of the batch was pool A", but
+           it only ever counted the FORCED draws) kept as-is for cross-run metric continuity -
+           uniform draws over the whole buffer can also land in pool A, so this alone
+           understates the batch's true pool-A representation; see total_pool_a_batch_fraction
+           below for the honest total. */
         double realized_pool_a_batch_fraction{};
+        /* KL-110 hygiene: mean, over this iteration's train_steps batches, of the fraction of
+           EACH batch's SELECTED rows (forced or drawn from the uniform remainder) that were
+           actually in pool A - the number realized_pool_a_batch_fraction's name always implied
+           but did not report. Always >= realized_pool_a_batch_fraction. */
+        double total_pool_a_batch_fraction{};
     };
 
     struct SelfPlayMetrics {
@@ -2771,9 +2788,11 @@ struct Trainer::Impl {
             const double rate = learning_rate();
             for (auto& group : optimizer.param_groups())
                 static_cast<torch::optim::AdamWOptions&>(group.options()).lr(rate);
-            auto [states_cpu, target_policy_cpu, target_value_cpu, pool_a_fraction] =
+            auto [states_cpu, target_policy_cpu, target_value_cpu, forced_pool_a_fraction,
+                  total_pool_a_fraction] =
                 replay.batch(config.batch_size, rng, config.replay_cause_balance_cap);
-            metrics.realized_pool_a_batch_fraction += pool_a_fraction;
+            metrics.realized_pool_a_batch_fraction += forced_pool_a_fraction;
+            metrics.total_pool_a_batch_fraction += total_pool_a_fraction;
             auto states = states_cpu.to(device);
             auto target_policy = target_policy_cpu.to(device);
             auto target_value = target_value_cpu.to(device);
@@ -2811,6 +2830,7 @@ struct Trainer::Impl {
             metrics.value_loss /= steps_completed;
             metrics.entropy /= steps_completed;
             metrics.realized_pool_a_batch_fraction /= steps_completed;
+            metrics.total_pool_a_batch_fraction /= steps_completed;
         }
         return metrics;
     }
@@ -3615,8 +3635,16 @@ struct Trainer::Impl {
                << ",\"value_loss\":" << optimization.value_loss
                << ",\"entropy\":" << optimization.entropy
                << ",\"learning_rate\":" << optimization.learning_rate
+               /* realized_pool_a_batch_fraction is retained as a deprecated alias of
+                  forced_pool_a_fraction (arms' metrics/analysis already key off this name) -
+                  forced_pool_a_fraction is the identical value under its honest name, and
+                  total_pool_a_fraction is the new KL-110 number (see OptimizationMetrics::
+                  total_pool_a_batch_fraction above). */
                << ",\"realized_pool_a_batch_fraction\":"
-               << optimization.realized_pool_a_batch_fraction << '}'
+               << optimization.realized_pool_a_batch_fraction
+               << ",\"forced_pool_a_fraction\":" << optimization.realized_pool_a_batch_fraction
+               << ",\"total_pool_a_fraction\":" << optimization.total_pool_a_batch_fraction
+               << '}'
                /* KL-101 Part E: this iteration's phase timings (all 7 phases KL-101/KL-102
                   ask for) - the "same-machine/same-config baseline" KL-102's throughput work
                   needs as its own first step, captured here instead of duplicated there. */
