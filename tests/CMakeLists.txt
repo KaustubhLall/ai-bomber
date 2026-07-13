@@ -548,6 +548,38 @@ if(TARGET bomber_alphazero_native)
       DEPENDS test_native_alphazero_cause_balance_fork_legacy TIMEOUT 20)
   endif()
 
+  # KL-110 hygiene regression: --fresh must truncate semantic-fork-log.jsonl exactly like it
+  # truncates metrics.jsonl/config-history.jsonl. Re-run the IDENTICAL --fresh --fork-from
+  # command above into the SAME run-dir a second time, after the first run/check pair above has
+  # already validated the pre-rerun state - on the old (buggy) code this second run would leave
+  # TWO accumulated semantic-fork-log.jsonl entries (one per run); on fixed code, exactly one
+  # (only the current run's own).
+  add_test(NAME test_native_alphazero_cause_balance_fork_legacy_rerun
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-cause-balance-fork-legacy
+      --fresh --fork-from ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke/latest.pt
+      --iterations 2 --games 2 --simulations 2
+      --train-steps 1 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 100 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress
+      --replay-cause-balance-cap 0.25)
+  set_tests_properties(test_native_alphazero_cause_balance_fork_legacy_rerun PROPERTIES
+    DEPENDS test_native_alphazero_cause_balance_fork_legacy_check TIMEOUT 60)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME test_native_alphazero_cause_balance_fork_legacy_rerun_check
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_alphazero_cause_balance_fork_legacy_rerun_check.py
+        ${CMAKE_BINARY_DIR}/native-alphazero-cause-balance-fork-legacy)
+    set_tests_properties(test_native_alphazero_cause_balance_fork_legacy_rerun_check PROPERTIES
+      DEPENDS test_native_alphazero_cause_balance_fork_legacy_rerun TIMEOUT 20)
+  endif()
+
   # Fork from a checkpoint SNAPSHOTTED before this feature existed (tests/fixtures/native-
   # alphazero-pre-cause-tag-checkpoint.pt - byte-for-byte the semantic-smoke fixture as it
   # existed at git commit 58f688bd4f9b, one commit before this feature's own work started, so

@@ -2095,11 +2095,18 @@ struct Trainer::Impl {
         model->to(device);
         bool forked = false;
         if (config.fresh) {
+            /* KL-110 hygiene: semantic-fork-log.jsonl must be truncated here exactly like
+               metrics.jsonl/config-history.jsonl - otherwise repeated --fresh (--fork-from)
+               runs into the same run-dir accumulate every past run's fork entries into one
+               file, and a reader has no way to tell which entries belong to the CURRENT run
+               (discovered during the cause-balance fork work; the existing check script had to
+               work around it by reading only the last entry - see
+               test_native_alphazero_cause_balance_fork_legacy_check.py). */
             for (const auto& entry : std::filesystem::directory_iterator(config.run_dir)) {
                 const auto name = entry.path().filename().string();
                 if (entry.is_regular_file() &&
                     (entry.path().extension() == ".pt" || name == "metrics.jsonl" ||
-                     name == "config-history.jsonl" ||
+                     name == "config-history.jsonl" || name == "semantic-fork-log.jsonl" ||
                      name.ends_with(".tmp")))
                     std::filesystem::remove(entry.path());
             }
