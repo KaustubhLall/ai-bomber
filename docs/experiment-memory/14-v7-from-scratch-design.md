@@ -148,3 +148,30 @@ under advisor-gated launches.
 - **Stage-1 exit gate** (unchanged from the stage table): gates ≥3/6 deployed (search mode,
   canary) AND student bomb-usage within 2x of the teacher histogram's bomb_fraction. Decided
   by the advisor on the run's metrics, not by clock.
+
+## Stage-2 ladder design (settled 2026-07-13, advisor-owned; implementation pipelined during
+## the Stage-1 run, launch strictly gated on the Stage-1 exit criteria)
+
+- **Rungs** as a semantic string `--ladder-rungs "random,evasive,greedy,heuristic,alphabeta,
+  mcts64,mcts256"` (strict parser; empty = ladder OFF, all v6 paths untouched). mcts64/mcts256
+  map to (64,16)/(256,16) sims/depth on the existing baseline MCTS agent — collect_league_play
+  gains the mcts_agent_configure guard it never needed under heuristic-only leagues.
+- **Promotion machinery**: at each eval interval, a noise-off in-process probe (reusing
+  evaluate_baseline, 32 games seat-balanced, diagnostic seed block) measures the win rate vs
+  the CURRENT rung; promote at ≥ `--ladder-promote-winrate` 0.55, demote below
+  `--ladder-demote-winrate` 0.45 (thresholds semantic). Ladder STATE (current rung, per-rung
+  rolling win rates) is training state, not semantics: persisted via new checkpoint archive
+  keys with legacy-safe absent-key defaults (rung 0), reported in metrics every iteration.
+- **Collection during Stage 2**: 100% ladder games (mirror enters in Stage 3 via a new
+  `--ladder-mirror-fraction`, default 0), distributed over rungs 0..current with TiZero
+  (1-winrate)^2 weighting — passed rungs are never retired by construction. Each rung batch
+  reuses collect_league_play per opponent type (GPU-batched learner search, root noise on,
+  learner-seat samples, cause tags — all existing machinery).
+- **Combat-window starts (E2, after the ladder unit)**: `--combat-window-fraction` of ladder
+  games start from a parameterized near-contact generator (two agents 2-4 tiles apart in an
+  open region of a normal crate map, seeded deterministic) — Backplay-lite per KL-110's
+  generation-side branch; the visited-state archive variant is deferred to v7.1.
+- **Stage-1 exit-gate measurement plan** (for the record): student bomb usage = per-iteration
+  delta of action_histogram_cumulative (the mirror-trickle noise-on moves) vs the teacher
+  bomb_fraction (0.1346 measured at iteration 1 ⇒ student floor ≈ 6.7%), alongside the canary
+  gates trajectory (≥3/6 to pass).
