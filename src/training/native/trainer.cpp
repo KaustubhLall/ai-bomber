@@ -685,6 +685,36 @@ struct SearchConstraint {
        construction site (gate_search_constraint()), not here - self-play/league/evaluate never
        set it, so re-validating on every leaf expansion would be pure overhead on the hot path. */
     int fixed_opponent_action{-1};
+    /* v7 Stage 0 item 0.4 (SEARCH-CONTEMPT PROTOTYPE): appended LAST, with a default member
+       initializer, so every existing aggregate initializer (the 3-field {modeled_seat, type,
+       seed} shape at self-play/league/evaluate's construction sites, and the 3-field
+       SearchConstraint{-1, AGENT_RANDOM, seed} literal in gate_search_constraint()'s "self"
+       early return) still compiles unchanged and still means "contempt off" (aggregate init
+       leaves a trailing unlisted field at its default) - identical reasoning to
+       fixed_opponent_action's own appended-last precedent directly above. -1 (default) = off,
+       BatchedMcts::search()'s descent loop always calls select_joint() exactly as before this
+       field existed. [0, kActions) is not a legal seat value here (only 0 or 1 - two seats
+       total); this project's convention elsewhere validates such constraint fields at their
+       construction site rather than on the hot path, but contempt's ONLY construction site
+       (gate_search_constraint()) only ever writes 1 or -1, so there is nothing to validate
+       against a bad CLI-supplied value the way fixed_opponent_action's aligned mode does.
+       >=0 (0 or 1) = this is the seat whose PUCT adaptation gets frozen past
+       config.search_contempt_nscl visits per node - see search_contempt_nscl's own doc comment
+       in trainer.h for the full mechanism. The OTHER seat (1 - contempt_seat) is never
+       modified - it is always this project's ordinary per-seat PUCT, unconditionally. Only
+       ever set by gate_search_constraint() (--gates-search-contempt sets it to 1, the scenario
+       opponent seat - the gates learner is always seat 0); self-play/league/evaluate/promotion
+       never set it, so contempt_seat stays -1 (off) on every training call site by
+       construction, not by a runtime check - this prototype has no training-path effect.
+       >=0 additionally REQUIRES the search() call's root_noise argument to be false - throws
+       otherwise (see search()'s own validation, right after the constraint-count check) -
+       contempt is a gates-only diagnostic and must never coexist with Dirichlet-noised
+       collection. When fixed_opponent_seat also equals this seat (gates "aligned" opponent
+       model), contempt is a documented NO-OP: expand_and_backup already one-hots that seat's
+       policy to a single fixed action at every node it expands, so that seat's marginal visit
+       distribution - snapshotted by contempt or not - is already 100% concentrated on that same
+       action; freezing a distribution that is already a point mass changes nothing. */
+    int contempt_seat{-1};
 };
 
 struct SearchResult {
@@ -744,6 +774,21 @@ public:
         if (environments.empty()) return {};
         if (constraints.size() != environments.size())
             throw std::runtime_error("MCTS constraint count mismatch");
+        /* v7 Stage 0 item 0.4 (SEARCH-CONTEMPT PROTOTYPE): contempt_seat>=0 must never coexist
+           with Dirichlet-noised collection - see SearchConstraint::contempt_seat's own doc
+           comment. Checked once here, up front, rather than per-simulation on the hot path;
+           training call sites (self-play/league) never set contempt_seat at all, so this can
+           only ever fire on a future misuse of the constraint construction site, not on any
+           reachable CLI path today (gates - the only contempt_seat>=0 source - always calls
+           search() with root_noise==false). */
+        if (root_noise) {
+            for (const auto& constraint : constraints)
+                if (constraint.contempt_seat >= 0)
+                    throw std::runtime_error(
+                        "search-contempt (contempt_seat>=0) is incompatible with "
+                        "root_noise=true - contempt is a gates-only prototype and must never "
+                        "coexist with Dirichlet-noised collection");
+        }
         const int simulation_count = simulations > 0 ? simulations : config_.simulations;
         std::vector<std::unique_ptr<Node>> roots;
         roots.reserve(environments.size());
@@ -769,6 +814,13 @@ public:
         std::vector<std::array<int, kActions>> forced_counts0(roots.size());
         std::vector<std::array<int, kActions>> forced_counts1(roots.size());
         const bool forcing_enabled = root_noise && config_.forced_playouts_k > 0.0;
+        /* v7 Stage 0 item 0.4: frozen-snapshot side map, scoped to THIS search() call only -
+           see contempt_snapshots_'s own doc comment for why a shared map (not a per-root vector
+           like forced_counts0/1 above) is an accepted, documented tradeoff here. Cleared
+           unconditionally (cheap - a fresh gates search's tree does not pre-populate it) rather
+           than only when contempt is active, so there is exactly one invariant to reason about
+           regardless of any given root's constraint. */
+        contempt_snapshots_.clear();
 
         for (int simulation = 0; simulation < std::max(simulation_count, 1); ++simulation) {
             std::vector<LeafJob> leaves;
@@ -781,6 +833,16 @@ public:
                  root_index < static_cast<int64_t>(roots.size()); ++root_index) {
                 Node* node = roots[root_index].get();
                 std::vector<std::pair<Node*, int>> path;
+                /* v7 Stage 0 item 0.4: per-root, computed once outside the descent while-loop
+                   below (contempt_seat is fixed for a root's whole search() call - see its own
+                   doc comment) - contempt_active reduces the descent loop's selection ternary to
+                   its pre-existing two-branch form byte-for-byte whenever false, which covers
+                   every call site that never sets contempt_seat (self-play/league/evaluate/
+                   promotion, and every gates call that omits --gates-search-contempt) and every
+                   call with search_contempt_nscl<=0 (the compiled default). */
+                const int contempt_seat = constraints[root_index].contempt_seat;
+                const bool contempt_active =
+                    contempt_seat >= 0 && config_.search_contempt_nscl > 0;
                 while (node->expanded && !node->terminal) {
                     /* Root-only hook: path.empty() is true exactly on this while loop's FIRST
                        iteration, i.e. exactly when `node` is still the root this simulation
@@ -789,12 +851,19 @@ public:
                        selection - and every selection at all when forcing_enabled is false,
                        which covers every eval/gates/promotion call and every
                        forced_playouts_k<=0 collection call - takes the IDENTICAL call it took
-                       before this feature existed). */
+                       before this feature existed). Contempt (v7 Stage 0 item 0.4), unlike
+                       forcing, applies at ANY node - root or interior - whenever contempt_active,
+                       so it is checked at every ply, not just at_root; forcing_enabled and
+                       contempt_active can never both be true in the same search() call (forcing
+                       requires root_noise==true, contempt requires root_noise==false - see the
+                       throw near the top of search()), so the two never actually compete for
+                       the same selection. */
                     const bool at_root = path.empty();
                     const int action = (at_root && forcing_enabled)
                         ? select_joint_root_forced(*node, forced_counts0[root_index],
                                                    forced_counts1[root_index])
-                        : select_joint(*node);
+                        : (contempt_active ? select_joint_contempt(*node, contempt_seat)
+                                           : select_joint(*node));
                     path.emplace_back(node, action);
                     if (!node->children[action]) {
                         BomberEnv child_env;
@@ -864,45 +933,110 @@ public:
 
 private:
     int select_joint(const Node& node) const {
-        int total = std::accumulate(node.visits.begin(), node.visits.end(), 0);
+        return select_seat_puct(node, 0) * kActions + select_seat_puct(node, 1);
+    }
+
+    /* v7 Stage 0 item 0.4 (SEARCH-CONTEMPT PROTOTYPE): extracted out of select_joint's
+       previously fully-inlined body (a single loop over `action` computed BOTH seats' visits/
+       values/priors together) so the contempt descent wrapper (select_joint_contempt() below)
+       can compute ONE seat's ordinary PUCT argmax in isolation without duplicating this
+       arithmetic - contempt must never touch the other seat's selection, so that seat has to be
+       callable on its own. Bit-for-bit equivalence proof for select_joint's two calls above:
+       node.visits is never mutated between them, so `total`/`scale` are identical both times;
+       each call's inner accumulation loop (visits/values/priors) is a self-contained float
+       accumulator chain walking `opponent` in the same 0..kActions-1 order the original
+       interleaved version used for that seat - splitting the two seats into separate calls
+       cannot reassociate either chain's own floating-point additions, it only removes the OTHER
+       seat's unrelated statements from between them. Same strict `>` tie-break, same
+       "only actions with positive prior are ever considered" guard. So
+       select_seat_puct(node, 0) == the pre-refactor selected_zero and
+       select_seat_puct(node, 1) == the pre-refactor selected_one, exactly - select_joint's own
+       compiled OUTPUT is unchanged; the byte-identical gates reruns
+       (test_native_alphazero_gates_check.py) are the guard. */
+    int select_seat_puct(const Node& node, int seat) const {
+        const int total = std::accumulate(node.visits.begin(), node.visits.end(), 0);
         const float scale = std::sqrt(static_cast<float>(total) + 1.0f);
-        int selected_zero = 0;
-        int selected_one = 0;
-        float best_zero = -std::numeric_limits<float>::infinity();
-        float best_one = -std::numeric_limits<float>::infinity();
+        int selected = 0;
+        float best = -std::numeric_limits<float>::infinity();
         for (int action = 0; action < kActions; ++action) {
-            int visits_zero = 0;
-            float values_zero = 0.0f;
-            float priors_zero = 0.0f;
-            int visits_one = 0;
-            float values_one = 0.0f;
-            float priors_one = 0.0f;
+            int visits = 0;
+            float values = 0.0f;
+            float priors = 0.0f;
             for (int opponent = 0; opponent < kActions; ++opponent) {
-                const int index_zero = action * kActions + opponent;
-                visits_zero += node.visits[index_zero];
-                values_zero += node.value_sum0[index_zero];
-                priors_zero += node.priors[index_zero];
-                const int index_one = opponent * kActions + action;
-                visits_one += node.visits[index_one];
-                values_one += node.value_sum1[index_one];
-                priors_one += node.priors[index_one];
-            }
-            if (priors_zero > 0.0f) {
-                const float q = visits_zero ? values_zero / visits_zero : 0.0f;
-                const float score = q + static_cast<float>(config_.c_puct) * priors_zero *
-                                          scale / (1.0f + visits_zero);
-                if (score > best_zero) { best_zero = score; selected_zero = action; }
-            }
-            if (priors_one > 0.0f) {
+                const int index = seat == 0 ? action * kActions + opponent
+                                            : opponent * kActions + action;
+                visits += node.visits[index];
                 /* Seat 1 maximizes its OWN accumulated value (no negation): value_sum1
-                   already stores seat 1's perspective. */
-                const float q = visits_one ? values_one / visits_one : 0.0f;
-                const float score = q + static_cast<float>(config_.c_puct) * priors_one *
-                                          scale / (1.0f + visits_one);
-                if (score > best_one) { best_one = score; selected_one = action; }
+                   already stores seat 1's perspective - same as select_joint carried inline
+                   before this extraction. */
+                values += seat == 0 ? node.value_sum0[index] : node.value_sum1[index];
+                priors += node.priors[index];
+            }
+            if (priors > 0.0f) {
+                const float q = visits ? values / visits : 0.0f;
+                const float score = q + static_cast<float>(config_.c_puct) * priors *
+                                          scale / (1.0f + visits);
+                if (score > best) { best = score; selected = action; }
             }
         }
-        return selected_zero * kActions + selected_one;
+        return selected;
+    }
+
+    /* v7 Stage 0 item 0.4 (docs/experiment-memory/14-v7-from-scratch-design.md; SEARCH-CONTEMPT
+       PROTOTYPE, Joshi 2025 arXiv:2504.07757, adapted to decoupled simultaneous PUCT; our H3a):
+       descent-loop replacement for select_joint(), called exactly when search()'s descent loop
+       sees a root whose constraint.contempt_seat is s>=0 AND config_.search_contempt_nscl>0 -
+       never otherwise (see search()'s own guard, which reduces to the pre-existing
+       `select_joint(*node)` call byte-for-byte whenever contempt is not active for this root).
+       Unlike select_joint_root_forced (root-only), this fires at ANY node along the descent -
+       root and interior alike - matching the mechanism's "per node, not per root" contract.
+
+       contempt_seat s's marginal action is frozen once this NODE's total visits (summed over
+       ALL prior simulations that passed through it - the same `total` select_seat_puct itself
+       computes) first exceed search_contempt_nscl: the seat's CURRENT marginal visit
+       distribution is snapshotted into contempt_snapshots_ (a side map owned by this
+       BatchedMcts instance, keyed by Node*, cleared at the top of every search() call - see
+       search()'s own clear and its doc comment on why a shared side map is safe here rather
+       than Node ABI growth) the first time this happens, and every simulation THEREAFTER
+       (including this one) samples seat s's action proportionally from that frozen snapshot via
+       rng_, instead of recomputing PUCT. Below/at the threshold, seat s still goes through
+       select_seat_puct - identical to what select_joint itself would compute for that seat. The
+       OTHER seat (1-s) is NEVER modified by any of this: it always goes through
+       select_seat_puct, unconditionally - exactly what select_joint would compute for it.
+
+       The snapshot is guaranteed non-degenerate whenever it is taken: total > search_contempt_
+       nscl >= 1 (search()'s guard already requires the config field positive) implies total>=2,
+       and marginal_visits(node, s) sums to exactly `total` (marginalizing regroups the same
+       visit count, it does not lose or add any), so std::discrete_distribution always has at
+       least one positive weight - no all-zero-weights edge case is possible here. */
+    int select_joint_contempt(const Node& node, int contempt_seat) {
+        const int other_seat = 1 - contempt_seat;
+        const int other_action = select_seat_puct(node, other_seat);
+        const int total = std::accumulate(node.visits.begin(), node.visits.end(), 0);
+        int contempt_action;
+        if (total > config_.search_contempt_nscl) {
+            auto [entry, inserted] = contempt_snapshots_.try_emplace(&node);
+            if (inserted) entry->second = marginal_visits(node, contempt_seat);
+            std::discrete_distribution<int> choose(entry->second.begin(), entry->second.end());
+            contempt_action = choose(rng_);
+        } else {
+            contempt_action = select_seat_puct(node, contempt_seat);
+        }
+        return contempt_seat == 0 ? contempt_action * kActions + other_action
+                                  : other_action * kActions + contempt_action;
+    }
+
+    /* Shared by select_joint_contempt (the frozen-snapshot source) - same accumulation pattern
+       as select_seat_puct/marginal_distribution (the KL-107 tracing helper defined later in
+       this file, out of reach from here since it is declared textually AFTER this class), typed
+       as int (visits, not the general numeric template tracing needs). */
+    static std::array<int, kActions> marginal_visits(const Node& node, int seat) {
+        std::array<int, kActions> marginal{};
+        for (int action = 0; action < kActions; ++action)
+            for (int opponent = 0; opponent < kActions; ++opponent)
+                marginal[action] += node.visits[seat == 0 ? action * kActions + opponent
+                                                           : opponent * kActions + action];
+        return marginal;
     }
 
     /* v7 Stage 0 item 0.2 (KataGo forced playouts, Wu arXiv:1902.10565 S4.1; independently
@@ -1193,6 +1327,32 @@ private:
     std::mt19937_64& rng_;
     int iteration_;
     bool bootstrap_enabled_;
+    /* v7 Stage 0 item 0.4 (SEARCH-CONTEMPT PROTOTYPE): frozen-snapshot side map for
+       select_joint_contempt() above - deliberately NOT a Node member (contempt is
+       prototype/gates-scale; a map of a few hundred nodes per search() call is fine, and this
+       keeps every other call site's Node ABI/memory footprint completely untouched). Cleared at
+       the top of every search() call (see search()'s own clear), so a Node* is never looked up
+       against a stale snapshot from a PRIOR search() call - only relevant across gates()'s
+       repeated per-step search() calls, each of which builds a brand-new tree from scratch
+       anyway (search() itself constructs fresh `roots` every call), so a stale hit would only
+       ever be a wasted lookup at worst, never a correctness bug - the clear is nonetheless the
+       documented, provable invariant rather than relying on that coincidence.
+       THREAD SAFETY: the root_index loop in search() below is `#pragma omp parallel for` when
+       compiled with AI_BOMBER_NATIVE_OPENMP, and this map is a single instance shared by the
+       whole BatchedMcts (not sharded per root_index the way forced_counts0/1 deliberately are -
+       see search()'s own comment on those). Mutating a std::map concurrently from two roots
+       that BOTH have contempt active would be a data race. This is safe today only because
+       contempt's one and only construction site (gate_search_constraint(), gated by
+       --gates-search-contempt) is only ever reached through run_gate_scenario, which always
+       calls search() with a SINGLE-element root vector (`std::vector<BomberEnv*> active{&env}`)
+       - the parallel-for loop's trip count is 1, so no concurrent access to this map can ever
+       occur in practice. A hypothetical future caller that batches multiple contempt-bearing
+       roots into one search() call would need to shard this map per root_index first (or drop
+       OpenMP for that call) before it would be safe - flagged here rather than solved
+       speculatively, since no such caller exists (self-play/league/evaluate/promotion never set
+       contempt_seat at all, and mirror-training adoption, if it ever happens, is explicitly out
+       of scope for this prototype - see doc 14 item 0.4's "NOT this unit's problem"). */
+    std::map<const Node*, std::array<int, kActions>> contempt_snapshots_;
 };
 
 /* v7 Stage 0 item 0.1+0.3 (docs/experiment-memory/14-v7-from-scratch-design.md): resolves the
@@ -1446,6 +1606,7 @@ std::string runtime_config_signature(const TrainConfig& config) {
            << ";dirichlet_alpha=" << config.dirichlet_alpha
            << ";dirichlet_fraction=" << config.dirichlet_fraction
            << ";forced_playouts_k=" << config.forced_playouts_k
+           << ";search_contempt_nscl=" << config.search_contempt_nscl
            << ";temperature=" << config.temperature
            << ";temperature_steps=" << config.temperature_steps
            << ";temperature_final=" << config.temperature_final
@@ -1487,6 +1648,7 @@ const std::vector<std::pair<std::string, std::string>>& semantic_field_flags() {
         {"dirichlet_alpha", "--dirichlet-alpha"},
         {"dirichlet_fraction", "--dirichlet-fraction"},
         {"forced_playouts_k", "--forced-playouts-k"},
+        {"search_contempt_nscl", "--search-contempt-nscl"},
         {"temperature", "--temperature"},
         {"temperature_steps", "--temperature-steps"},
         {"temperature_final", "--temperature-final"},
@@ -1515,6 +1677,7 @@ std::string semantic_manifest_string(const TrainConfig& config) {
            << ";dirichlet_alpha=" << config.dirichlet_alpha
            << ";dirichlet_fraction=" << config.dirichlet_fraction
            << ";forced_playouts_k=" << config.forced_playouts_k
+           << ";search_contempt_nscl=" << config.search_contempt_nscl
            << ";temperature=" << config.temperature
            << ";temperature_steps=" << config.temperature_steps
            << ";temperature_final=" << config.temperature_final
@@ -1640,6 +1803,15 @@ std::vector<std::string> apply_semantic_manifest(TrainConfig& config,
                      "0.2); inheriting the compiled default 0.0 (off), which reproduces the "
                      "unforced root-selection behavior this checkpoint was trained under.\n";
     reconcile_double("forced_playouts_k", &TrainConfig::forced_playouts_k);
+    /* v7 Stage 0 item 0.4 (SEARCH-CONTEMPT PROTOTYPE): search_contempt_nscl did not exist before
+       this manifest schema addition - same situation as forced_playouts_k's own addition
+       directly above. Inheriting 0 (off) is faithful, not a substitution: no training call site
+       ever sets contempt_seat (see SearchConstraint::contempt_seat's own doc comment), so this
+       checkpoint was never trained under anything else regardless of this field's value. */
+    if (!stored.count("search_contempt_nscl"))
+        std::cerr << "NOTE - checkpoint manifest predates search_contempt_nscl (v7 Stage 0 item "
+                     "0.4); inheriting the compiled default 0 (off).\n";
+    reconcile_int("search_contempt_nscl", &TrainConfig::search_contempt_nscl);
     reconcile_double("temperature", &TrainConfig::temperature);
     reconcile_int("temperature_steps", &TrainConfig::temperature_steps);
     /* v7 Stage 0 item 0.1+0.3: temperature_final/temperature_anneal did not exist before this
@@ -1771,12 +1943,12 @@ void validate_train_cli_options(int argc, char** argv, int first) {
         "--promotion-confidence-z", "--random-score-floor", "--heuristic-score-floor",
         "--heuristic-regression-margin", "--fork-from", "--dirty-diff-digest",
         "--gates-agent", "--gates-opponent-model", "--replay-cause-balance-cap",
-        "--temperature-final", "--forced-playouts-k",
+        "--temperature-final", "--forced-playouts-k", "--search-contempt-nscl",
     };
     static const std::set<std::string_view> flag_options = {
         "--fresh", "--no-progress", "--eval-mcts", "--overwrite-evidence",
         "--legacy-accept-unverified-semantics", "--fork-reset-champion",
-        "--temperature-anneal",
+        "--temperature-anneal", "--gates-search-contempt",
     };
     for (int index = first; index < argc; ++index) {
         const std::string_view option(argv[index]);
@@ -1823,6 +1995,14 @@ void validate_config(const TrainConfig& config) {
        catching an obvious typo/unit confusion (e.g. a value meant for a different knob). */
     if (config.forced_playouts_k < 0.0 || config.forced_playouts_k > 10.0)
         throw std::invalid_argument("forced-playouts-k must lie in [0, 10]");
+    /* v7 Stage 0 item 0.4 (SEARCH-CONTEMPT PROTOTYPE): search_contempt_nscl is a per-node visit
+       threshold (BatchedMcts::select_joint_contempt), so negative is meaningless; 10000 is a
+       generous upper bound - well above any simulation budget this project runs (baseline MCTS
+       tops out at baseline_mcts_simulations, itself unbounded but never run anywhere near
+       10000 in practice) - wide enough for experimentation while still catching an obvious
+       typo/unit confusion. */
+    if (config.search_contempt_nscl < 0 || config.search_contempt_nscl > 10000)
+        throw std::invalid_argument("search-contempt-nscl must lie in [0, 10000]");
     /* v7 Stage 0 item 0.1+0.3: temperature_final must be a valid endpoint for the linear anneal
        to land on - below 0 is not a probability-like temperature, above `temperature` would be
        annealing UP, not down. temperature_anneal's linear fraction (resolve_temperature() in
@@ -2010,12 +2190,29 @@ AgentType parse_gate_agent_name(const std::string& name) {
                   recomputation, not a reproduction of the rollout agent's own state/RNG
                   trajectory. This asymmetry is exactly why doc 13's alignment-kind label
                   distinguishes "action_exact" (kNone/kConstant) from "type_aligned" (kAgent) -
-                  see gate_opponent_alignment_kind() below. */
+                  see gate_opponent_alignment_kind() below.
+
+   v7 Stage 0 item 0.4 (SEARCH-CONTEMPT PROTOTYPE): gates_search_contempt (--gates-search-
+   contempt, default false) sets contempt_seat=1 (the scenario opponent; the gates learner is
+   ALWAYS seat 0) on the returned constraint, INDEPENDENTLY of the self/aligned branch above -
+   composing with gates_opponent_model rather than being exclusive to either: under "self" this
+   is the interesting case (freezes the self-model's seat-1 PUCT adaptation past
+   config.search_contempt_nscl visits per node); under "aligned" it is a documented no-op
+   (fixed_opponent_seat==1 already one-hots seat 1's policy to a single fixed action at every
+   node - see SearchConstraint::fixed_opponent_action's doc comment - so seat 1's marginal visit
+   distribution is already a point mass regardless of whether contempt snapshots it). false
+   (default) leaves contempt_seat at -1 (off) on both branches - unchanged from before this
+   parameter existed. */
 SearchConstraint gate_search_constraint(const std::string& gates_opponent_model,
                                         GateOpponentMode opponent_mode,
                                         Action opponent_constant_action,
-                                        AgentType opponent_agent_type, uint64_t seed) {
-    if (gates_opponent_model != "aligned") return SearchConstraint{-1, AGENT_RANDOM, seed};
+                                        AgentType opponent_agent_type, uint64_t seed,
+                                        bool gates_search_contempt) {
+    if (gates_opponent_model != "aligned") {
+        SearchConstraint constraint{-1, AGENT_RANDOM, seed};
+        constraint.contempt_seat = gates_search_contempt ? 1 : -1;
+        return constraint;
+    }
     SearchConstraint constraint;
     constraint.fixed_opponent_seat = 1;
     constraint.opponent_seed = seed;
@@ -2035,6 +2232,7 @@ SearchConstraint gate_search_constraint(const std::string& gates_opponent_model,
     }
     if (constraint.fixed_opponent_action < -1 || constraint.fixed_opponent_action >= kActions)
         throw std::runtime_error("gates: aligned fixed_opponent_action out of range");
+    constraint.contempt_seat = gates_search_contempt ? 1 : -1;
     return constraint;
 }
 
@@ -2691,6 +2889,7 @@ struct Trainer::Impl {
                << "  \"dirichlet_alpha\": " << config.dirichlet_alpha << ",\n"
                << "  \"dirichlet_fraction\": " << config.dirichlet_fraction << ",\n"
                << "  \"forced_playouts_k\": " << config.forced_playouts_k << ",\n"
+               << "  \"search_contempt_nscl\": " << config.search_contempt_nscl << ",\n"
                << "  \"temperature\": " << config.temperature << ",\n"
                << "  \"temperature_steps\": " << config.temperature_steps << ",\n"
                << "  \"temperature_final\": " << config.temperature_final << ",\n"
@@ -4593,7 +4792,12 @@ struct Trainer::Impl {
        item 0.5 in-training probe below) can supply its OWN dedicated RNG and a hardcoded "self"
        model - see that function's own doc comment for why. The `gates()` subcommand's call
        sites pass the member `rng` and config.gates_opponent_model explicitly, so its behavior
-       (including determinism across repeated `gates` invocations) is completely unchanged. */
+       (including determinism across repeated `gates` invocations) is completely unchanged.
+       gates_search_contempt (v7 Stage 0 item 0.4) is threaded through the SAME way and for the
+       SAME reason: run_gate_canary() hardcodes false (contempt off) rather than reading
+       config.gates_search_contempt, so the in-training drift canary's own behavior never
+       depends on a --gates-* flag that has nothing to do with training - only the `gates()`
+       subcommand ever passes config.gates_search_contempt through. */
     GateResult run_gate_scenario(BomberEnv env, int k_steps, GateOpponentMode opponent_mode,
                                  Action opponent_constant_action, AgentType opponent_agent_type,
                                  uint64_t seed,
@@ -4601,7 +4805,8 @@ struct Trainer::Impl {
                                  GateLearnerMode learner_mode,
                                  std::mt19937_64& scenario_rng,
                                  const std::string& gates_opponent_model,
-                                 AgentType learner_agent_type = AGENT_RANDOM) {
+                                 AgentType learner_agent_type = AGENT_RANDOM,
+                                 bool gates_search_contempt = false) {
         GateResult result;
         /* KL-110 Phase B: accumulates across every kSearch step of this whole scenario (one
            BatchedMcts::search call per step) via count_fixed_opponent_violations() - see the
@@ -4668,7 +4873,7 @@ struct Trainer::Impl {
                    when the real opponent that step is a WAIT-only or CONSTANT-action stub. */
                 const SearchConstraint constraint = gate_search_constraint(
                     gates_opponent_model, opponent_mode, opponent_constant_action,
-                    opponent_agent_type, seed);
+                    opponent_agent_type, seed, gates_search_contempt);
                 std::vector<SearchConstraint> constraints{constraint};
                 const auto results = search->search(active, constraints, false,
                                                      config.evaluation_simulations,
@@ -4960,7 +5165,8 @@ struct Trainer::Impl {
                                                   spec.opponent_constant_action,
                                                   spec.opponent_agent_type, seed,
                                                   spec.pass_predicate, GateLearnerMode::kSearch,
-                                                  rng, config.gates_opponent_model);
+                                                  rng, config.gates_opponent_model, AGENT_RANDOM,
+                                                  config.gates_search_contempt);
                 record.raw = run_gate_scenario(constructed, spec.k_steps, spec.opponent_mode,
                                                spec.opponent_constant_action,
                                                spec.opponent_agent_type, seed,
@@ -5089,8 +5295,19 @@ struct Trainer::Impl {
                    << "\",\n"
                    << "  \"simulations\": " << config.evaluation_simulations << ",\n"
                    << "  \"search_opponent_model\": \""
-                   << json_escape(config.gates_opponent_model) << "\",\n"
-                   << "  \"scenarios\": [\n";
+                   << json_escape(config.gates_opponent_model) << "\",\n";
+            /* v7 Stage 0 item 0.4 (SEARCH-CONTEMPT PROTOTYPE): conditionally present - only when
+               --gates-search-contempt was passed this invocation. config.search_contempt_nscl is
+               parsed unconditionally like any other CLI value, but is only actually LIVE when a
+               constraint's contempt_seat>=0 too (see gate_search_constraint()) - printing it
+               unconditionally would misleadingly suggest every gates run "used" whatever value
+               this process's --search-contempt-nscl happened to resolve to, even a run that
+               never passed --gates-search-contempt at all. Per-scenario evidence needs no
+               companion field: contempt does not change GateResult's shape, only which action(s)
+               a search-mode scenario's own steps[] record. */
+            if (config.gates_search_contempt)
+                output << "  \"search_contempt_nscl\": " << config.search_contempt_nscl << ",\n";
+            output << "  \"scenarios\": [\n";
             for (size_t index = 0; index < records.size(); ++index) {
                 const auto& record = records[index];
                 output << "    {\"name\": \"" << json_escape(record.name) << "\", ";
@@ -5183,6 +5400,8 @@ TrainConfig parse_train_config(int argc, char** argv, int first) {
     config.dirichlet_fraction = parse_number(argc, argv, first, "--dirichlet-fraction", config.dirichlet_fraction);
     config.forced_playouts_k = parse_number(argc, argv, first, "--forced-playouts-k",
                                             config.forced_playouts_k);
+    config.search_contempt_nscl = parse_number(argc, argv, first, "--search-contempt-nscl",
+                                               config.search_contempt_nscl);
     config.temperature = parse_number(argc, argv, first, "--temperature", config.temperature);
     config.temperature_final = parse_number(argc, argv, first, "--temperature-final",
                                             config.temperature_final);
@@ -5214,6 +5433,7 @@ TrainConfig parse_train_config(int argc, char** argv, int first) {
     config.gates_agent = parse_string(argc, argv, first, "--gates-agent", config.gates_agent);
     config.gates_opponent_model = parse_string(argc, argv, first, "--gates-opponent-model",
                                                config.gates_opponent_model);
+    config.gates_search_contempt = has_flag(argc, argv, first, "--gates-search-contempt");
     config.fork_from = parse_string(argc, argv, first, "--fork-from", config.fork_from.string());
     config.dirty_diff_digest = parse_string(argc, argv, first, "--dirty-diff-digest",
                                             config.dirty_diff_digest);
@@ -5296,6 +5516,19 @@ void print_native_help() {
         "                            visits at collection time - counters measured prior\n"
         "                            starvation under Dirichlet noise - see docs/experiment-\n"
         "                            memory/14-v7-from-scratch-design.md item 0.2\n"
+        "  --search-contempt-nscl N  SEARCH-CONTEMPT PROTOTYPE (in [0,10000], default 0 = off).\n"
+        "                            Gates-only for now: requires a constraint with\n"
+        "                            contempt_seat>=0 (see --gates-search-contempt) AND\n"
+        "                            root_noise=false (throws otherwise - never coexists with\n"
+        "                            collection). >0: at any node (root or interior) where that\n"
+        "                            seat is modeled, once the node's total visits first exceed\n"
+        "                            N, the seat's marginal action freezes to a snapshot of its\n"
+        "                            visit distribution at that moment and is sampled from it\n"
+        "                            thereafter, instead of continuing PUCT - caps how perfectly\n"
+        "                            the modeled opponent can punish a commitment move (e.g.\n"
+        "                            BOMB) within one search budget. Joshi 2025 arXiv:2504.07757,\n"
+        "                            adapted to decoupled simultaneous PUCT - see docs/\n"
+        "                            experiment-memory/14-v7-from-scratch-design.md item 0.4\n"
         "  --temperature-anneal      Linearly anneal the sample temperature from --temperature\n"
         "                            (step 0) down to --temperature-final (step\n"
         "                            --temperature-steps), then argmax after - default off,\n"
@@ -5355,6 +5588,13 @@ void print_native_help() {
         "                            scenario (action_exact/type_aligned/self), and a\n"
         "                            fixed_opponent_internal_violations structural check\n"
         "                            (gates_format_version 2)\n"
+        "  --gates-search-contempt   (gates, search mode) Set contempt_seat=1 (the scenario\n"
+        "                            opponent seat) on every constraint gate_search_constraint()\n"
+        "                            builds - composes with --gates-opponent-model: a documented\n"
+        "                            no-op under aligned (already one-hot), the interesting case\n"
+        "                            under self (default off). Needs --search-contempt-nscl N>0\n"
+        "                            to actually do anything; evidence gains a top-level\n"
+        "                            search_contempt_nscl field when this flag is set\n"
         "  --iterations N            Total iteration target (resume-safe)\n"
         "  --games N                 Concurrent self-play games\n"
         "  --simulations N           PUCT simulations per move\n"

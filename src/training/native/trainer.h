@@ -68,6 +68,22 @@ struct TrainConfig {
        deliberately NOT in the manifest/runtime_config_signature/semantic-fork machinery - same
        treatment as --gates-agent. CLI --gates-opponent-model NAME. */
     std::string gates_opponent_model{"self"};
+    /* v7 Stage 0 item 0.4 (docs/experiment-memory/14-v7-from-scratch-design.md; SEARCH-CONTEMPT
+       PROTOTYPE): `gates` subcommand only. false (default) = today's behavior, unchanged - every
+       gates SearchConstraint has contempt_seat==-1 (off), exactly like before this field
+       existed. true = gate_search_constraint() sets contempt_seat=1 (the scenario opponent; the
+       gates learner is always seat 0) on every constraint it builds, composing with
+       gates_opponent_model: under "self" this is the interesting case (freezes the self-model's
+       seat-1 PUCT adaptation past --search-contempt-nscl visits - see SearchConstraint::
+       contempt_seat and search_contempt_nscl below); under "aligned" it is a documented no-op
+       (aligned already one-hots seat 1's policy to a single fixed action at every node, so seat
+       1's marginal visit distribution - snapshotted or not - is already 100% concentrated on
+       that one action; freezing changes nothing). Not a semantic field (unlike
+       search_contempt_nscl itself): it changes what a read-only diagnostic probe's internal
+       lookahead assumes, never what a checkpoint is trained under - same treatment as
+       --gates-agent/--gates-opponent-model, deliberately NOT in the manifest/
+       runtime_config_signature/semantic-fork machinery. CLI --gates-search-contempt. */
+    bool gates_search_contempt{false};
     /* If > 0 and replay_incumbent is set, run a full N-game statistical mirror-match
        (checkpoint vs replay_incumbent, both seats, with the same win-cause/WAIT behavior
        instrumentation as the baseline evals) instead of just the single replay-recording
@@ -137,6 +153,39 @@ struct TrainConfig {
            policy_target_pruning.h - so the network is not taught "forced == good" merely from
            the forcing itself. CLI --forced-playouts-k X, must lie in [0, 10]. */
     double forced_playouts_k{0.0};
+    /* v7 Stage 0 item 0.4 (docs/experiment-memory/14-v7-from-scratch-design.md; SEARCH-CONTEMPT
+       PROTOTYPE, Joshi 2025 arXiv:2504.07757, adapted to decoupled simultaneous PUCT; our H3a):
+       a semantic field riding the FULL manifest machinery exactly like forced_playouts_k -
+       persisted/inherited/explicit-override-logged, part of runtime_config_signature,
+       config.json, and semantic_field_flags() - even though, as of this prototype, only the
+       `gates` subcommand ever constructs a SearchConstraint with contempt_seat>=0 (see
+       gate_search_constraint(), --gates-search-contempt) and gates never trains or mutates
+       weights. It rides the full machinery anyway because it changes what search COMPUTES
+       during any run that enables it - the same standard forced_playouts_k is held to, and the
+       one that matters if a later, separately-gated evaluation ever adopts this in a training
+       call site.
+         - search_contempt_nscl<=0 (default 0, "off"): BatchedMcts::select_joint_contempt() is
+           never invoked (search()'s descent-loop guard requires BOTH a root's
+           constraint.contempt_seat>=0 AND this field >0) - every existing call site, including
+           every gates run that never passes --gates-search-contempt, is unaffected, bit for bit.
+         - search_contempt_nscl>0 AND a root's constraint.contempt_seat is s>=0 (gates-only for
+           now - see SearchConstraint::contempt_seat's own doc comment): at ANY node (root or
+           interior) reached during that root's search, once the node's total visits first
+           exceed this threshold, seat s's marginal action stops being chosen by PUCT argmax and
+           is instead SAMPLED from seat s's marginal visit distribution AS IT STOOD at that
+           freeze moment (snapshotted once per node - a small side map in BatchedMcts, keyed by
+           Node* and cleared at the start of every search() call - and reused thereafter for the
+           rest of THIS search() call). The other seat's selection is never modified. Caps how
+           perfectly the modeled opponent is allowed to punish a commitment move (e.g. BOMB) as
+           simulation count grows within one simulation budget, adapted from Joshi 2025's
+           alternating-turn-chess mechanism (freeze the visit distribution into a fixed
+           stochastic policy past N_scl visits) to this engine's decoupled simultaneous PUCT,
+           per seat. constraint.contempt_seat>=0 additionally REQUIRES root_noise==false
+           (BatchedMcts::search() throws otherwise) - contempt never coexists with
+           Dirichlet-noised collection by construction; training call sites (self-play/league)
+           never set contempt_seat, so this throw is unreachable from any current CLI path. CLI
+           --search-contempt-nscl X, must lie in [0, 10000]. */
+    int search_contempt_nscl{0};
     double temperature{1.0};
     /* v7 Stage 0 item 0.1+0.3 (docs/experiment-memory/14-v7-from-scratch-design.md): the sample
        temperature used for step < temperature_steps of self-play/league collection (argmax

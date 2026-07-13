@@ -321,6 +321,38 @@ if(TARGET bomber_alphazero_native)
   set_tests_properties(test_native_alphazero_gates_aligned_rerun PROPERTIES
     DEPENDS test_native_alphazero_gates_aligned_run TIMEOUT 60)
 
+  # v7 Stage 0 item 0.4 (docs/experiment-memory/14-v7-from-scratch-design.md; SEARCH-CONTEMPT
+  # PROTOTYPE): --gates-search-contempt --search-contempt-nscl 1 ablation. Two independent runs -
+  # determinism must hold exactly like self/aligned mode above (sampling from the frozen snapshot
+  # uses the search's own rng, deterministic per fixed seed/order - see
+  # BatchedMcts::select_joint_contempt). --eval-simulations 8 matches gates-network-1.json's own
+  # budget exactly, so the python check can diff against that EXISTING no-flag/contempt-off run
+  # directly (test plan item 3, "changes something") instead of a third dedicated baseline run.
+  add_test(NAME test_native_alphazero_gates_contempt_run
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> gates
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke
+      --checkpoint latest.pt
+      --channels 16 --blocks 1 --max-steps 8 --replay-capacity 128
+      --eval-simulations 8 --gates-search-contempt --search-contempt-nscl 1
+      --output ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke/gates-contempt-1.json
+      --overwrite-evidence --no-progress)
+  set_tests_properties(test_native_alphazero_gates_contempt_run PROPERTIES
+    DEPENDS test_native_alphazero_gates_aligned_rerun TIMEOUT 60)
+  add_test(NAME test_native_alphazero_gates_contempt_rerun
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> gates
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke
+      --checkpoint latest.pt
+      --channels 16 --blocks 1 --max-steps 8 --replay-capacity 128
+      --eval-simulations 8 --gates-search-contempt --search-contempt-nscl 1
+      --output ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke/gates-contempt-2.json
+      --overwrite-evidence --no-progress)
+  set_tests_properties(test_native_alphazero_gates_contempt_rerun PROPERTIES
+    DEPENDS test_native_alphazero_gates_contempt_run TIMEOUT 60)
+
   if(Python3_Interpreter_FOUND)
     add_test(NAME test_native_alphazero_gates_check
       COMMAND ${Python3_EXECUTABLE}
@@ -328,6 +360,18 @@ if(TARGET bomber_alphazero_native)
         ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke)
     set_tests_properties(test_native_alphazero_gates_check PROPERTIES
       DEPENDS test_native_alphazero_gates_aligned_rerun TIMEOUT 20)
+
+    # v7 Stage 0 item 0.4 test plan items 2-3: contempt determinism (byte-identical scenarios
+    # arrays across the two --gates-search-contempt runs above) and "contempt changes something"
+    # (at least one scenario's search.steps differs from the contempt-OFF gates-network-1.json
+    # baseline already produced earlier in this chain - proves the code path is LIVE, not a
+    # behavioral claim about search-contempt's quality).
+    add_test(NAME test_native_alphazero_gates_contempt_check
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_alphazero_gates_contempt_check.py
+        ${CMAKE_BINARY_DIR}/native-alphazero-semantic-smoke)
+    set_tests_properties(test_native_alphazero_gates_contempt_check PROPERTIES
+      DEPENDS test_native_alphazero_gates_contempt_rerun TIMEOUT 20)
 
     # KL-110 Phase B verdict tool: pure-Python logic, no native binary/GPU dependency at
     # runtime, but deliberately kept INSIDE this TARGET-guarded block (not the dependency-free
@@ -776,6 +820,73 @@ if(TARGET bomber_alphazero_native)
         ${CMAKE_BINARY_DIR}/native-alphazero-forced-playouts-smoke)
     set_tests_properties(test_native_alphazero_forced_playouts_metrics_check PROPERTIES
       DEPENDS test_native_alphazero_forced_playouts_override TIMEOUT 20)
+  endif()
+
+  # v7 Stage 0 item 0.4 (docs/experiment-memory/14-v7-from-scratch-design.md; SEARCH-CONTEMPT
+  # PROTOTYPE): search_contempt_nscl semantic-field machinery. Same fresh -> resume(inherit) ->
+  # resume(explicit override) shape as the forced-playouts chain above, in its own dedicated
+  # run-dir - --simulations 2 (not forced-playouts' 32) is fine here since, unlike
+  # forced_playouts_k, search_contempt_nscl has NO training-path effect at all (no training call
+  # site ever sets SearchConstraint::contempt_seat - the field only ever becomes live through the
+  # `gates` subcommand's --gates-search-contempt, exercised separately below) - this chain only
+  # needs to prove the manifest plumbing (persist/inherit/override-fork), not any search behavior.
+  add_test(NAME test_native_alphazero_search_contempt_fresh
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-search-contempt-smoke
+      --fresh --iterations 1 --games 2 --simulations 2
+      --train-steps 1 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 100 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress
+      --search-contempt-nscl 5)
+  set_tests_properties(test_native_alphazero_search_contempt_fresh PROPERTIES TIMEOUT 60)
+  # No search-contempt flag at all - must inherit search_contempt_nscl=5 silently from the
+  # manifest.
+  add_test(NAME test_native_alphazero_search_contempt_resume
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-search-contempt-smoke
+      --iterations 2 --games 2 --simulations 2
+      --train-steps 1 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 100 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress)
+  set_tests_properties(test_native_alphazero_search_contempt_resume PROPERTIES
+    DEPENDS test_native_alphazero_search_contempt_fresh TIMEOUT 60)
+  # Only --search-contempt-nscl diverges from the inherited manifest value (5 -> 7) - must log a
+  # SEMANTIC FORK line.
+  add_test(NAME test_native_alphazero_search_contempt_override
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-search-contempt-smoke
+      --iterations 3 --games 2 --simulations 2
+      --train-steps 1 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 1 --teacher-iterations 1
+      --eval-interval 100 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress
+      --search-contempt-nscl 7)
+  set_tests_properties(test_native_alphazero_search_contempt_override PROPERTIES
+    DEPENDS test_native_alphazero_search_contempt_resume TIMEOUT 60)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME test_native_alphazero_search_contempt_semantic_check
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_alphazero_search_contempt_semantic_check.py
+        ${CMAKE_BINARY_DIR}/native-alphazero-search-contempt-smoke)
+    set_tests_properties(test_native_alphazero_search_contempt_semantic_check PROPERTIES
+      DEPENDS test_native_alphazero_search_contempt_override TIMEOUT 20)
   endif()
 
   # KL-101 Part D regression: a second `train` process must be refused while a first is still
