@@ -996,6 +996,65 @@ if(TARGET bomber_alphazero_native)
       DEPENDS test_native_alphazero_teacher_semantic_override TIMEOUT 20)
   endif()
 
+  # v7 Stage-1 IL (D3): collect_teacher()'s OpenMP parallelization - output must be BIT-IDENTICAL
+  # for any thread count (result samples, teacher_actions histogram, and the teacher_sample_digest
+  # FNV-1a hash that oracles it), never just visually plausible. Two fresh trains, identical flags
+  # except --teacher-threads 1 vs --teacher-threads 4 - the python check below asserts every
+  # metrics.jsonl row's teacher_sample_digest AND teacher_actions (all keys) are IDENTICAL across
+  # the two run-dirs, per iteration. heuristic/random keeps this fast and deterministic in CI; mcts
+  # teacher thread-safety runs the exact same parallel-for code path and is exercised only via a
+  # local, out-of-CI smoke comparison (see the D3 implementation notes, not a test in this file).
+  add_test(NAME test_native_alphazero_teacher_threads_1_smoke
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-teacher-threads-1-smoke
+      --fresh --iterations 2 --games 2 --simulations 2
+      --train-steps 1 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 4 --teacher-iterations 2
+      --teacher-agents heuristic,random --teacher-threads 1
+      --eval-interval 1 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress)
+  set_tests_properties(test_native_alphazero_teacher_threads_1_smoke PROPERTIES TIMEOUT 90)
+  add_test(NAME test_native_alphazero_teacher_threads_4_smoke
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> train
+      --run-dir ${CMAKE_BINARY_DIR}/native-alphazero-teacher-threads-4-smoke
+      --fresh --iterations 2 --games 2 --simulations 2
+      --train-steps 1 --batch-size 4 --replay-capacity 128
+      --channels 16 --blocks 1 --teacher-games 4 --teacher-iterations 2
+      --teacher-agents heuristic,random --teacher-threads 4
+      --eval-interval 1 --eval-games 1 --eval-simulations 2
+      --promotion-games 1 --promotion-simulations 2
+      --random-score-floor 0 --heuristic-score-floor 0
+      --heuristic-regression-margin 1
+      --snapshot-interval 1 --max-steps 8 --no-progress)
+  set_tests_properties(test_native_alphazero_teacher_threads_4_smoke PROPERTIES TIMEOUT 90)
+
+  # (range) --teacher-threads outside [0,256] must fail closed at startup - same WILL_FAIL pattern
+  # as test_native_alphazero_teacher_agents_invalid_fails above.
+  add_test(NAME test_native_alphazero_teacher_threads_range_fails
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PATH=${AI_BOMBER_TORCH_LIB_DIR}$<SEMICOLON>$ENV{PATH}"
+      $<TARGET_FILE:bomber_alphazero_native> evaluate --teacher-threads 257)
+  set_tests_properties(test_native_alphazero_teacher_threads_range_fails PROPERTIES
+    TIMEOUT 20 WILL_FAIL TRUE)
+
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME test_native_alphazero_teacher_threads_check
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_alphazero_teacher_threads_check.py
+        ${CMAKE_BINARY_DIR}/native-alphazero-teacher-threads-1-smoke
+        ${CMAKE_BINARY_DIR}/native-alphazero-teacher-threads-4-smoke)
+    set_tests_properties(test_native_alphazero_teacher_threads_check PROPERTIES
+      DEPENDS "test_native_alphazero_teacher_threads_1_smoke;test_native_alphazero_teacher_threads_4_smoke"
+      TIMEOUT 20)
+  endif()
+
   # v7 Stage-1 IL Bombing-Collapse guards (docs/experiment-memory/14-v7-from-scratch-design.md
   # Stage 1; Meisheri et al. 2019): policy_entropy_bonus / value_only_iterations semantic fields
   # and their applied-loss metrics keys. Two fixtures, own run-dirs. The off-is-identical case is

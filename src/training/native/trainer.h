@@ -128,6 +128,16 @@ struct TrainConfig {
        harvest; a legacy checkpoint with no teacher_agents key inherits this compiled default via
        the faithful-default NOTE path in apply_semantic_manifest(). */
     std::string teacher_agents{"heuristic"};
+    /* v7 Stage-1 IL (D3): OpenMP thread count for collect_teacher()'s game loop. This is a pure
+       PERFORMANCE knob and is deliberately NON-SEMANTIC - collect_teacher() fills per-game slots
+       and concatenates them in game_index order after the parallel region, so its output (samples,
+       teacher_actions histogram, teacher_sample_digest) is BIT-IDENTICAL for any thread count. That
+       determinism is proven by the threads=1-vs-4 digest/histogram identity test (see
+       tests/test_native_alphazero_teacher_threads_check.py), which is what licenses keeping this field OUT of
+       runtime_config_signature(), the manifest, and semantic_field_flags(). 0 = auto
+       (omp_get_max_threads()), 1 = serial, N in [2,256] = N threads. Without AI_BOMBER_NATIVE_OPENMP
+       every value behaves as 1 (the loop is a plain serial for). */
+    int teacher_threads{0};
     int evaluation_interval{5};
     int evaluation_games{32};
     int evaluation_simulations{64};

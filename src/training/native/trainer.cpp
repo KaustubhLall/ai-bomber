@@ -26,6 +26,7 @@ extern "C" {
 #include <cstring>
 #include <ctime>
 #include <deque>
+#include <exception>
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -41,6 +42,10 @@ extern "C" {
 #include <string_view>
 #include <tuple>
 #include <vector>
+
+#ifdef AI_BOMBER_NATIVE_OPENMP
+#include <omp.h>
+#endif
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -350,6 +355,52 @@ struct Sample {
        kill, from that seat's perspective. */
     uint8_t bomb_win_side{0};
 };
+
+/* v7 Stage-1 IL (D3): FNV-1a 64-bit, the determinism oracle for the OpenMP-parallelized
+   collect_teacher() (see TrainConfig::teacher_threads in trainer.h). Same "no existing hash
+   utility anywhere in this codebase, self-contained" rationale as sha256_file above, but FNV-1a
+   instead of SHA-256 - this digest is a cheap per-sample checksum meant to run over every teacher
+   sample of every teacher iteration, not a cryptographic provenance hash. hash_teacher_sample
+   folds exactly the four fields that pin a teacher game's trajectory + finalization (policy
+   argmax byte, the value's IEEE-754 bits via memcpy to uint32, outcome_cause, bomb_win_side) -
+   never the encoded state planes (state determinism follows from action determinism given the
+   seeded env, and at::Half buffers are large for no additional signal). */
+constexpr uint64_t kFnvOffsetBasis64 = 0xcbf29ce484222325ULL;
+constexpr uint64_t kFnvPrime64 = 0x100000001b3ULL;
+
+void fnv1a_update(uint64_t& hash, const void* data, size_t length) {
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    for (size_t index = 0; index < length; ++index) {
+        hash ^= bytes[index];
+        hash *= kFnvPrime64;
+    }
+}
+
+void hash_teacher_sample(uint64_t& hash, const Sample& sample) {
+    /* policy is exactly one-hot by construction (collect_teacher sets exactly one action's
+       policy entry to 1.0f on a zero-initialized array), so a linear-scan argmax is unambiguous -
+       no tie-break rule is needed. */
+    uint8_t policy_argmax = 0;
+    float best = sample.policy[0];
+    for (int action = 1; action < kActions; ++action) {
+        if (sample.policy[static_cast<size_t>(action)] > best) {
+            best = sample.policy[static_cast<size_t>(action)];
+            policy_argmax = static_cast<uint8_t>(action);
+        }
+    }
+    fnv1a_update(hash, &policy_argmax, sizeof(policy_argmax));
+    uint32_t value_bits;
+    std::memcpy(&value_bits, &sample.value, sizeof(value_bits));
+    fnv1a_update(hash, &value_bits, sizeof(value_bits));
+    fnv1a_update(hash, &sample.outcome_cause, sizeof(sample.outcome_cause));
+    fnv1a_update(hash, &sample.bomb_win_side, sizeof(sample.bomb_win_side));
+}
+
+std::string hex_digest64(uint64_t value) {
+    std::ostringstream hex;
+    hex << std::hex << std::setfill('0') << std::setw(16) << value;
+    return hex.str();
+}
 
 class ReplayBuffer {
 public:
@@ -1990,7 +2041,7 @@ void validate_train_cli_options(int argc, char** argv, int first) {
         "--sudden-death-start", "--shrink-interval", "--iterations", "--games",
         "--simulations", "--train-steps", "--batch-size", "--replay-capacity",
         "--channels", "--blocks", "--teacher-games", "--teacher-iterations",
-        "--teacher-agents",
+        "--teacher-agents", "--teacher-threads",
         "--eval-interval", "--eval-games", "--eval-simulations", "--promotion-games",
         "--promotion-simulations", "--mcts-eval-interval", "--mcts-eval-games",
         "--baseline-mcts-simulations", "--baseline-mcts-depth", "--eval-seed-base",
@@ -2062,6 +2113,16 @@ void validate_config(const TrainConfig& config) {
        mid-run. parse_teacher_agents throws a listing-valid-names message; the result is discarded
        here (collect_teacher rebuilds the live roster when it actually runs). */
     parse_teacher_agents(config.teacher_agents);
+    /* v7 Stage-1 IL (D3): teacher_threads is an OpenMP thread COUNT, so negative is meaningless;
+       256 is a generous upper bound (well above any real machine's core count this project runs
+       on) wide enough to catch an obvious typo/unit confusion while never constraining a real
+       run. This range check is what collect_teacher's `resolved_teacher_threads` (0 -> auto,
+       N -> exactly N) can rely on without a second bounds check of its own - see
+       TrainConfig::teacher_threads in trainer.h for why the field itself is deliberately kept
+       OUT of the semantic manifest despite being validated here just like every other field in
+       this function. */
+    if (config.teacher_threads < 0 || config.teacher_threads > 256)
+        throw std::invalid_argument("teacher-threads must lie in [0, 256]");
     /* v7 Stage 0 item 0.2: forced_playouts_k is a multiplier inside a sqrt(k*P*N) visit floor
        (BatchedMcts::select_joint_root_forced), so negative is meaningless; 10 is a generous
        upper bound (KataGo's own k~=2 default) wide enough for experimentation while still
@@ -2930,6 +2991,15 @@ struct Trainer::Impl {
        only on iterations where teacher games actually ran (the block is ABSENT from other
        iterations' rows, not present-as-zeros). */
     std::array<int64_t, kActions> last_teacher_actions{};
+    /* v7 Stage-1 IL (D3): determinism oracle for the OpenMP-parallelized collect_teacher(). A
+       stable 64-bit FNV-1a hash over every teacher Sample IN game_index/step ORDER (policy argmax
+       byte, value's IEEE-754 bits, outcome_cause, bomb_win_side - NOT the encoded state planes,
+       which are pinned by action determinism given the seeded env). Computed in the ordered
+       post-region concatenation pass so it is order-proof, emitted as a hex string
+       "teacher_sample_digest" alongside teacher_actions. Equal digests at threads=1 vs N prove the
+       parallel path is bit-identical to serial - the license for teacher_threads being
+       non-semantic. Set only on iterations where collect_teacher() ran. */
+    std::string last_teacher_sample_digest{};
 
     /* KL-101 Part C: immutable fork provenance, written once at fork time (--fresh
        --fork-from PATH). Deliberately a SEPARATE file from config.json/config-history.jsonl
@@ -3036,6 +3106,10 @@ struct Trainer::Impl {
                << "  \"teacher_agents\": \"" << json_escape(config.teacher_agents) << "\",\n"
                << "  \"teacher_games\": " << config.teacher_games << ",\n"
                << "  \"teacher_iterations\": " << config.teacher_iterations << ",\n"
+               /* Non-semantic (see TrainConfig::teacher_threads in trainer.h) but still recorded
+                  here like other non-semantic fields (e.g. evaluation_games below) - config.json
+                  is a full run-configuration dump, not just the semantic manifest. */
+               << "  \"teacher_threads\": " << config.teacher_threads << ",\n"
                << "  \"bootstrap_value_weight\": " << config.bootstrap_value_weight << ",\n"
                << "  \"bootstrap_value_iterations\": " << config.bootstrap_value_iterations << ",\n"
                << "  \"timeout_draw_value\": " << config.timeout_draw_value << ",\n"
@@ -3090,105 +3164,212 @@ struct Trainer::Impl {
        harvest, doc 14 Stage 1) and BOTH seats are harvested, so the one-hot policy targets clone
        both experts' moves and the per-seat value targets follow mirror parity exactly like
        collect_self_play. The roster (config.teacher_agents) drives seat assignment; a multi-entry
-       roster rotates matchups across games, a single-entry roster is expert-vs-itself. */
+       roster rotates matchups across games, a single-entry roster is expert-vs-itself.
+       v7 Stage-1 IL (D3): the GAME loop below is `#pragma omp parallel for schedule(dynamic)`
+       (config.teacher_threads threads - see TrainConfig::teacher_threads in trainer.h). Each
+       game_index iteration writes ONLY its own per_game/per_game_actions slot - zero shared
+       mutable state is touched inside the region (env/agents/trajectory are per-iteration locals;
+       base/config/roster are read-only; the module-level stop_requested is only ever read here).
+       All cross-game aggregation - last_teacher_actions, teacher_sample_digest, result, progress -
+       is finished in the ordered serial pass AFTER the region. That ordering is what makes the
+       output bit-identical for any thread count, proven by
+       tests/test_native_alphazero_teacher_threads_check.py (threads=1 vs 4). */
     std::vector<Sample> collect_teacher(int count) {
         std::vector<Sample> result;
         last_teacher_actions = {};
+        last_teacher_sample_digest.clear();
         const std::vector<AgentType> roster = parse_teacher_agents(config.teacher_agents);
         const int roster_size = static_cast<int>(roster.size());
         PhaseProgress progress("teacher", count, config.progress);
         const BomberConfig base = game_config(config);
-        for (int game_index = 0; game_index < count && !stop_requested.load(); ++game_index) {
-            const uint64_t seed = static_cast<uint64_t>(config.seed) * 1'000'003ULL +
-                                  static_cast<uint64_t>(iteration + 1) * 10'007ULL + game_index;
-            BomberEnv env{};
-            env_init(&env, &base);
-            env_reset(&env, seed);
-            /* Seat roster assignment: seat0 rotates through the roster per game, seat1 takes the
-               NEXT entry so a >1-entry roster plays every ordered matchup as game_index advances;
-               a single-entry roster puts the same expert on both seats (expert-vs-itself). */
-            const AgentType seat_types[2] = {
-                roster[game_index % roster_size],
-                roster_size > 1 ? roster[(game_index + 1) % roster_size] : roster[0]};
-            Agent agents[2];
-            for (int seat = 0; seat < 2; ++seat) {
-                agent_init(&agents[seat], seat_types[seat]);
-                agent_reset(&agents[seat], seed * 2 + static_cast<uint64_t>(seat));
-                /* An MCTS teacher seat needs its search budget configured before it acts - the
-                   same guard evaluate_baseline uses for its MCTS baseline opponent (a bare
-                   agent_init leaves the search unconfigured), failing loudly on a bad budget. */
-                if (seat_types[seat] == AGENT_MCTS &&
-                    !mcts_agent_configure(&agents[seat], config.baseline_mcts_simulations,
-                                          config.baseline_mcts_depth))
-                    throw std::runtime_error("invalid native MCTS teacher configuration");
-            }
-            std::vector<Sample> trajectory;
-            bool done = false;
-            while (!done) {
-                Observation observations[2];
-                DebugSnapshot snapshot;
-                env_observe(&env, 0, &observations[0]);
-                env_observe(&env, 1, &observations[1]);
-                env_get_debug_snapshot(&env, &snapshot);
-                const Action actions[2] = {agent_act(&agents[0], &observations[0], &snapshot),
-                                           agent_act(&agents[1], &observations[1], &snapshot)};
-                /* Harvest BOTH seats every step - seat 0 sample then seat 1 sample, so
-                   sample_index%2 == seat at finalization, matching collect_self_play's parity
-                   convention exactly (the value/cause split below relies on it). */
+
+        /* Per-game slots. A skipped or not-yet-run game leaves its slot at its value-initialized
+           default (empty vector<Sample>, all-zero histogram array) - the fill constructors below
+           value-initialize every element, so no separate "was this game skipped" bookkeeping is
+           needed by the reduction pass at the bottom of this function. */
+        std::vector<std::vector<Sample>> per_game(static_cast<size_t>(count));
+        std::vector<std::array<int64_t, kActions>> per_game_actions(static_cast<size_t>(count));
+        /* An exception thrown from inside an OpenMP parallel region must never propagate out of
+           it (undefined behavior - typically an immediate std::terminate rather than the clear
+           error message the caller would otherwise see). The two throwing calls in the per-game
+           body below (an invalid MCTS teacher budget, or an observation-encoder ABI mismatch) are
+           both effectively invariant checks that should never fire in a correctly built binary
+           (validate_config already rejects a bad baseline_mcts_simulations/depth before any run
+           starts), but this project's determinism work does not take "should never fire" on
+           faith - so any exception is caught per-game, the first one wins (under a critical
+           section - std::exception_ptr assignment is not itself thread-safe), and it is rethrown
+           here once the parallel region has fully joined, preserving the same fail-loud behavior
+           and message the pre-parallelization serial loop had, just relocated to a safe point. */
+        std::exception_ptr first_error;
+        /* Live progress, reported as each game actually FINISHES - NOT in game_index order, which
+           schedule(dynamic) does not preserve (a straggler mcts game_index can finish long after
+           later, cheaper heuristic/random game_indices already have). games_completed is a plain
+           int, never touched outside the critical section below, so that section alone is
+           sufficient synchronization (no separate atomic needed). A DISTINCT critical section
+           name from the error one above, so a thread reporting progress never blocks a thread
+           recording an error, or vice versa - they guard unrelated shared state. */
+        int games_completed = 0;
+
+#ifdef AI_BOMBER_NATIVE_OPENMP
+        /* config.teacher_threads: 0 = auto (omp_get_max_threads()), N = exactly N threads,
+           including N==1. The SAME omp construct runs for every positive value (no separate
+           "skip the pragma" code path to keep in sync with this one): a team of exactly one
+           thread executes game_index 0..count-1 in order on the encountering thread, which is
+           output-identical to a plain serial for for this loop's purposes - every iteration
+           writes only its own disjoint slot, and no floating-point accumulation ever crosses a
+           game boundary (the only cross-game aggregation, the histogram sum and the digest, is
+           exact-integer / explicitly-ordered and proven below regardless of thread count). */
+        const int resolved_teacher_threads =
+            config.teacher_threads > 0 ? config.teacher_threads : omp_get_max_threads();
+        /* schedule(dynamic), unlike BatchedMcts::search's root loop above (schedule(static)):
+           mcts teacher games cost ~20-40s each vs ~1s for heuristic/random, so a static split
+           would let one thread's straggler mcts games stall the whole region while other threads
+           idle on an already-finished static share. Dynamic scheduling changes WHICH thread
+           claims WHICH game_index and WHEN, but never which slot a given game_index writes to -
+           it has no bearing on the ordering guarantee, which comes entirely from the serial
+           concatenation pass below, never from execution/completion order. */
+#pragma omp parallel for schedule(dynamic) num_threads(resolved_teacher_threads)
+#endif
+        for (int game_index = 0; game_index < count; ++game_index) {
+            /* Per-GAME stop check (not per-step): the old serial loop's `&& !stop_requested.load()`
+               continuation guard stopped STARTING new games the moment the flag flipped, while
+               letting the in-flight game finish. A parallel-for has no early-break, so the
+               equivalent is "skip any game not yet claimed by a thread"; a game a thread has
+               already started always runs to completion - same per-game granularity as before,
+               just distributed instead of sequential. */
+            if (stop_requested.load()) continue;
+            try {
+                const uint64_t seed = static_cast<uint64_t>(config.seed) * 1'000'003ULL +
+                                      static_cast<uint64_t>(iteration + 1) * 10'007ULL + game_index;
+                BomberEnv env{};
+                env_init(&env, &base);
+                env_reset(&env, seed);
+                /* Seat roster assignment: seat0 rotates through the roster per game, seat1 takes
+                   the NEXT entry so a >1-entry roster plays every ordered matchup as game_index
+                   advances; a single-entry roster puts the same expert on both seats
+                   (expert-vs-itself). */
+                const AgentType seat_types[2] = {
+                    roster[game_index % roster_size],
+                    roster_size > 1 ? roster[(game_index + 1) % roster_size] : roster[0]};
+                Agent agents[2];
                 for (int seat = 0; seat < 2; ++seat) {
-                    Sample sample;
-                    encode_state(env, seat, sample.state);
-                    sample.policy[static_cast<int>(actions[seat])] = 1.0f;
-                    trajectory.push_back(std::move(sample));
-                    last_teacher_actions[static_cast<size_t>(actions[seat])]++;
+                    agent_init(&agents[seat], seat_types[seat]);
+                    agent_reset(&agents[seat], seed * 2 + static_cast<uint64_t>(seat));
+                    /* An MCTS teacher seat needs its search budget configured before it acts - the
+                       same guard evaluate_baseline uses for its MCTS baseline opponent (a bare
+                       agent_init leaves the search unconfigured), failing loudly on a bad budget
+                       (via the catch below, once the parallel region has finished). */
+                    if (seat_types[seat] == AGENT_MCTS &&
+                        !mcts_agent_configure(&agents[seat], config.baseline_mcts_simulations,
+                                              config.baseline_mcts_depth))
+                        throw std::runtime_error("invalid native MCTS teacher configuration");
                 }
-                done = env_step_joint(&env, actions, 2).done != 0;
-            }
-            /* Per-seat terminal values (mirror parity, independent per seat - a both-seat-negative
-               draw must not be antisymmetrized), and the KL-105 cause tags: teacher games ARE
-               tagged as of v7 Stage 1 (they contain exactly the demonstrated kills IL exists to
-               clone), replicating collect_self_play's finalization - game-level outcome_cause on
-               every sample, bomb_win_side=1 only on the WINNING seat's samples of a bomb-decisive
-               game (the loser seat gets the cause tag but shows a death, not a kill). */
-            const float value_seat0 = terminal_training_value(env, 0,
-                config.timeout_draw_value, config.mutual_death_value,
-                config.arena_crush_win_value, config.selfkill_win_value);
-            const float value_seat1 = terminal_training_value(env, 1,
-                config.timeout_draw_value, config.mutual_death_value,
-                config.arena_crush_win_value, config.selfkill_win_value);
-            const int game_outcome = outcome(env, 0);
-            auto outcome_cause = static_cast<uint8_t>(OutcomeCause::kTimeoutDraw);
-            int bomb_winner_seat = -1;
-            if (game_outcome != 0) {
-                const int winner_seat = game_outcome > 0 ? 0 : 1;
-                const int loser_seat = 1 - winner_seat;
-                const int died_owner = env.state.death_owner[loser_seat];
-                if (died_owner == loser_seat) {
-                    outcome_cause = static_cast<uint8_t>(OutcomeCause::kSelfkill);
-                } else if (died_owner == winner_seat) {
-                    outcome_cause = static_cast<uint8_t>(OutcomeCause::kBomb);
-                    bomb_winner_seat = winner_seat;
+                std::vector<Sample> trajectory;
+                std::array<int64_t, kActions>& game_actions =
+                    per_game_actions[static_cast<size_t>(game_index)];
+                bool done = false;
+                while (!done) {
+                    Observation observations[2];
+                    DebugSnapshot snapshot;
+                    env_observe(&env, 0, &observations[0]);
+                    env_observe(&env, 1, &observations[1]);
+                    env_get_debug_snapshot(&env, &snapshot);
+                    const Action actions[2] = {agent_act(&agents[0], &observations[0], &snapshot),
+                                               agent_act(&agents[1], &observations[1], &snapshot)};
+                    /* Harvest BOTH seats every step - seat 0 sample then seat 1 sample, so
+                       sample_index%2 == seat at finalization, matching collect_self_play's parity
+                       convention exactly (the value/cause split below relies on it). */
+                    for (int seat = 0; seat < 2; ++seat) {
+                        Sample sample;
+                        encode_state(env, seat, sample.state);
+                        sample.policy[static_cast<int>(actions[seat])] = 1.0f;
+                        trajectory.push_back(std::move(sample));
+                        /* Per-game histogram slot, NOT the shared last_teacher_actions member -
+                           see the reduction in the serial pass below. */
+                        game_actions[static_cast<size_t>(actions[seat])]++;
+                    }
+                    done = env_step_joint(&env, actions, 2).done != 0;
+                }
+                /* Per-seat terminal values (mirror parity, independent per seat - a
+                   both-seat-negative draw must not be antisymmetrized), and the KL-105 cause
+                   tags: teacher games ARE tagged as of v7 Stage 1 (they contain exactly the
+                   demonstrated kills IL exists to clone), replicating collect_self_play's
+                   finalization - game-level outcome_cause on every sample, bomb_win_side=1 only
+                   on the WINNING seat's samples of a bomb-decisive game (the loser seat gets the
+                   cause tag but shows a death, not a kill). */
+                const float value_seat0 = terminal_training_value(env, 0,
+                    config.timeout_draw_value, config.mutual_death_value,
+                    config.arena_crush_win_value, config.selfkill_win_value);
+                const float value_seat1 = terminal_training_value(env, 1,
+                    config.timeout_draw_value, config.mutual_death_value,
+                    config.arena_crush_win_value, config.selfkill_win_value);
+                const int game_outcome = outcome(env, 0);
+                auto outcome_cause = static_cast<uint8_t>(OutcomeCause::kTimeoutDraw);
+                int bomb_winner_seat = -1;
+                if (game_outcome != 0) {
+                    const int winner_seat = game_outcome > 0 ? 0 : 1;
+                    const int loser_seat = 1 - winner_seat;
+                    const int died_owner = env.state.death_owner[loser_seat];
+                    if (died_owner == loser_seat) {
+                        outcome_cause = static_cast<uint8_t>(OutcomeCause::kSelfkill);
+                    } else if (died_owner == winner_seat) {
+                        outcome_cause = static_cast<uint8_t>(OutcomeCause::kBomb);
+                        bomb_winner_seat = winner_seat;
+                    } else {
+                        outcome_cause = static_cast<uint8_t>(OutcomeCause::kArenaCrush);
+                    }
                 } else {
-                    outcome_cause = static_cast<uint8_t>(OutcomeCause::kArenaCrush);
+                    const bool seat0_alive = env.state.agents[0].alive != 0;
+                    const bool seat1_alive = env.state.agents[1].alive != 0;
+                    outcome_cause = static_cast<uint8_t>(
+                        (!seat0_alive && !seat1_alive) ? OutcomeCause::kMutualDeath
+                                                       : OutcomeCause::kTimeoutDraw);
                 }
-            } else {
-                const bool seat0_alive = env.state.agents[0].alive != 0;
-                const bool seat1_alive = env.state.agents[1].alive != 0;
-                outcome_cause = static_cast<uint8_t>(
-                    (!seat0_alive && !seat1_alive) ? OutcomeCause::kMutualDeath
-                                                   : OutcomeCause::kTimeoutDraw);
+                for (size_t sample_index = 0; sample_index < trajectory.size(); ++sample_index) {
+                    const int sample_seat = static_cast<int>(sample_index % 2);
+                    trajectory[sample_index].value =
+                        sample_seat == 0 ? value_seat0 : value_seat1;
+                    trajectory[sample_index].outcome_cause = outcome_cause;
+                    trajectory[sample_index].bomb_win_side =
+                        bomb_winner_seat == sample_seat ? 1 : 0;
+                }
+                /* This game's own slot only - never `result` directly (concurrent push_back into
+                   a shared vector from multiple threads is a data race). result/
+                   last_teacher_actions/last_teacher_sample_digest/progress are all finished in
+                   the ordered serial pass below instead. */
+                per_game[static_cast<size_t>(game_index)] = std::move(trajectory);
+            } catch (...) {
+#ifdef AI_BOMBER_NATIVE_OPENMP
+#pragma omp critical(teacher_collect_error)
+#endif
+                {
+                    if (!first_error) first_error = std::current_exception();
+                }
             }
-            for (size_t sample_index = 0; sample_index < trajectory.size(); ++sample_index) {
-                const int sample_seat = static_cast<int>(sample_index % 2);
-                trajectory[sample_index].value =
-                    sample_seat == 0 ? value_seat0 : value_seat1;
-                trajectory[sample_index].outcome_cause = outcome_cause;
-                trajectory[sample_index].bomb_win_side =
-                    bomb_winner_seat == sample_seat ? 1 : 0;
-                result.push_back(std::move(trajectory[sample_index]));
+        }
+        if (first_error) std::rethrow_exception(first_error);
+
+        /* Ordered serial pass: concatenate per-game slots IN game_index ORDER (the rule that
+           makes output bit-identical for any thread count - see this function's own doc comment
+           above), reduce the per-game histograms into last_teacher_actions (plain int64 addition
+           - associative/commutative, so summation order never affects the total), fold the
+           digest in the same order, and drive `progress` - matching how collect_self_play never
+           touches PhaseProgress from inside BatchedMcts::search's own `#pragma omp parallel for`
+           region; this collector keeps the same discipline for its own parallel region. */
+        uint64_t digest = kFnvOffsetBasis64;
+        for (int game_index = 0; game_index < count; ++game_index) {
+            const auto index = static_cast<size_t>(game_index);
+            for (int action = 0; action < kActions; ++action) {
+                last_teacher_actions[static_cast<size_t>(action)] +=
+                    per_game_actions[index][static_cast<size_t>(action)];
+            }
+            for (auto& sample : per_game[index]) {
+                hash_teacher_sample(digest, sample);
+                result.push_back(std::move(sample));
             }
             progress.update(game_index + 1);
         }
+        last_teacher_sample_digest = hex_digest64(digest);
         return result;
     }
 
@@ -4529,7 +4710,11 @@ struct Trainer::Impl {
            iteration-1; teacher ran that iteration iff it was below teacher_iterations and
            teacher_games>0 - the exact condition run()'s call site used. bomb_fraction is BOMB /
            total teacher actions (total is always >0 when teacher ran: every game contributes >=1
-           two-seat step). Keys follow the UP,DOWN,LEFT,RIGHT,BOMB,WAIT ordering. */
+           two-seat step). Keys follow the UP,DOWN,LEFT,RIGHT,BOMB,WAIT ordering.
+           v7 Stage-1 IL (D3): teacher_sample_digest is the FNV-1a determinism oracle for this
+           same collect_teacher() call (see last_teacher_sample_digest's own doc comment above,
+           and TrainConfig::teacher_threads in trainer.h) - a sibling of teacher_actions, present
+           under the exact same guard since both are set together at the end of collect_teacher(). */
         if (config.teacher_games > 0 && (iteration - 1) < config.teacher_iterations) {
             const int64_t teacher_total = std::accumulate(
                 last_teacher_actions.begin(), last_teacher_actions.end(), int64_t{0});
@@ -4544,7 +4729,8 @@ struct Trainer::Impl {
                            ? static_cast<double>(last_teacher_actions[ACTION_PLACE_BOMB]) /
                                  static_cast<double>(teacher_total)
                            : 0.0)
-                   << '}';
+                   << '}'
+                   << ",\"teacher_sample_digest\":\"" << last_teacher_sample_digest << "\"";
         }
         auto write_evaluation = [&output](const char* name, const Evaluation* value) {
             if (!value) return;
@@ -5642,6 +5828,7 @@ TrainConfig parse_train_config(int argc, char** argv, int first) {
     config.teacher_games = parse_number(argc, argv, first, "--teacher-games", config.teacher_games);
     config.teacher_iterations = parse_number(argc, argv, first, "--teacher-iterations", config.teacher_iterations);
     config.teacher_agents = parse_string(argc, argv, first, "--teacher-agents", config.teacher_agents);
+    config.teacher_threads = parse_number(argc, argv, first, "--teacher-threads", config.teacher_threads);
     config.evaluation_interval = parse_number(argc, argv, first, "--eval-interval", config.evaluation_interval);
     config.evaluation_games = parse_number(argc, argv, first, "--eval-games", config.evaluation_games);
     config.evaluation_simulations = parse_number(argc, argv, first, "--eval-simulations", config.evaluation_simulations);
@@ -5820,6 +6007,13 @@ void print_native_help() {
         "                            greedy, enemy-bot, external, alpha-beta, mcts, evasive - a\n"
         "                            typo or empty roster fails closed at startup. Only harvested\n"
         "                            while iteration < --teacher-iterations and --teacher-games>0\n"
+        "  --teacher-threads N       (D3) OpenMP thread count for collect_teacher()'s game loop,\n"
+        "                            in [0,256] - NOT a semantic field (a pure performance knob;\n"
+        "                            output is bit-identical for any thread count, proven by\n"
+        "                            tests/test_native_alphazero_teacher_threads_check.py). 0\n"
+        "                            (default) = auto (omp_get_max_threads()), 1 = serial, N =\n"
+        "                            exactly N threads. Without OpenMP compiled in, every value\n"
+        "                            behaves as 1\n"
         "  --policy-entropy-bonus X  v7 Stage-1 IL Bombing-Collapse guard (semantic field, in\n"
         "                            [0,0.5], default 0 = off, bit-for-bit). >0: the policy loss\n"
         "                            becomes policy_ce - X*H(pi), an entropy floor keeping the\n"
